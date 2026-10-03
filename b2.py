@@ -12,6 +12,7 @@ Options:
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -610,12 +611,24 @@ def allocate_files(source_files: list[SourceFile], accounts: dict[str, Account])
     return allocation
 
 
+def compute_sha1(file_path: Path) -> str:
+    """Compute SHA-1 hash of a file."""
+    sha1 = hashlib.sha1()
+    with file_path.open('rb') as f:
+        for chunk in iter(lambda: f.read(8192), b''):
+            sha1.update(chunk)
+    return sha1.hexdigest()
+
+
 def upload_file(bucket: Bucket, abs_path: Path, object_name: str, size: int) -> bool:
-    """Upload a file to B2 using streaming to avoid memory issues with large files."""
+    """Upload a file to B2 using streaming and verify SHA-1 after upload."""
     if bucket.account is None:
         raise ValueError("Bucket must have an associated account")
     account = bucket.account
     client = get_b2_client(account)
+
+    # Compute local SHA-1 before upload
+    local_sha1 = compute_sha1(abs_path)
 
     def _do_upload() -> bool:
         b2_bucket = client.get_bucket_by_name(bucket.name)
@@ -625,7 +638,21 @@ def upload_file(bucket: Bucket, abs_path: Path, object_name: str, size: int) -> 
 
     try:
         retry_with_backoff(_do_upload)
-        logging.info(f"Uploaded {object_name} ({size} bytes) \u2192 {account.name}:{bucket.name}")
+
+        # Verify SHA-1 after upload
+        b2_bucket = client.get_bucket_by_name(bucket.name)
+        file_version = b2_bucket.get_file_info_by_name(object_name)
+        remote_sha1 = file_version.content_sha1
+
+        if remote_sha1 is None:
+            logging.error(f"B2 did not return SHA-1 for {object_name}")
+            return False
+
+        if local_sha1 != remote_sha1:
+            logging.error(f"SHA-1 mismatch for {object_name}: local={local_sha1}, remote={remote_sha1}")
+            return False
+
+        logging.info(f"Uploaded {object_name} ({size} bytes) \u2192 {account.name}:{bucket.name} [SHA-1 verified]")
         return True
     except Exception as exc:
         logging.error(f"Failed upload to bucket '{bucket.name}' (Account '{account.name}'): {exc}")
