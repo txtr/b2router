@@ -18,6 +18,7 @@ import os
 import random
 import stat
 import sys
+import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -53,11 +54,11 @@ def retry_with_backoff(
     max_retries: int = MAX_RETRIES,
     base_delay: float = RETRY_BASE_DELAY,
     max_delay: float = RETRY_MAX_DELAY,
-    retry_exceptions: tuple[type[BaseException], ...] = (B2Error, ConnectionError, TimeoutError),
+    retry_exceptions: tuple[type[Exception], ...] = (B2Error, ConnectionError, TimeoutError),
     **kwargs
 ) -> T:
     """Execute function with exponential backoff retry for transient errors."""
-    last_exception: BaseException | None = None
+    last_exception: Exception | None = None
     for attempt in range(max_retries + 1):
         try:
             return func(*args, **kwargs)
@@ -167,13 +168,15 @@ class OperationState:
     created_at: str
     updated_at: str
     allocations: list[AllocationEntry]
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @staticmethod
     def create(source_dir: str, accounts_config: str, allocation: dict[Path, tuple[Bucket, str]]) -> 'OperationState':
         """Create a new state from allocation plan."""
         entries = []
         for abs_path, (bucket, object_name) in allocation.items():
-            assert bucket.account is not None
+            if bucket.account is None:
+                raise ValueError(f"Bucket {bucket.name} has no associated account")
             entries.append(AllocationEntry(
                 abs_path=str(abs_path),
                 size=abs_path.stat().st_size,
@@ -209,9 +212,10 @@ class OperationState:
 
     def save(self, source_dir: str) -> None:
         """Save state to .b2router_state.json in source directory."""
-        state_file = Path(source_dir) / STATE_FILE_NAME
-        state_file.write_text(self.to_json())
-        logging.debug(f"Saved state to {state_file}")
+        with self._lock:
+            state_file = Path(source_dir) / STATE_FILE_NAME
+            state_file.write_text(self.to_json())
+            logging.debug(f"Saved state to {state_file}")
 
     @staticmethod
     def load(source_dir: str) -> Optional['OperationState']:
@@ -231,11 +235,12 @@ class OperationState:
 
     def mark_uploaded(self, abs_path: str) -> None:
         """Mark an entry as uploaded."""
-        for entry in self.allocations:
-            if entry.abs_path == abs_path:
-                entry.uploaded = True
-                break
-        self.updated_at = datetime.utcnow().isoformat() + "Z"
+        with self._lock:
+            for entry in self.allocations:
+                if entry.abs_path == abs_path:
+                    entry.uploaded = True
+                    break
+            self.updated_at = datetime.utcnow().isoformat() + "Z"
 
     def is_complete(self) -> bool:
         """Check if all entries are uploaded."""
@@ -243,10 +248,11 @@ class OperationState:
 
     def cleanup(self, source_dir: str) -> None:
         """Remove state file after successful completion."""
-        state_file = Path(source_dir) / STATE_FILE_NAME
-        if state_file.exists():
-            state_file.unlink()
-            logging.debug(f"Removed state file {state_file}")
+        with self._lock:
+            state_file = Path(source_dir) / STATE_FILE_NAME
+            if state_file.exists():
+                state_file.unlink()
+                logging.debug(f"Removed state file {state_file}")
 
 
 # ----------------------------------------------------------------------
@@ -355,7 +361,8 @@ def populate_bucket_files_and_usage(bucket: Bucket) -> None:
     If population fails, the bucket is marked as failed and will be skipped
     during allocation to prevent over-allocation based on stale/zero usage data.
     """
-    assert bucket.account is not None, "Bucket must have an associated account"
+    if bucket.account is None:
+        raise ValueError("Bucket must have an associated account")
     client = get_b2_client(bucket.account)
     total = 0
     bucket.files.clear()
@@ -523,7 +530,8 @@ def allocate_files(source_files: list[SourceFile], accounts: dict[str, Account])
 
 def upload_file(bucket: Bucket, abs_path: Path, object_name: str, size: int) -> bool:
     """Upload a file to B2 using streaming to avoid memory issues with large files."""
-    assert bucket.account is not None, "Bucket must have an associated account"
+    if bucket.account is None:
+        raise ValueError("Bucket must have an associated account")
     account = bucket.account
     client = get_b2_client(account)
 
@@ -649,13 +657,17 @@ def _execute_operation(
         allocation = {}
         for entry in state.allocations:
             if not entry.uploaded:
+                found = False
                 for account in accounts.values():
                     if account.name == entry.account_name:
                         for bucket in account.buckets:
                             if bucket.name == entry.bucket_name and bucket.id_ == entry.bucket_id:
                                 allocation[Path(entry.abs_path)] = (bucket, entry.object_name)
+                                found = True
                                 break
                         break
+                if not found:
+                    logging.warning(f"Could not find account '{entry.account_name}' bucket '{entry.bucket_name}' for resume, skipping {entry.abs_path}")
         logging.info(f"Resuming: {len(allocation)} files remaining")
         if not allocation:
             logging.info(f"All files already {operation_type}ed!")
@@ -794,7 +806,7 @@ def main() -> None:
 
     # Store realm for use in get_b2_client
     for account in accounts.values():
-        account.realm = args.realm  # type: ignore[attr-defined]
+        account.realm = args.realm
 
     if args.command == "list":
         list_all(accounts, parallel=args.parallel)
@@ -807,7 +819,7 @@ def main() -> None:
         _execute_command(args, accounts, command_type="copy")
 
 
-def _execute_command(args, accounts: dict[str, Account], command_type: str) -> None:
+def _execute_command(args: argparse.Namespace, accounts: dict[str, Account], command_type: str) -> None:
     """Execute move or copy command with shared logic."""
     source = args.source
     dry_run = args.dry_run
@@ -847,7 +859,8 @@ def _execute_command(args, accounts: dict[str, Account], command_type: str) -> N
 
     print("\n== Allocation plan:")
     for abs_path, (bucket, object_name) in allocation.items():
-        assert bucket.account is not None
+        if bucket.account is None:
+            raise ValueError(f"Bucket {bucket.name} has no associated account")
         print(f"  {abs_path.name} → {bucket.account.name}:{bucket.name}/{object_name}")
 
     if dry_run:
