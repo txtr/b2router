@@ -1,0 +1,15 @@
+# Backblaze B2 Account Master Keys
+# Copy to accounts.yaml and replace with actual credentials.
+# Each account maps to its own buckets (discovered via the B2 API).
+# capacity_in_gb is the total storage limit for the account.
+
+accounts:
+  backblaze0000:
+    account_id: ""
+    master_key: ""
+    capacity_in_gb: 10
+
+  backblaze0001:
+    account_id: ""
+    master_key: ""
+    capacity_in_gb: 10

@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Configuration (contains credentials)
+accounts.yaml
+accounts_filtered.yaml
+*.yaml.secret
+
+# State files
+.b2router_state.json
+
+# Test files (local only)
+test_accounts.yaml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
