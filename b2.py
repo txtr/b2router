@@ -3,8 +3,9 @@
 B2 Router – Route files from a local directory to Backblaze B2 buckets.
 
 Commands:
-    b2.py list --accounts=accounts.yaml [--parallel]
-    b2.py move --accounts=accounts.yaml /source [--dry-run] [--yes]
+    b2.py --accounts=accounts.yaml list [--parallel]
+    b2.py --accounts=accounts.yaml move /source [--dry-run] [--yes]
+    b2.py --accounts=accounts.yaml copy /source [--dry-run] [--yes]
 
 Options:
     --dry-run  Show allocation plan without executing uploads
