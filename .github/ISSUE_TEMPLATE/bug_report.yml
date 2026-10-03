@@ -1,0 +1,95 @@
+---
+name: Bug Report
+about: Create a report to help us improve
+title: "[BUG] "
+labels: bug
+assignees: ""
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to fill out this bug report!
+  - type: textarea
+    id: description
+    attributes:
+      label: Describe the bug
+      description: A clear and concise description of what the bug is.
+      placeholder: When running `b2.py list --parallel`, I get...
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      description: Steps to reproduce the behavior
+      placeholder: |
+        1. Run `python b2.py --accounts=accounts.yaml list --parallel`
+        2. Wait for...
+        3. Error occurs...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: A clear and concise description of what you expected to happen.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+      description: What actually happened. Include error messages, logs, screenshots.
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating System
+      description: e.g., Ubuntu 22.04, macOS 14, Windows 11
+    validations:
+      required: true
+  - type: input
+    id: python_version
+    attributes:
+      label: Python Version
+      description: Run `python --version`
+    validations:
+      required: true
+  - type: input
+    id: b2sdk_version
+    attributes:
+      label: b2sdk Version
+      description: Run `pip show b2sdk`
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: b2router Commit
+      description: Run `git rev-parse HEAD`
+    validations:
+      required: true
+  - type: dropdown
+    id: parallel
+    attributes:
+      label: Parallel Mode
+      options:
+        - "Yes"
+        - "No"
+    validations:
+      required: true
+  - type: dropdown
+    id: dryrun
+    attributes:
+      label: Dry-run Mode
+      options:
+        - "Yes"
+        - "No"
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context
+      description: Add any other context about the problem here.
