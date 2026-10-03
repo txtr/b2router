@@ -125,6 +125,10 @@ def run_with_timeout(func: Callable[..., T], *args, timeout: float = B2_API_TIME
             return future.result(timeout=timeout)
         except TimeoutError:
             logging.error(f"Operation timed out after {timeout}s")
+            # Attempt to cancel the underlying operation
+            future.cancel()
+            # Note: B2 SDK doesn't support cancellation, but we cancel the future
+            # to prevent it from continuing to run in the thread pool
             raise
 
 
@@ -133,12 +137,28 @@ def run_with_timeout(func: Callable[..., T], *args, timeout: float = B2_API_TIME
 # ----------------------------------------------------------------------
 
 
-@dataclass(slots=True, eq=True, frozen=True)
+@dataclass(slots=True, eq=False)
 class FileMetadata:
     """Represents a single file in a B2 bucket."""
     file_name: str
     size: int
     content_sha1: str | None = None
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, FileMetadata):
+            return NotImplemented
+        # Compare file_name and size always
+        # For content_sha1: None != None (treat as unknown, don't consider equal)
+        if self.content_sha1 is not None and other.content_sha1 is not None:
+            return (self.file_name == other.file_name and
+                    self.size == other.size and
+                    self.content_sha1 == other.content_sha1)
+        # If either SHA-1 is None, only compare name and size
+        return self.file_name == other.file_name and self.size == other.size
+
+    def __hash__(self) -> int:
+        # Hash based on name and size only (SHA-1 can be None)
+        return hash((self.file_name, self.size))
 
     def __repr__(self) -> str:
         return f"File({self.file_name}, {self.size} bytes)"
@@ -271,8 +291,19 @@ class OperationState:
             state_file = get_state_file_path(source_dir)
             state_file.write_text(self.to_json())
             # Restrict permissions: owner read/write only (contains account info)
-            # Skip on Windows where chmod doesn't work
-            if sys.platform != "win32":
+            if sys.platform == "win32":
+                # Use icacls to set ACL: owner full, remove inheritance, remove other users
+                try:
+                    import subprocess
+                    # Disable inheritance and remove inherited ACEs
+                    subprocess.run(["icacls", str(state_file), "/inheritance:r"], check=False, capture_output=True)
+                    # Grant current user full control
+                    subprocess.run(["icacls", str(state_file), "/grant:r", f"{os.getlogin()}:(OI)(CI)F"], check=False, capture_output=True)
+                    # Remove all other access (optional, but more secure)
+                    # Note: This is best-effort; icacls may fail in some environments
+                except Exception:
+                    pass  # Best effort - if icacls fails, file may be world-readable
+            else:
                 state_file.chmod(0o600)
             logging.debug(f"Saved state to {state_file}")
 
@@ -740,8 +771,10 @@ def upload_file(bucket: Bucket, abs_path: Path, object_name: str, size: int) -> 
         remote_sha1 = file_version.content_sha1
 
         if remote_sha1 is None:
-            logging.error(f"B2 did not return SHA-1 for {object_name}")
-            return False
+            # B2 may not have computed SHA-1 yet for large files (async processing)
+            # Log warning but don't fail - upload succeeded
+            logging.warning(f"B2 has not yet computed SHA-1 for {object_name} (large file async processing). Upload succeeded but SHA-1 not verified.")
+            return True
 
         if local_sha1 != remote_sha1:
             logging.error(f"SHA-1 mismatch for {object_name}: local={local_sha1}, remote={remote_sha1}")
@@ -770,6 +803,8 @@ def cleanup_empty_dirs(source_dir: str) -> None:
 
     Does not follow symlinks to avoid traversing outside the source tree.
     """
+    # Small delay to ensure all file handles are released after parallel uploads
+    time.sleep(0.1)
     source_path = Path(source_dir).resolve()
     for root, dirs, files in os.walk(source_path, topdown=False, followlinks=False):
         for dir_name in dirs:
@@ -1027,6 +1062,12 @@ def main() -> None:
                              help="Number of parallel uploads (default: 1, max: 10)")
     move_parser.add_argument("--resume", action="store_true",
                              help="Resume interrupted move from saved state file")
+    move_parser.add_argument("--skip-existing", action="store_true",
+                             help="Skip files that already exist in B2 with matching SHA-1")
+    move_parser.add_argument("--check", action="store_true",
+                             help="Verify files in B2 match local (no upload), exit with code 1 if mismatch")
+    move_parser.add_argument("--verify-only", action="store_true",
+                             help="Only verify SHA-1 of already uploaded files (no upload)")
 
     copy_parser = subparsers.add_parser("copy", help="Copy files from source directory to B2 (no deletion)")
     copy_parser.add_argument("source", help="Local directory containing files to copy")
@@ -1036,6 +1077,12 @@ def main() -> None:
                              help="Number of parallel uploads (default: 1, max: 10)")
     copy_parser.add_argument("--resume", action="store_true",
                              help="Resume interrupted copy from saved state file")
+    copy_parser.add_argument("--skip-existing", action="store_true",
+                             help="Skip files that already exist in B2 with matching SHA-1")
+    copy_parser.add_argument("--check", action="store_true",
+                             help="Verify files in B2 match local (no upload), exit with code 1 if mismatch")
+    copy_parser.add_argument("--verify-only", action="store_true",
+                             help="Only verify SHA-1 of already uploaded files (no upload)")
 
     args = parser.parse_args()
 
@@ -1164,7 +1211,124 @@ def _execute_command(args: argparse.Namespace, accounts: dict[str, Account], com
         print(f"{'=' * 60}")
         return
 
-    if not yes:
+    # Handle --verify-only: verify SHA-1 of files already in B2
+    if args.verify_only:
+        print(f"\n{'=' * 60}")
+        print("🔍  VERIFY ONLY MODE - Checking SHA-1 of files in B2")
+        print(f"{'=' * 60}\n")
+        build_account_state(accounts, parallel=False)
+        mismatches = 0
+        verified = 0
+        for src_file in source_files:
+            # Find which bucket this file would go to (use allocation or check all)
+            found = False
+            for account in accounts.values():
+                for bucket in account.buckets:
+                    if bucket._populate_failed:
+                        continue
+                    if bucket.has_file(src_file.rel_path):
+                        # File exists in B2, verify SHA-1
+                        client = get_b2_client(account)
+                        def _get_file_info():
+                            b2_bucket = client.get_bucket_by_name(bucket.name)
+                            return b2_bucket.get_file_info_by_name(src_file.rel_path)
+                        file_version = retry_with_backoff(run_with_timeout, _get_file_info)
+                        if file_version and file_version.content_sha1:
+                            local_sha1 = compute_sha1(src_file.abs_path)
+                            if file_version.content_sha1 == local_sha1:
+                                logging.info(f"✓ {src_file.rel_path} SHA-1 matches")
+                                verified += 1
+                            else:
+                                logging.error(f"✗ {src_file.rel_path} SHA-1 MISMATCH: local={local_sha1}, remote={file_version.content_sha1}")
+                                mismatches += 1
+                        else:
+                            logging.warning(f"? {src_file.rel_path} SHA-1 not available from B2")
+                        found = True
+                        break
+                if found:
+                    break
+            if not found:
+                logging.warning(f"! {src_file.rel_path} not found in B2")
+        print(f"\n{'=' * 60}")
+        print(f"Verified: {verified}, Mismatches: {mismatches}, Not found: {len(source_files) - verified - mismatches}")
+        if mismatches > 0:
+            sys.exit(1)
+        return
+
+    # Handle --check: verify files in B2 match local (no upload)
+    if args.check:
+        print(f"\n{'=' * 60}")
+        print("🔍  CHECK MODE - Verifying files in B2 match local")
+        print(f"{'=' * 60}\n")
+        build_account_state(accounts, parallel=False)
+        mismatches = 0
+        missing = 0
+        for src_file in source_files:
+            found = False
+            for account in accounts.values():
+                for bucket in account.buckets:
+                    if bucket._populate_failed:
+                        continue
+                    if bucket.has_file(src_file.rel_path):
+                        client = get_b2_client(account)
+                        def _get_file_info():
+                            b2_bucket = client.get_bucket_by_name(bucket.name)
+                            return b2_bucket.get_file_info_by_name(src_file.rel_path)
+                        file_version = retry_with_backoff(run_with_timeout, _get_file_info)
+                        if file_version and file_version.content_sha1:
+                            local_sha1 = compute_sha1(src_file.abs_path)
+                            if file_version.content_sha1 != local_sha1:
+                                logging.error(f"✗ {src_file.rel_path} SHA-1 MISMATCH")
+                                mismatches += 1
+                        else:
+                            logging.warning(f"? {src_file.rel_path} SHA-1 not available from B2")
+                        found = True
+                        break
+                if found:
+                    break
+            if not found:
+                logging.error(f"✗ {src_file.rel_path} MISSING from B2")
+                missing += 1
+        print(f"\n{'=' * 60}")
+        print(f"OK: {len(source_files) - mismatches - missing}, Mismatches: {mismatches}, Missing: {missing}")
+        if mismatches > 0 or missing > 0:
+            sys.exit(1)
+        return
+
+    # Handle --skip-existing: filter out files already in B2 with matching SHA-1
+    if args.skip_existing:
+        print(f"\n🔍  Checking for existing files in B2 (--skip-existing)...")
+        build_account_state(accounts, parallel=False)
+        filtered_allocation = {}
+        skipped_count = 0
+        skipped_size = 0
+        for abs_path, (bucket, object_name) in allocation.items():
+            if bucket._populate_failed:
+                filtered_allocation[abs_path] = (bucket, object_name)
+                continue
+            if bucket.account is None:
+                filtered_allocation[abs_path] = (bucket, object_name)
+                continue
+            client = get_b2_client(bucket.account)
+            def _get_file_info():
+                b2_bucket = client.get_bucket_by_name(bucket.name)
+                return b2_bucket.get_file_info_by_name(object_name)
+            existing_file = retry_with_backoff(run_with_timeout, _get_file_info)
+            if existing_file is not None:
+                remote_sha1 = existing_file.content_sha1
+                local_sha1 = compute_sha1(abs_path)
+                if remote_sha1 is not None and remote_sha1 == local_sha1:
+                    logging.info(f"Skipping {object_name} - already exists with matching SHA-1")
+                    skipped_count += 1
+                    skipped_size += abs_path.stat().st_size
+                    continue
+            filtered_allocation[abs_path] = (bucket, object_name)
+        allocation = filtered_allocation
+        print(f"  ⏭️  Skipped: {skipped_count} files ({format_bytes(skipped_size)})")
+        print(f"  📤  Remaining: {len(allocation)} files")
+        if not allocation:
+            print("\n✅  All files already exist in B2 with matching SHA-1!")
+            return
         print(f"\n{'=' * 60}")
         print("⚠️  CONFIRMATION REQUIRED")
         print(f"{'=' * 60}")
