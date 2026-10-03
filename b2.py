@@ -959,6 +959,8 @@ def _execute_command(args: argparse.Namespace, accounts: dict[str, Account], com
 
     total_allocated = 0
     total_allocated_size = 0
+    # Build abs_path -> rel_path lookup
+    rel_path_map = {f.abs_path: f.rel_path for f in source_files}
     for acc_name, items in account_allocations.items():
         acc_size = sum(item[0].stat().st_size for item in items)
         print(f"\n  📦  Account: {acc_name} ({len(items)} files, {format_bytes(acc_size)})")
@@ -966,7 +968,8 @@ def _execute_command(args: argparse.Namespace, accounts: dict[str, Account], com
         total_allocated_size += acc_size
         for abs_path, bucket, object_name in items[:10]:  # Show first 10 per account
             size_str = format_bytes(abs_path.stat().st_size)
-            print(f"      📄  {abs_path.name} ({size_str}) → {bucket.name}/{object_name}")
+            rel_path = rel_path_map.get(abs_path, abs_path.name)
+            print(f"      📄  {rel_path} ({size_str}) → {bucket.name}/{object_name}")
         if len(items) > 10:
             remaining_size = sum(item[0].stat().st_size for item in items[10:])
             print(f"      … and {len(items) - 10} more files ({format_bytes(remaining_size)})")
