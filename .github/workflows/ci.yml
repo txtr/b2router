@@ -61,8 +61,8 @@ jobs:
 
       - name: Test Docker image
         run: |
-          docker run --rm b2router:latest python -m py_compile b2.py
-          docker run --rm b2router:latest python test_bugs.py
+          docker run --rm --entrypoint python b2router:latest -m py_compile b2.py
+          docker run --rm --entrypoint python b2router:latest test_bugs.py
 
   release:
     runs-on: ubuntu-latest
