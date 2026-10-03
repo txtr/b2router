@@ -216,7 +216,9 @@ class OperationState:
             state_file = Path(source_dir) / STATE_FILE_NAME
             state_file.write_text(self.to_json())
             # Restrict permissions: owner read/write only (contains account info)
-            state_file.chmod(0o600)
+            # Skip on Windows where chmod doesn't work
+            if sys.platform != "win32":
+                state_file.chmod(0o600)
             logging.debug(f"Saved state to {state_file}")
 
     @staticmethod
@@ -421,7 +423,6 @@ def build_account_state(accounts: dict[str, Account], parallel: bool = False) ->
 
 def list_all(accounts: dict[str, Account], parallel: bool = False) -> None:
     """Print details of all accounts, buckets, and files."""
-    setup_logging(verbose=False, quiet=False)  # Ensure logging is configured
 
     # Show progress while fetching
     print("🔍  Fetching account state from B2...")
@@ -547,11 +548,13 @@ def get_unique_object_name(bucket: Bucket, base_name: str) -> str:
     if not bucket.has_file(base_name):
         return base_name
     counter = 1
-    while True:
+    max_attempts = 10000  # Prevent infinite loop
+    while counter <= max_attempts:
         candidate = f"Copy of ({counter}) {base_name}"
         if not bucket.has_file(candidate):
             return candidate
         counter += 1
+    raise RuntimeError(f"Could not generate unique name for {base_name} after {max_attempts} attempts")
 
 
 def allocate_files(source_files: list[SourceFile], accounts: dict[str, Account]) -> dict[Path, tuple[Bucket, str]]:
@@ -741,6 +744,11 @@ def _execute_operation(
                     if account.name == entry.account_name:
                         for bucket in account.buckets:
                             if bucket.name == entry.bucket_name and bucket.id_ == entry.bucket_id:
+                                # Validate object name length (B2 limit: 1024 bytes)
+                                if len(entry.object_name.encode('utf-8')) > 1024:
+                                    logging.warning(f"Object name too long (>1024 bytes), skipping: {entry.object_name[:50]}...")
+                                    found = True  # Skip this entry
+                                    break
                                 allocation[Path(entry.abs_path)] = (bucket, entry.object_name)
                                 found = True
                                 break
@@ -770,6 +778,7 @@ def _execute_operation(
     error_msg = None
     files_since_save = 0
     SAVE_BATCH_SIZE = 5  # Save state every N files
+    save_lock = threading.Lock()  # Protect files_since_save and state.save()
 
     # Progress bar
     pbar = tqdm(total=total_files, desc=progress_desc, unit="file",
@@ -802,12 +811,14 @@ def _execute_operation(
                     path, ok, err = future.result()
                     if ok:
                         success += 1
-                        files_since_save += 1
-                        if state:
-                            state.mark_uploaded(str(path))
-                            if files_since_save >= SAVE_BATCH_SIZE:
-                                state.save(args.source)
-                                files_since_save = 0
+                        # Thread-safe state save batching
+                        with save_lock:
+                            files_since_save += 1
+                            if state:
+                                state.mark_uploaded(str(path))
+                                if files_since_save >= SAVE_BATCH_SIZE:
+                                    state.save(args.source)
+                                    files_since_save = 0
                     else:
                         failed = True
                         error_msg = err
