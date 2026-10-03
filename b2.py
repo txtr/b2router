@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import os
+import platform
 import random
 import stat
 import sys
@@ -42,11 +43,44 @@ RETRY_MAX_DELAY = 30.0  # seconds
 CAP_SAFETY = 0.99  # stay 1% under capacity
 STATE_FILE_NAME = ".b2router_state.json"
 MAX_PARALLEL_UPLOADS = 10  # cap on parallel workers
+# Overall timeout for B2 API calls (seconds)
+B2_API_TIMEOUT = 300
 
 # Version
 __version__ = "1.0.0"
 
 T = TypeVar('T')
+
+
+def get_state_dir(source_dir: str) -> Path:
+    """Get the directory for state files, outside the source tree.
+
+    Uses platform-appropriate cache/config directory to avoid
+    the state file being uploaded to B2.
+    """
+    source_path = Path(source_dir).resolve()
+    # Create a unique subdir based on source path hash
+    import hashlib
+    path_hash = hashlib.sha256(str(source_path).encode()).hexdigest()[:12]
+    
+    if sys.platform == "win32":
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        state_dir = base / "b2router" / "state" / path_hash
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Caches"
+        state_dir = base / "b2router" / "state" / path_hash
+    else:
+        # Linux/Unix - use XDG_CACHE_HOME or ~/.cache
+        base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+        state_dir = base / "b2router" / "state" / path_hash
+    
+    state_dir.mkdir(parents=True, exist_ok=True)
+    return state_dir
+
+
+def get_state_file_path(source_dir: str) -> Path:
+    """Get the full path to the state file for a source directory."""
+    return get_state_dir(source_dir) / STATE_FILE_NAME
 
 
 def retry_with_backoff(
@@ -74,7 +108,8 @@ def retry_with_backoff(
             else:
                 logging.error(f"All {max_retries + 1} attempts failed: {exc}")
                 raise
-    assert last_exception is not None
+    if last_exception is None:
+        raise RuntimeError("Retry failed with no exception recorded")
     raise last_exception
 
 
@@ -212,9 +247,9 @@ class OperationState:
         )
 
     def save(self, source_dir: str) -> None:
-        """Save state to .b2router_state.json in source directory."""
+        """Save state to .b2router_state.json in platform-appropriate cache directory."""
         with self._lock:
-            state_file = Path(source_dir) / STATE_FILE_NAME
+            state_file = get_state_file_path(source_dir)
             state_file.write_text(self.to_json())
             # Restrict permissions: owner read/write only (contains account info)
             # Skip on Windows where chmod doesn't work
@@ -224,8 +259,8 @@ class OperationState:
 
     @staticmethod
     def load(source_dir: str) -> Optional['OperationState']:
-        """Load state from .b2router_state.json in source directory."""
-        state_file = Path(source_dir) / STATE_FILE_NAME
+        """Load state from .b2router_state.json in platform-appropriate cache directory."""
+        state_file = get_state_file_path(source_dir)
         if not state_file.exists():
             return None
         try:
@@ -258,7 +293,7 @@ class OperationState:
     def cleanup(self, source_dir: str) -> None:
         """Remove state file after successful completion."""
         with self._lock:
-            state_file = Path(source_dir) / STATE_FILE_NAME
+            state_file = get_state_file_path(source_dir)
             if state_file.exists():
                 state_file.unlink()
                 logging.debug(f"Removed state file {state_file}")
@@ -344,13 +379,13 @@ def discover_and_add_buckets_for_account(account: Account) -> None:
         bucket_obj.account = account
         account.buckets.append(bucket_obj)
 
-    # Second pass: divide account capacity equally among all buckets as initial allocation
+    # Second pass: set bucket capacity to account total (B2 has no per-bucket limit)
+    # The account-level capacity limit is enforced in allocate_files()
     n = len(account.buckets)
     if n > 0:
         total_capacity_bytes = int(account.capacity_in_gb * (1024 ** 3) * CAP_SAFETY)
-        per_bucket_bytes = total_capacity_bytes // n
         for bucket in account.buckets:
-            bucket.capacity_bytes = per_bucket_bytes
+            bucket.capacity_bytes = total_capacity_bytes
             # used_bytes will be populated by populate_bucket_files_and_usage
 
     logging.info(f"Discovered {len(account.buckets)} buckets for account {account.name}.")
@@ -469,13 +504,14 @@ def list_all(accounts: dict[str, Account], parallel: bool = False) -> None:
             print(f"        ID: {bucket.id_}{status}")
 
             bucket_used_gb = bucket.used_bytes / (1024 ** 3)
+            # Bucket capacity is account-level (B2 has no per-bucket limit)
             bucket_cap_gb = bucket.capacity_bytes / (1024 ** 3)
             bucket_pct = (bucket_used_gb / bucket_cap_gb * 100) if bucket_cap_gb > 0 else 0
 
             filled = int(20 * bucket_used_gb / bucket_cap_gb) if bucket_cap_gb > 0 else 0
             filled = max(0, min(filled, 20))  # Clamp
             bar = "█" * filled + "░" * (20 - filled)
-            print(f"        Capacity: {bucket_cap_gb:.2f} GB")
+            print(f"        Capacity: {bucket_cap_gb:.2f} GB (account limit)")
             print(f"        Used:     {bucket_used_gb:.2f} GB ({bucket_pct:.1f}%) [{bar}]")
 
             if not bucket.files:
@@ -547,11 +583,18 @@ def collect_source_files(source_dir: str) -> list[SourceFile]:
 def get_unique_object_name(bucket: Bucket, base_name: str) -> str:
     """Generate a unique object name by appending 'Copy of (N)' prefix if needed."""
     if not bucket.has_file(base_name):
+        # Validate length even for original name
+        if len(base_name.encode('utf-8')) > 1024:
+            raise ValueError(f"Object name too long (>1024 bytes): {base_name[:50]}...")
         return base_name
     counter = 1
     max_attempts = 10000  # Prevent infinite loop
     while counter <= max_attempts:
         candidate = f"Copy of ({counter}) {base_name}"
+        # Validate length after adding prefix
+        if len(candidate.encode('utf-8')) > 1024:
+            counter += 1
+            continue
         if not bucket.has_file(candidate):
             return candidate
         counter += 1
@@ -621,7 +664,10 @@ def compute_sha1(file_path: Path) -> str:
 
 
 def upload_file(bucket: Bucket, abs_path: Path, object_name: str, size: int) -> bool:
-    """Upload a file to B2 using streaming and verify SHA-1 after upload."""
+    """Upload a file to B2 using streaming and verify SHA-1 after upload.
+
+    If file already exists in B2 with matching SHA-1, skip upload.
+    """
     if bucket.account is None:
         raise ValueError("Bucket must have an associated account")
     account = bucket.account
@@ -637,11 +683,32 @@ def upload_file(bucket: Bucket, abs_path: Path, object_name: str, size: int) -> 
         return True
 
     try:
+        # Check if file already exists in B2 (for resume/idempotency)
+        def _get_file_info():
+            b2_bucket = client.get_bucket_by_name(bucket.name)
+            return b2_bucket.get_file_info_by_name(object_name)
+
+        existing_file = retry_with_backoff(_get_file_info)
+        if existing_file is not None:
+            remote_sha1 = existing_file.content_sha1
+            if remote_sha1 is not None and remote_sha1 == local_sha1:
+                logging.info(f"File {object_name} already exists with matching SHA-1, skipping upload")
+                return True
+            else:
+                logging.warning(f"File {object_name} exists but SHA-1 differs (local={local_sha1}, remote={remote_sha1}), will re-upload")
+
         retry_with_backoff(_do_upload)
 
         # Verify SHA-1 after upload
-        b2_bucket = client.get_bucket_by_name(bucket.name)
-        file_version = b2_bucket.get_file_info_by_name(object_name)
+        def _verify_upload():
+            b2_bucket = client.get_bucket_by_name(bucket.name)
+            return b2_bucket.get_file_info_by_name(object_name)
+
+        file_version = retry_with_backoff(_verify_upload)
+        if file_version is None:
+            logging.error(f"B2 did not return file info for {object_name} after upload")
+            return False
+
         remote_sha1 = file_version.content_sha1
 
         if remote_sha1 is None:
@@ -764,6 +831,10 @@ def _execute_operation(
     # If resuming, rebuild allocation from state
     if resume and state:
         allocation = {}
+        # Refresh account state from B2 to get current capacity/usage
+        logging.info("Refreshing account state from B2 for resume verification...")
+        build_account_state(accounts, parallel=False)
+        
         for entry in state.allocations:
             if not entry.uploaded:
                 found = False
@@ -776,6 +847,31 @@ def _execute_operation(
                                     logging.warning(f"Object name too long (>1024 bytes), skipping: {entry.object_name[:50]}...")
                                     found = True  # Skip this entry
                                     break
+                                
+                                # H4: Verify bucket still exists and account has capacity
+                                if bucket._populate_failed:
+                                    logging.warning(f"Bucket {bucket.name} population failed, cannot verify capacity, skipping {entry.abs_path}")
+                                    found = True
+                                    break
+                                
+                                # Check account capacity
+                                account_used = sum(b.used_bytes for b in account.buckets if not b._populate_failed)
+                                account_capacity = int(account.capacity_in_gb * (1024 ** 3) * CAP_SAFETY)
+                                account_remaining = account_capacity - account_used
+                                
+                                # Get source file size for capacity check
+                                source_path = Path(entry.abs_path)
+                                if source_path.exists():
+                                    file_size = source_path.stat().st_size
+                                    if account_remaining < file_size:
+                                        logging.warning(f"Account {account.name} has insufficient capacity ({format_bytes(account_remaining)} remaining, need {format_bytes(file_size)}), skipping {entry.abs_path}")
+                                        found = True
+                                        break
+                                else:
+                                    logging.warning(f"Source file {entry.abs_path} no longer exists, skipping")
+                                    found = True
+                                    break
+                                
                                 allocation[Path(entry.abs_path)] = (bucket, entry.object_name)
                                 found = True
                                 break
@@ -997,7 +1093,8 @@ def _execute_command(args: argparse.Namespace, accounts: dict[str, Account], com
     # Group by account for display
     account_allocations: dict[str, list[tuple[Path, Bucket, str]]] = {}
     for abs_path, (bucket, object_name) in allocation.items():
-        assert bucket.account is not None
+        if bucket.account is None:
+            raise ValueError(f"Bucket {bucket.name} has no associated account")
         acc_name = bucket.account.name
         if acc_name not in account_allocations:
             account_allocations[acc_name] = []
