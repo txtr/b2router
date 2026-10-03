@@ -89,7 +89,7 @@ def retry_with_backoff(
     max_retries: int = MAX_RETRIES,
     base_delay: float = RETRY_BASE_DELAY,
     max_delay: float = RETRY_MAX_DELAY,
-    retry_exceptions: tuple[type[Exception], ...] = (B2Error, ConnectionError, TimeoutError),
+    retry_exceptions: tuple[type[Exception], ...] = (B2Error, ConnectionError, TimeoutError, OSError, IOError),
     **kwargs
 ) -> T:
     """Execute function with exponential backoff retry for transient errors."""
@@ -111,6 +111,21 @@ def retry_with_backoff(
     if last_exception is None:
         raise RuntimeError("Retry failed with no exception recorded")
     raise last_exception
+
+
+def run_with_timeout(func: Callable[..., T], *args, timeout: float = B2_API_TIMEOUT, **kwargs) -> T:
+    """Run a function with a timeout using ThreadPoolExecutor.
+
+    Note: This doesn't actually cancel the underlying operation if it times out,
+    but it prevents the caller from blocking indefinitely.
+    """
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(func, *args, **kwargs)
+        try:
+            return future.result(timeout=timeout)
+        except TimeoutError:
+            logging.error(f"Operation timed out after {timeout}s")
+            raise
 
 
 # ----------------------------------------------------------------------
@@ -190,6 +205,7 @@ class AllocationEntry:
     bucket_id: str
     account_name: str
     object_name: str
+    sha1: str | None = None  # SHA-1 of source file at time of allocation
     uploaded: bool = False
 
 
@@ -213,6 +229,8 @@ class OperationState:
             # Validate object name length (B2 limit: 1024 bytes)
             if len(object_name.encode('utf-8')) > 1024:
                 raise ValueError(f"Object name too long (>1024 bytes): {object_name[:50]}...")
+            # Compute SHA-1 for resume verification
+            file_sha1 = compute_sha1(abs_path)
             entries.append(AllocationEntry(
                 abs_path=str(abs_path),
                 size=abs_path.stat().st_size,
@@ -221,6 +239,7 @@ class OperationState:
                 bucket_id=bucket.id_,
                 account_name=bucket.account.name,
                 object_name=object_name,
+                sha1=file_sha1,
                 uploaded=False
             ))
         now = datetime.utcnow().isoformat() + "Z"
@@ -352,11 +371,15 @@ def get_b2_client(account: Account) -> B2Api:
     """Authenticate and return a B2Api client for the given account."""
     if account.client is None:
         account.client = B2Api()
-        account.client.authorize_account(
-            realm=account.realm,
-            application_key_id=account.account_id,
-            application_key=account.master_key
-        )
+
+        def _authorize():
+            account.client.authorize_account(
+                realm=account.realm,
+                application_key_id=account.account_id,
+                application_key=account.master_key
+            )
+
+        retry_with_backoff(run_with_timeout, _authorize)
     return account.client
 
 
@@ -370,7 +393,7 @@ def discover_and_add_buckets_for_account(account: Account) -> None:
     def _list_buckets():
         return client.list_buckets()
 
-    b2_buckets_info = retry_with_backoff(_list_buckets)
+    b2_buckets_info = retry_with_backoff(run_with_timeout, _list_buckets)
     # First pass: create buckets with placeholder capacity
     for b2_bucket in b2_buckets_info:
         # Handle both possible SDK attribute names for bucket ID
@@ -412,17 +435,22 @@ def populate_bucket_files_and_usage(bucket: Bucket) -> None:
     bucket._file_names.clear()
     bucket._populate_failed = False
 
-    def _list_all_objects() -> list:
-        """List all objects in the bucket, returning a list (not generator) so retry works."""
+    def _list_and_process():
+        """List and process all objects in the bucket incrementally (streaming)."""
         b2_bucket = client.get_bucket_by_name(bucket.name)
-        return list(b2_bucket.ls(recursive=True))
-
-    try:
-        # Retry wraps the ENTIRE listing operation including iteration
-        objects = retry_with_backoff(_list_all_objects)
-        for fv, _ in objects:
-            total += fv.size
+        # Stream objects instead of loading all into memory
+        for fv, _ in b2_bucket.ls(recursive=True):
+            total_local = fv.size
             bucket.add_file(fv.file_name, fv.size, fv.content_sha1)
+            # Use nonlocal to update total
+            nonlocal_total[0] += total_local
+
+    # Use a list to allow modification from nested function
+    nonlocal_total = [0]
+    try:
+        # Retry wraps the entire streaming operation with timeout
+        retry_with_backoff(run_with_timeout, _list_and_process)
+        total = nonlocal_total[0]
     except Exception as exc:
         logging.warning(f"Error listing objects in {bucket.name}: {exc}")
         bucket._populate_failed = True
@@ -688,7 +716,7 @@ def upload_file(bucket: Bucket, abs_path: Path, object_name: str, size: int) -> 
             b2_bucket = client.get_bucket_by_name(bucket.name)
             return b2_bucket.get_file_info_by_name(object_name)
 
-        existing_file = retry_with_backoff(_get_file_info)
+        existing_file = retry_with_backoff(run_with_timeout, _get_file_info)
         if existing_file is not None:
             remote_sha1 = existing_file.content_sha1
             if remote_sha1 is not None and remote_sha1 == local_sha1:
@@ -697,14 +725,14 @@ def upload_file(bucket: Bucket, abs_path: Path, object_name: str, size: int) -> 
             else:
                 logging.warning(f"File {object_name} exists but SHA-1 differs (local={local_sha1}, remote={remote_sha1}), will re-upload")
 
-        retry_with_backoff(_do_upload)
+        retry_with_backoff(run_with_timeout, _do_upload)
 
         # Verify SHA-1 after upload
         def _verify_upload():
             b2_bucket = client.get_bucket_by_name(bucket.name)
             return b2_bucket.get_file_info_by_name(object_name)
 
-        file_version = retry_with_backoff(_verify_upload)
+        file_version = retry_with_backoff(run_with_timeout, _verify_upload)
         if file_version is None:
             logging.error(f"B2 did not return file info for {object_name} after upload")
             return False
@@ -863,6 +891,13 @@ def _execute_operation(
                                 source_path = Path(entry.abs_path)
                                 if source_path.exists():
                                     file_size = source_path.stat().st_size
+                                    # H3: Verify local file hasn't changed since state was saved
+                                    if entry.size != file_size:
+                                        logging.warning(f"Local file {entry.abs_path} size changed ({entry.size} -> {file_size}), will re-upload")
+                                    elif entry.sha1:
+                                        local_sha1 = compute_sha1(source_path)
+                                        if local_sha1 != entry.sha1:
+                                            logging.warning(f"Local file {entry.abs_path} SHA-1 changed, will re-upload")
                                     if account_remaining < file_size:
                                         logging.warning(f"Account {account.name} has insufficient capacity ({format_bytes(account_remaining)} remaining, need {format_bytes(file_size)}), skipping {entry.abs_path}")
                                         found = True
