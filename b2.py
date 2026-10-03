@@ -104,9 +104,6 @@ class Bucket:
     _file_names: set = field(default_factory=set, repr=False)
     account: Optional['Account'] = field(default=None, repr=False)
     _populate_failed: bool = field(default=False, repr=False)
-    # Runtime-only fields for allocation tracking
-    _account_remaining: int = field(default=0, repr=False)
-    _account_capacity: int = field(default=0, repr=False)
 
     def add_file(self, file_name: str, size: int, content_sha1: str | None = None) -> None:
         self.files.append(FileMetadata(file_name, size, content_sha1))
@@ -177,6 +174,9 @@ class OperationState:
         for abs_path, (bucket, object_name) in allocation.items():
             if bucket.account is None:
                 raise ValueError(f"Bucket {bucket.name} has no associated account")
+            # Validate object name length (B2 limit: 1024 bytes)
+            if len(object_name.encode('utf-8')) > 1024:
+                raise ValueError(f"Object name too long (>1024 bytes): {object_name[:50]}...")
             entries.append(AllocationEntry(
                 abs_path=str(abs_path),
                 size=abs_path.stat().st_size,
@@ -215,6 +215,8 @@ class OperationState:
         with self._lock:
             state_file = Path(source_dir) / STATE_FILE_NAME
             state_file.write_text(self.to_json())
+            # Restrict permissions: owner read/write only (contains account info)
+            state_file.chmod(0o600)
             logging.debug(f"Saved state to {state_file}")
 
     @staticmethod
@@ -228,6 +230,10 @@ class OperationState:
         except Exception as exc:
             logging.warning(f"Failed to load state file: {exc}")
             return None
+
+    def validate_config(self, accounts_config: str) -> bool:
+        """Validate that the state matches the current config."""
+        return self.accounts_config == accounts_config
 
     def get_pending(self) -> list[AllocationEntry]:
         """Get list of entries not yet uploaded."""
@@ -306,7 +312,6 @@ def load_config(config_path: str) -> dict[str, Account]:
 
 def get_b2_client(account: Account) -> B2Api:
     """Authenticate and return a B2Api client for the given account."""
-    assert account.client is not None or True  # B2Api() can be created
     if account.client is None:
         account.client = B2Api()
         account.client.authorize_account(
@@ -556,7 +561,8 @@ def allocate_files(source_files: list[SourceFile], accounts: dict[str, Account])
     Respects account total capacity limit across all buckets.
     """
     # Build list of valid buckets with their accounts
-    valid_buckets = []
+    # Use local tracking to avoid mutating bucket objects
+    bucket_info = []  # list of (bucket, bucket_remaining, account_remaining)
     for account in accounts.values():
         # Calculate total used space across all buckets in this account
         account_used = sum(b.used_bytes for b in account.buckets if not b._populate_failed)
@@ -567,37 +573,35 @@ def allocate_files(source_files: list[SourceFile], accounts: dict[str, Account])
             if bucket._populate_failed:
                 logging.warning(f"Skipping bucket {bucket.name} (account {account.name}) - population failed, cannot determine available space")
                 continue
-            # Attach account-level info for allocation decisions
-            bucket._account_remaining = account_remaining
-            bucket._account_capacity = account_capacity
-            valid_buckets.append(bucket)
+            bucket_remaining = bucket.remaining_bytes
+            bucket_info.append((bucket, bucket_remaining, account_remaining))
 
     sorted_files = sorted(source_files, key=lambda x: x.size, reverse=True)
     allocation: dict[Path, tuple[Bucket, str]] = {}
 
     for src_file in sorted_files:
-        best_bucket = None
+        best_idx = None
         best_remaining = None
 
-        for bucket in valid_buckets:
-            # Check both bucket-level and account-level remaining space
-            bucket_remaining = bucket.remaining_bytes
-            account_remaining = bucket._account_remaining
+        for i, (bucket, bucket_remaining, account_remaining) in enumerate(bucket_info):
             # Use the more restrictive limit
             effective_remaining = min(bucket_remaining, account_remaining)
 
             if effective_remaining >= src_file.size:
                 if best_remaining is None or effective_remaining < best_remaining:
                     best_remaining = effective_remaining
-                    best_bucket = bucket
+                    best_idx = i
 
-        if best_bucket is not None:
-            object_name = get_unique_object_name(best_bucket, src_file.rel_path)
-            allocation[src_file.abs_path] = (best_bucket, object_name)
-            # Update both bucket and account tracking
-            best_bucket.used_bytes += src_file.size
-            best_bucket._account_remaining -= src_file.size
-            best_bucket.add_file(object_name, src_file.size)
+        if best_idx is not None:
+            bucket, bucket_remaining, account_remaining = bucket_info[best_idx]
+            object_name = get_unique_object_name(bucket, src_file.rel_path)
+            allocation[src_file.abs_path] = (bucket, object_name)
+            # Update local tracking only (don't mutate bucket objects)
+            bucket_info[best_idx] = (
+                bucket,
+                bucket_remaining - src_file.size,
+                account_remaining - src_file.size
+            )
         else:
             logging.warning(f"Skipping {src_file.rel_path} ({src_file.size} bytes) – no bucket has enough free space")
     return allocation
@@ -698,7 +702,7 @@ def setup_logging(verbose: bool = False, quiet: bool = False) -> None:
 
 
 def _execute_operation(
-    args,
+    args: argparse.Namespace,
     accounts: dict[str, Account],
     source_files: list[SourceFile],
     allocation: dict[Path, tuple[Bucket, str]],
@@ -930,6 +934,10 @@ def _execute_command(args: argparse.Namespace, accounts: dict[str, Account], com
         state = OperationState.load(source)
         if not state:
             logging.error(f"No saved state found to resume. Use without --resume for new {command_type}.")
+            return
+        # Validate config matches
+        if not state.validate_config(args.accounts):
+            logging.error(f"Config mismatch: state was created with different accounts file. Use without --resume for new {command_type}.")
             return
         print(f"📋  State loaded: {state.created_at} (updated {state.updated_at})")
         print("🔍  Querying B2 accounts...")
