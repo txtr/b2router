@@ -911,7 +911,19 @@ def _execute_command(args: argparse.Namespace, accounts: dict[str, Account], com
         logging.info("No files found in source directory.")
         return
 
-    logging.info(f"Found {len(source_files)} files.")
+    total_size = sum(f.size for f in source_files)
+    print(f"\n{'=' * 60}")
+    op_name = "MOVE" if command_type == "move" else "COPY"
+    print(f"        B2 ROUTER - {op_name} OPERATION")
+    print(f"{'=' * 60}")
+    print(f"📁  Source:      {source}")
+    print(f"📄  Files:       {len(source_files)}")
+    print(f"📦  Total size:  {format_bytes(total_size)}")
+    print(f"⚙️  Mode:        {'Dry-run' if dry_run else 'Execute'}")
+    print(f"🔄  Resume:      {'Yes' if resume else 'No'}")
+    print(f"🔀  Parallel:    {parallel_uploads}")
+    if resume:
+        print(f"🔁  Resuming from saved state...")
 
     state = None
     if resume:
@@ -919,56 +931,85 @@ def _execute_command(args: argparse.Namespace, accounts: dict[str, Account], com
         if not state:
             logging.error(f"No saved state found to resume. Use without --resume for new {command_type}.")
             return
-        logging.info(f"Loaded state from {state.created_at} (updated {state.updated_at})")
-        logging.info("Querying B2 accounts...")
+        print(f"📋  State loaded: {state.created_at} (updated {state.updated_at})")
+        print("🔍  Querying B2 accounts...")
         build_account_state(accounts, parallel=False)
     else:
-        logging.info("Querying B2 accounts...")
+        print("🔍  Querying B2 accounts...")
         build_account_state(accounts, parallel=False)
 
-    logging.info("Allocating files...")
+    print("📊  Allocating files...")
     allocation = allocate_files(source_files, accounts)
     if not allocation:
-        logging.info("No files could be allocated.")
+        print("⚠️  No files could be allocated (insufficient capacity).")
         return
 
-    print("\n== Allocation plan:")
+    print(f"\n{'─' * 60}")
+    print("📋  ALLOCATION PLAN")
+    print(f"{'─' * 60}")
+
+    # Group by account for display
+    account_allocations: dict[str, list[tuple[Path, Bucket, str]]] = {}
     for abs_path, (bucket, object_name) in allocation.items():
-        if bucket.account is None:
-            raise ValueError(f"Bucket {bucket.name} has no associated account")
-        print(f"  {abs_path.name} → {bucket.account.name}:{bucket.name}/{object_name}")
+        assert bucket.account is not None
+        acc_name = bucket.account.name
+        if acc_name not in account_allocations:
+            account_allocations[acc_name] = []
+        account_allocations[acc_name].append((abs_path, bucket, object_name))
+
+    total_allocated = 0
+    total_allocated_size = 0
+    for acc_name, items in account_allocations.items():
+        acc_size = sum(item[0].stat().st_size for item in items)
+        print(f"\n  📦  Account: {acc_name} ({len(items)} files, {format_bytes(acc_size)})")
+        total_allocated += len(items)
+        total_allocated_size += acc_size
+        for abs_path, bucket, object_name in items[:10]:  # Show first 10 per account
+            size_str = format_bytes(abs_path.stat().st_size)
+            print(f"      📄  {abs_path.name} ({size_str}) → {bucket.name}/{object_name}")
+        if len(items) > 10:
+            remaining_size = sum(item[0].stat().st_size for item in items[10:])
+            print(f"      … and {len(items) - 10} more files ({format_bytes(remaining_size)})")
+
+    print(f"\n  ✅  Total allocated: {total_allocated}/{len(source_files)} files ({format_bytes(total_allocated_size)})")
+    if total_allocated < len(source_files):
+        skipped = len(source_files) - total_allocated
+        skipped_size = total_size - total_allocated_size
+        print(f"  ⚠️  Skipped: {skipped} files ({format_bytes(skipped_size)}) - insufficient capacity")
 
     if dry_run:
-        print(f"\n== Dry-run complete. No uploads performed.")
+        print(f"\n{'=' * 60}")
+        print("🔍  DRY RUN COMPLETE - No uploads performed")
+        print(f"{'=' * 60}")
         return
 
     if not yes:
-        print(f"\n⚠️  No --yes flag provided. Uploads skipped for safety. Use --yes to proceed.")
+        print(f"\n{'=' * 60}")
+        print("⚠️  CONFIRMATION REQUIRED")
+        print(f"{'=' * 60}")
+        print("No --yes flag provided. Uploads skipped for safety.")
+        print("Re-run with --yes to proceed.")
         return
 
+    print(f"\n{'=' * 60}")
+    action = "Uploading" if command_type == "move" else "Copying"
+    print(f"🚀  STARTING {action.upper()}...")
+    print(f"{'=' * 60}\n")
+
     try:
-        if command_type == "move":
-            _execute_operation(
-                args, accounts, source_files, allocation, state, resume, parallel_uploads,
-                operation_type="move",
-                upload_func=_upload_and_delete,
-                progress_desc="Uploading",
-                success_msg="files successfully moved",
-                post_success=cleanup_empty_dirs,
-            )
-        else:
-            _execute_operation(
-                args, accounts, source_files, allocation, state, resume, parallel_uploads,
-                operation_type="copy",
-                upload_func=_upload_only,
-                progress_desc="Copying",
-                success_msg="files successfully copied",
-                post_success=None,
-            )
+        _execute_operation(
+            args, accounts, source_files, allocation, state, resume, parallel_uploads,
+            operation_type=command_type,
+            upload_func=_upload_and_delete if command_type == "move" else _upload_only,
+            progress_desc=f"{action}",
+            success_msg=f"files successfully {command_type}d",
+            post_success=cleanup_empty_dirs if command_type == "move" else None,
+        )
     except RuntimeError:
         # Error already logged in execution function
         if state:
-            logging.info(f"State saved. Resume with: b2.py {command_type} --accounts={args.accounts} {source} --resume --yes")
+            print(f"\n💾  State saved. Resume with:")
+            print(f"    b2.py {command_type} --accounts={args.accounts} {source} --resume --yes")
         return
 
 
