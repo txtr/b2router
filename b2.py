@@ -1333,9 +1333,17 @@ def _execute_command(args: argparse.Namespace, accounts: dict[str, Account], com
         print(f"\n{'=' * 60}")
         print("⚠️  CONFIRMATION REQUIRED")
         print(f"{'=' * 60}")
-        print("No --yes flag provided. Uploads skipped for safety.")
-        print("Re-run with --yes to proceed.")
-        return
+        action = "move" if command_type == "move" else "copy"
+        print(f"This will {action} {len(allocation)} files to B2.")
+        print("Type 'yes' to confirm, or anything else to cancel:")
+        try:
+            response = input("> ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nCancelled.")
+            return
+        if response != "yes":
+            print("Cancelled.")
+            return
 
     print(f"\n{'=' * 60}")
     action = "Uploading" if command_type == "move" else "Copying"
