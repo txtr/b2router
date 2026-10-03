@@ -30,6 +30,11 @@ jobs:
       - name: Run tests
         run: python test_bugs.py -v
 
+      - name: Run type checking
+        run: |
+          pip install mypy types-requests types-tqdm
+          mypy b2.py --ignore-missing-imports
+
       - name: Run linting
         run: |
           pip install ruff

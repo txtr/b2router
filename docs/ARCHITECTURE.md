@@ -312,11 +312,14 @@ for abs_path, (bucket, object_name) in allocation.items():
 |---------|---------|-------------|
 | `list` | Query and display all accounts/buckets/files | `--parallel`, `-v`, `-q` |
 | `move` | Move files from source to B2 | `--dry-run`, `--yes`, `--parallel-uploads N`, `--resume`, `-v`, `-q` |
+| `copy` | Copy files from source to B2 (no deletion) | `--dry-run`, `--yes`, `--parallel-uploads N`, `--resume`, `-v`, `-q` |
 
 ### Global Options
 - `--accounts PATH` - Config file (default: `accounts.yaml`)
 - `-v, --verbose` - Debug output
 - `-q, --quiet` - Suppress non-error output (also disables progress bar)
+- `--version` - Show program version and exit
+- `--realm {production,test}` - B2 realm (default: production)
 
 ### Move Command Safety Flow
 ```
@@ -332,6 +335,23 @@ for abs_path, (bucket, object_name) in allocation.items():
 9. Save state after each file (for resume)
 10. On failure: stop, preserve state for resume
 11. On success: cleanup state file, cleanup empty dirs
+12. Report success/failure
+```
+
+### Copy Command Safety Flow
+```
+1. Validate source directory exists
+2. Collect source files
+3. If --resume: load state, rebuild allocation
+   Else: Query B2 state (build_account_state)
+4. Allocate files (allocate_files)
+5. Display allocation plan
+6. If --dry-run: STOP
+7. If not --yes: Prompt user, STOP if no
+8. Execute uploads with progress bar (NO deletion)
+9. Save state after each file (for resume)
+10. On failure: stop, preserve state for resume
+11. On success: cleanup state file
 12. Report success/failure
 ```
 
@@ -517,6 +537,21 @@ python b2.py --accounts=accounts.yaml move /data --yes -v
 python b2.py --accounts=accounts.yaml move /data --yes -q
 ```
 
+### Copy files (no deletion)
+```bash
+python b2.py --accounts=accounts.yaml copy /data --yes
+```
+
+### Copy files with parallel uploads
+```bash
+python b2.py --accounts=accounts.yaml copy /data --yes --parallel-uploads 4
+```
+
+### Show version
+```bash
+python b2.py --version
+```
+
 ---
 
 ## Version History
@@ -540,6 +575,11 @@ python b2.py --accounts=accounts.yaml move /data --yes -q
 5. **Retry logic** - Exponential backoff for transient B2 errors
 6. **Dataclasses with slots** - Cleaner code, better performance
 7. **Logging module** - Structured logging with verbose/quiet flags
+8. **Copy command** - Upload without deleting source files
+9. **Batch state saves** - Save state every 5 files for performance
+10. **Config validation** - Duplicate account_id detection
+11. **Realm support** - `--realm` for B2 partner/testing environments
+12. **Logging to stderr** - Clean stdout for piping
 
 ---
 

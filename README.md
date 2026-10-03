@@ -19,6 +19,10 @@ Route files from a local directory to Backblaze B2 buckets across multiple accou
 - **Retry with backoff** - Exponential backoff + jitter for transient B2 errors
 - **Symlink safety** - Never follows symlinks; prevents directory traversal
 - **Comprehensive tests** - 18 test cases covering edge cases
+- **Copy command** - Upload without deleting source files
+- **Config validation** - Duplicate account_id detection
+- **B2 realm support** - Production and test environments
+- **Type safety** - Full mypy type checking
 
 ## Quick Start
 
@@ -43,8 +47,17 @@ python b2.py --accounts=accounts.yaml move /path/to/data --dry-run
 # Execute move
 python b2.py --accounts=accounts.yaml move /path/to/data --yes
 
+# Dry-run copy (preview allocation)
+python b2.py --accounts=accounts.yaml copy /path/to/data --dry-run
+
+# Execute copy (no deletion of local files)
+python b2.py --accounts=accounts.yaml copy /path/to/data --yes
+
 # Resume interrupted move
 python b2.py --accounts=accounts.yaml move /path/to/data --resume --yes
+
+# Resume interrupted copy
+python b2.py --accounts=accounts.yaml copy /path/to/data --resume --yes
 ```
 
 ## Configuration
@@ -67,17 +80,20 @@ See [accounts.yaml.example](accounts.yaml.example) for the full template.
 |---------|-------------|
 | `list` | Query and display all accounts/buckets/files |
 | `move` | Move files from source directory to B2 |
+| `copy` | Copy files from source directory to B2 (no deletion) |
 
 ### Global Options
 - `--accounts PATH` - Config file (default: `accounts.yaml`)
 - `-v, --verbose` - Debug output
 - `-q, --quiet` - Errors only (disables progress bar)
+- `--version` - Show version and exit
+- `--realm {production,test}` - B2 realm (default: production)
 
-### Move Options
+### Move/Copy Options
 - `--dry-run` - Preview allocation without uploading
 - `--yes` - Skip confirmation prompt
 - `--parallel-uploads N` - Concurrent uploads (1-10, default: 1)
-- `--resume` - Resume from previous interrupted move
+- `--resume` - Resume from previous interrupted operation
 
 ## Documentation
 

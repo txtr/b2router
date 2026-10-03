@@ -41,6 +41,9 @@ CAP_SAFETY = 0.99  # stay 1% under capacity
 STATE_FILE_NAME = ".b2router_state.json"
 MAX_PARALLEL_UPLOADS = 10  # cap on parallel workers
 
+# Version
+__version__ = "1.0.0"
+
 T = TypeVar('T')
 
 
@@ -50,11 +53,11 @@ def retry_with_backoff(
     max_retries: int = MAX_RETRIES,
     base_delay: float = RETRY_BASE_DELAY,
     max_delay: float = RETRY_MAX_DELAY,
-    retry_exceptions: tuple[type, ...] = (B2Error, ConnectionError, TimeoutError),
+    retry_exceptions: tuple[type[BaseException], ...] = (B2Error, ConnectionError, TimeoutError),
     **kwargs
 ) -> T:
     """Execute function with exponential backoff retry for transient errors."""
-    last_exception = None
+    last_exception: BaseException | None = None
     for attempt in range(max_retries + 1):
         try:
             return func(*args, **kwargs)
@@ -69,6 +72,7 @@ def retry_with_backoff(
             else:
                 logging.error(f"All {max_retries + 1} attempts failed: {exc}")
                 raise
+    assert last_exception is not None
     raise last_exception
 
 
@@ -128,6 +132,7 @@ class Account:
     capacity_in_gb: int
     buckets: list[Bucket] = field(default_factory=list)
     client: B2Api | None = field(default=None, repr=False)
+    realm: str = "production"  # B2 realm (production or test)
 
     def __repr__(self) -> str:
         return f"Account({self.name}, id={self.account_id}, capacity={self.capacity_in_gb} GB)"
@@ -155,8 +160,8 @@ class AllocationEntry:
 
 
 @dataclass(slots=True)
-class MoveState:
-    """Persisted state for resume capability."""
+class OperationState:
+    """Persisted state for resume capability (used by both move and copy)."""
     source_dir: str
     accounts_config: str
     created_at: str
@@ -164,10 +169,11 @@ class MoveState:
     allocations: list[AllocationEntry]
 
     @staticmethod
-    def create(source_dir: str, accounts_config: str, allocation: dict[Path, tuple[Bucket, str]]) -> 'MoveState':
+    def create(source_dir: str, accounts_config: str, allocation: dict[Path, tuple[Bucket, str]]) -> 'OperationState':
         """Create a new state from allocation plan."""
         entries = []
         for abs_path, (bucket, object_name) in allocation.items():
+            assert bucket.account is not None
             entries.append(AllocationEntry(
                 abs_path=str(abs_path),
                 size=abs_path.stat().st_size,
@@ -179,7 +185,7 @@ class MoveState:
                 uploaded=False
             ))
         now = datetime.utcnow().isoformat() + "Z"
-        return MoveState(
+        return OperationState(
             source_dir=source_dir,
             accounts_config=accounts_config,
             created_at=now,
@@ -191,9 +197,9 @@ class MoveState:
         return json.dumps(asdict(self), indent=2)
 
     @staticmethod
-    def from_json(json_str: str) -> 'MoveState':
+    def from_json(json_str: str) -> 'OperationState':
         data = json.loads(json_str)
-        return MoveState(
+        return OperationState(
             source_dir=data["source_dir"],
             accounts_config=data["accounts_config"],
             created_at=data["created_at"],
@@ -208,13 +214,13 @@ class MoveState:
         logging.debug(f"Saved state to {state_file}")
 
     @staticmethod
-    def load(source_dir: str) -> Optional['MoveState']:
+    def load(source_dir: str) -> Optional['OperationState']:
         """Load state from .b2router_state.json in source directory."""
         state_file = Path(source_dir) / STATE_FILE_NAME
         if not state_file.exists():
             return None
         try:
-            return MoveState.from_json(state_file.read_text())
+            return OperationState.from_json(state_file.read_text())
         except Exception as exc:
             logging.warning(f"Failed to load state file: {exc}")
             return None
@@ -259,6 +265,9 @@ def load_config(config_path: str) -> dict[str, Account]:
 
     accounts: dict[str, Account] = {}
     raw_accounts = raw.get("accounts", {}) or {}
+    
+    # Check for duplicate account IDs across accounts
+    seen_account_ids: set[str] = set()
     for acc_name, acc_data in raw_accounts.items():
         try:
             account_id = acc_data["account_id"]
@@ -272,6 +281,11 @@ def load_config(config_path: str) -> dict[str, Account]:
                 raise ValueError(f"master_key is empty in account '{acc_name}'")
             if not isinstance(capacity_in_gb, int) or capacity_in_gb <= 0:
                 raise ValueError(f"capacity_in_gb must be a positive integer in account '{acc_name}'")
+            
+            # Check for duplicate account_id
+            if account_id in seen_account_ids:
+                raise ValueError(f"Duplicate account_id '{account_id}' found (also used by another account)")
+            seen_account_ids.add(account_id)
 
             accounts[acc_name] = Account(
                 name=acc_name,
@@ -286,10 +300,11 @@ def load_config(config_path: str) -> dict[str, Account]:
 
 def get_b2_client(account: Account) -> B2Api:
     """Authenticate and return a B2Api client for the given account."""
+    assert account.client is not None or True  # B2Api() can be created
     if account.client is None:
         account.client = B2Api()
         account.client.authorize_account(
-            realm="production",
+            realm=account.realm,
             application_key_id=account.account_id,
             application_key=account.master_key
         )
@@ -340,6 +355,7 @@ def populate_bucket_files_and_usage(bucket: Bucket) -> None:
     If population fails, the bucket is marked as failed and will be skipped
     during allocation to prevent over-allocation based on stale/zero usage data.
     """
+    assert bucket.account is not None, "Bucket must have an associated account"
     client = get_b2_client(bucket.account)
     total = 0
     bucket.files.clear()
@@ -398,6 +414,9 @@ def list_all(accounts: dict[str, Account], parallel: bool = False) -> None:
     for acc_name, account in accounts.items():
         print(f"\n== Account: {acc_name} ({account.account_id})")
         print(f"   Account limit: {account.capacity_in_gb} GB")
+        account_used = sum(b.used_bytes for b in account.buckets if not b._populate_failed)
+        account_capacity = int(account.capacity_in_gb * (1024 ** 3) * CAP_SAFETY)
+        print(f"   Used: {account_used} bytes ({account_used / (1024**3):.4f} GB) of {account_capacity / (1024**3):.2f} GB allocated")
         for bucket in account.buckets:
             status = " [POPULATE FAILED - DATA MAY BE STALE]" if bucket._populate_failed else ""
             print(f"   +- Bucket: {bucket.name} (ID: {bucket.id_}){status}")
@@ -504,10 +523,11 @@ def allocate_files(source_files: list[SourceFile], accounts: dict[str, Account])
 
 def upload_file(bucket: Bucket, abs_path: Path, object_name: str, size: int) -> bool:
     """Upload a file to B2 using streaming to avoid memory issues with large files."""
+    assert bucket.account is not None, "Bucket must have an associated account"
     account = bucket.account
     client = get_b2_client(account)
 
-    def _do_upload():
+    def _do_upload() -> bool:
         b2_bucket = client.get_bucket_by_name(bucket.name)
         # Use upload_local_file for streaming upload (avoids loading entire file into memory)
         b2_bucket.upload_local_file(str(abs_path), object_name)
@@ -515,7 +535,7 @@ def upload_file(bucket: Bucket, abs_path: Path, object_name: str, size: int) -> 
 
     try:
         retry_with_backoff(_do_upload)
-        logging.info(f"Uploaded {object_name} ({size} bytes) → {account.name}:{bucket.name}")
+        logging.info(f"Uploaded {object_name} ({size} bytes) \u2192 {account.name}:{bucket.name}")
         return True
     except Exception as exc:
         logging.error(f"Failed upload to bucket '{bucket.name}' (Account '{account.name}'): {exc}")
@@ -583,33 +603,52 @@ def setup_logging(verbose: bool = False, quiet: bool = False) -> None:
     else:
         level = logging.INFO
 
+    # Use stderr for logs to not interfere with stdout output
     logging.basicConfig(
         level=level,
         format="%(levelname)s: %(message)s",
-        handlers=[logging.StreamHandler(sys.stdout)]
+        handlers=[logging.StreamHandler(sys.stderr)]
     )
 
     # Reduce tqdm output noise
     logging.getLogger("tqdm").setLevel(logging.WARNING)
 
 
-def _execute_move(
+def _execute_operation(
     args,
     accounts: dict[str, Account],
     source_files: list[SourceFile],
     allocation: dict[Path, tuple[Bucket, str]],
-    state: MoveState | None = None,
+    state: OperationState | None = None,
     resume: bool = False,
-    max_workers: int = 1
+    max_workers: int = 1,
+    operation_type: str = "move",
+    upload_func: Callable[[Bucket, Path, str, int], tuple[Path, bool, str | None]] = _upload_and_delete,
+    progress_desc: str = "Uploading",
+    success_msg: str = "files successfully moved",
+    post_success: Callable[[str], None] | None = cleanup_empty_dirs,
 ) -> int:
-    """Execute the move operation with optional resume support."""
-    # If resuming, use state allocations; otherwise create new state
+    """Execute move or copy operation with shared logic.
+    
+    Args:
+        args: Parsed command line arguments
+        accounts: Account configurations
+        source_files: List of source files to process
+        allocation: Mapping of source paths to (bucket, object_name) tuples
+        state: Existing state for resume, or None for new operation
+        resume: Whether this is a resume operation
+        max_workers: Number of parallel workers (1 = sequential)
+        operation_type: "move" or "copy" - used for messages
+        upload_func: Function to process each file (_upload_and_delete or _upload_only)
+        progress_desc: Progress bar description
+        success_msg: Success message suffix
+        post_success: Optional callback on success (e.g., cleanup_empty_dirs for move)
+    """
+    # If resuming, rebuild allocation from state
     if resume and state:
-        # Rebuild allocation dict from state
         allocation = {}
         for entry in state.allocations:
             if not entry.uploaded:
-                # Find matching bucket/account
                 for account in accounts.values():
                     if account.name == entry.account_name:
                         for bucket in account.buckets:
@@ -619,12 +658,12 @@ def _execute_move(
                         break
         logging.info(f"Resuming: {len(allocation)} files remaining")
         if not allocation:
-            logging.info("All files already uploaded!")
+            logging.info(f"All files already {operation_type}ed!")
             state.cleanup(args.source)
             return 0
     else:
-        # New move - create state
-        state = MoveState.create(args.source, args.accounts, allocation)
+        # New operation - create state
+        state = OperationState.create(args.source, args.accounts, allocation)
         state.save(args.source)
 
     items = list(allocation.items())
@@ -633,116 +672,16 @@ def _execute_move(
     def process_item(item: tuple[Path, tuple[Bucket, str]]) -> tuple[Path, bool, str | None]:
         abs_path, (bucket, object_name) = item
         size = abs_path.stat().st_size
-        return _upload_and_delete(bucket, abs_path, object_name, size)
+        return upload_func(bucket, abs_path, object_name, size)
 
     success = 0
     failed = False
     error_msg = None
+    files_since_save = 0
+    SAVE_BATCH_SIZE = 5  # Save state every N files
 
     # Progress bar
-    pbar = tqdm(total=total_files, desc="Uploading", unit="file",
-                disable=args.quiet, leave=True,
-                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]")
-
-    try:
-        if max_workers == 1:
-            # Sequential (original behavior)
-            for item in items:
-                path, ok, err = process_item(item)
-                if ok:
-                    success += 1
-                    if state:
-                        state.mark_uploaded(str(path))
-                        state.save(args.source)
-                else:
-                    failed = True
-                    error_msg = err
-                    break
-                pbar.update(1)
-        else:
-            # Parallel uploads
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_path = {executor.submit(process_item, item): item[0] for item in items}
-                for future in as_completed(future_to_path):
-                    path, ok, err = future.result()
-                    if ok:
-                        success += 1
-                        if state:
-                            state.mark_uploaded(str(path))
-                            state.save(args.source)
-                    else:
-                        failed = True
-                        error_msg = err
-                        # Cancel remaining futures
-                        for f in future_to_path:
-                            f.cancel()
-                        break
-                    pbar.update(1)
-    finally:
-        pbar.close()
-
-    if failed:
-        logging.error(f"{error_msg}! Interrupting and stopping execution immediately to prevent partial failures.")
-        raise RuntimeError(error_msg)
-
-    if state:
-        state.cleanup(args.source)
-
-    # Clean up empty directories after successful moves
-    cleanup_empty_dirs(args.source)
-
-    print(f"\n== Done. {success}/{total_files} files successfully moved.")
-    return success
-
-
-def _execute_copy(
-    args,
-    accounts: dict[str, Account],
-    source_files: list[SourceFile],
-    allocation: dict[Path, tuple[Bucket, str]],
-    state: MoveState | None = None,
-    resume: bool = False,
-    max_workers: int = 1
-) -> int:
-    """Execute the copy operation with optional resume support (no deletion of source files)."""
-    # If resuming, use state allocations; otherwise create new state
-    if resume and state:
-        # Rebuild allocation dict from state
-        allocation = {}
-        for entry in state.allocations:
-            if not entry.uploaded:
-                # Find matching bucket/account
-                for account in accounts.values():
-                    if account.name == entry.account_name:
-                        for bucket in account.buckets:
-                            if bucket.name == entry.bucket_name and bucket.id_ == entry.bucket_id:
-                                allocation[Path(entry.abs_path)] = (bucket, entry.object_name)
-                                break
-                        break
-        logging.info(f"Resuming: {len(allocation)} files remaining")
-        if not allocation:
-            logging.info("All files already copied!")
-            state.cleanup(args.source)
-            return 0
-    else:
-        # New copy - create state
-        state = MoveState.create(args.source, args.accounts, allocation)
-        state.save(args.source)
-
-    items = list(allocation.items())
-    total_files = len(items)
-
-    def process_item(item: tuple[Path, tuple[Bucket, str]]) -> tuple[Path, bool, str | None]:
-        abs_path, (bucket, object_name) = item
-        size = abs_path.stat().st_size
-        return _upload_only(bucket, abs_path, object_name, size)
-
-    success = 0
-    failed = False
-    error_msg = None
-
-    # Progress bar
-    pbar = tqdm(total=total_files, desc="Copying", unit="file",
+    pbar = tqdm(total=total_files, desc=progress_desc, unit="file",
                 disable=args.quiet, leave=True,
                 bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]")
 
@@ -753,9 +692,12 @@ def _execute_copy(
                 path, ok, err = process_item(item)
                 if ok:
                     success += 1
+                    files_since_save += 1
                     if state:
                         state.mark_uploaded(str(path))
-                        state.save(args.source)
+                        if files_since_save >= SAVE_BATCH_SIZE:
+                            state.save(args.source)
+                            files_since_save = 0
                 else:
                     failed = True
                     error_msg = err
@@ -769,9 +711,12 @@ def _execute_copy(
                     path, ok, err = future.result()
                     if ok:
                         success += 1
+                        files_since_save += 1
                         if state:
                             state.mark_uploaded(str(path))
-                            state.save(args.source)
+                            if files_since_save >= SAVE_BATCH_SIZE:
+                                state.save(args.source)
+                                files_since_save = 0
                     else:
                         failed = True
                         error_msg = err
@@ -782,6 +727,9 @@ def _execute_copy(
                     pbar.update(1)
     finally:
         pbar.close()
+        # Final state save
+        if state and files_since_save > 0:
+            state.save(args.source)
 
     if failed:
         logging.error(f"{error_msg}! Interrupting and stopping execution immediately to prevent partial failures.")
@@ -790,7 +738,11 @@ def _execute_copy(
     if state:
         state.cleanup(args.source)
 
-    print(f"\n== Done. {success}/{total_files} files successfully copied.")
+    # Post-success callback (e.g., cleanup empty dirs for move)
+    if post_success:
+        post_success(args.source)
+
+    print(f"\n== Done. {success}/{total_files} {success_msg}.")
     return success
 
 
@@ -799,6 +751,9 @@ def main() -> None:
     parser.add_argument("--accounts", default="accounts.yaml", help="Path to accounts YAML configuration")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose (debug) output")
     parser.add_argument("-q", "--quiet", action="store_true", help="Suppress non-error output")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument("--realm", default="production", choices=["production", "test"],
+                        help="B2 realm (default: production)")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     list_parser = subparsers.add_parser("list", help="List all accounts, buckets, and files")
@@ -824,6 +779,11 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    # Validate parallel_uploads range
+    if hasattr(args, "parallel_uploads") and not (1 <= args.parallel_uploads <= MAX_PARALLEL_UPLOADS):
+        logging.error(f"--parallel-uploads must be between 1 and {MAX_PARALLEL_UPLOADS}")
+        return
+
     setup_logging(verbose=args.verbose, quiet=args.quiet)
 
     try:
@@ -831,6 +791,10 @@ def main() -> None:
     except Exception as exc:
         logging.error(f"Failed to load configuration: {exc}")
         return
+
+    # Store realm for use in get_b2_client
+    for account in accounts.values():
+        account.realm = args.realm  # type: ignore[attr-defined]
 
     if args.command == "list":
         list_all(accounts, parallel=args.parallel)
@@ -864,7 +828,7 @@ def _execute_command(args, accounts: dict[str, Account], command_type: str) -> N
 
     state = None
     if resume:
-        state = MoveState.load(source)
+        state = OperationState.load(source)
         if not state:
             logging.error(f"No saved state found to resume. Use without --resume for new {command_type}.")
             return
@@ -883,6 +847,7 @@ def _execute_command(args, accounts: dict[str, Account], command_type: str) -> N
 
     print("\n== Allocation plan:")
     for abs_path, (bucket, object_name) in allocation.items():
+        assert bucket.account is not None
         print(f"  {abs_path.name} → {bucket.account.name}:{bucket.name}/{object_name}")
 
     if dry_run:
@@ -895,9 +860,23 @@ def _execute_command(args, accounts: dict[str, Account], command_type: str) -> N
 
     try:
         if command_type == "move":
-            _execute_move(args, accounts, source_files, allocation, state, resume, parallel_uploads)
+            _execute_operation(
+                args, accounts, source_files, allocation, state, resume, parallel_uploads,
+                operation_type="move",
+                upload_func=_upload_and_delete,
+                progress_desc="Uploading",
+                success_msg="files successfully moved",
+                post_success=cleanup_empty_dirs,
+            )
         else:
-            _execute_copy(args, accounts, source_files, allocation, state, resume, parallel_uploads)
+            _execute_operation(
+                args, accounts, source_files, allocation, state, resume, parallel_uploads,
+                operation_type="copy",
+                upload_func=_upload_only,
+                progress_desc="Copying",
+                success_msg="files successfully copied",
+                post_success=None,
+            )
     except RuntimeError:
         # Error already logged in execution function
         if state:
