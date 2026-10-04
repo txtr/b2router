@@ -24,7 +24,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -238,7 +238,15 @@ class OperationState:
     created_at: str
     updated_at: str
     allocations: list[AllocationEntry]
+    # Integrity checksum of the allocations data
+    _checksum: str = field(default="", repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, init=False)
+
+    @staticmethod
+    def _compute_checksum(allocations: list[AllocationEntry]) -> str:
+        """Compute SHA-256 checksum of allocations data for integrity verification."""
+        data = json.dumps([asdict(e) for e in allocations], sort_keys=True)
+        return hashlib.sha256(data.encode()).hexdigest()
 
     @staticmethod
     def create(source_dir: str, accounts_config: str, allocation: dict[Path, tuple[Bucket, str]]) -> 'OperationState':
@@ -264,13 +272,15 @@ class OperationState:
                 uploaded=False
             ))
         now = datetime.utcnow().isoformat() + "Z"
-        return OperationState(
+        state = OperationState(
             source_dir=source_dir,
             accounts_config=accounts_config,
             created_at=now,
             updated_at=now,
-            allocations=entries
+            allocations=entries,
+            _checksum=OperationState._compute_checksum(entries)
         )
+        return state
 
     def to_json(self) -> str:
         # Exclude _lock from serialization (not JSON serializable)
@@ -279,26 +289,40 @@ class OperationState:
             "accounts_config": self.accounts_config,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
-            "allocations": [asdict(e) for e in self.allocations]
+            "allocations": [asdict(e) for e in self.allocations],
+            "_checksum": self._checksum
         }
         return json.dumps(data, indent=2)
 
     @staticmethod
     def from_json(json_str: str) -> 'OperationState':
         data = json.loads(json_str)
+        # Verify integrity checksum
+        allocations_data = data.get("allocations", [])
+        expected_checksum = data.get("_checksum", "")
+        if expected_checksum:
+            actual_checksum = OperationState._compute_checksum([AllocationEntry(**e) for e in allocations_data])
+            if actual_checksum != expected_checksum:
+                raise ValueError("State file integrity check failed: checksum mismatch")
         return OperationState(
             source_dir=data["source_dir"],
             accounts_config=data["accounts_config"],
             created_at=data["created_at"],
             updated_at=data["updated_at"],
-            allocations=[AllocationEntry(**e) for e in data["allocations"]]
+            allocations=[AllocationEntry(**e) for e in allocations_data],
+            _checksum=expected_checksum
         )
 
     def save(self, source_dir: str) -> None:
         """Save state to .b2router_state.json in platform-appropriate cache directory."""
         with self._lock:
             state_file = get_state_file_path(source_dir)
-            state_file.write_text(self.to_json())
+            # Update checksum before saving
+            self._checksum = OperationState._compute_checksum(self.allocations)
+            # Atomic write: write to temp file then rename
+            temp_file = state_file.with_suffix(".tmp")
+            temp_file.write_text(self.to_json())
+            temp_file.replace(state_file)
             # Restrict permissions: owner read/write only (contains account info)
             if sys.platform == "win32":
                 # Use icacls to set ACL: owner full, remove inheritance, remove other users
@@ -310,8 +334,8 @@ class OperationState:
                     subprocess.run(["icacls", str(state_file), "/grant:r", f"{os.getlogin()}:(OI)(CI)F"], check=False, capture_output=True)
                     # Remove all other access (optional, but more secure)
                     # Note: This is best-effort; icacls may fail in some environments
-                except Exception:
-                    pass  # Best effort - if icacls fails, file may be world-readable
+                except Exception as exc:
+                    logging.debug(f"icacls failed (best effort): {exc}")
             else:
                 state_file.chmod(0o600)
             logging.debug(f"Saved state to {state_file}")
@@ -324,6 +348,10 @@ class OperationState:
             return None
         try:
             return OperationState.from_json(state_file.read_text())
+        except ValueError as exc:
+            # Integrity check failed - don't resume with corrupted state
+            logging.error(f"State file integrity check failed: {exc}")
+            return None
         except Exception as exc:
             logging.warning(f"Failed to load state file: {exc}")
             return None
@@ -477,31 +505,30 @@ def populate_bucket_files_and_usage(bucket: Bucket) -> None:
     if bucket.account is None:
         raise ValueError("Bucket must have an associated account")
     client = get_b2_client(bucket.account)
-    total = 0
     bucket.files.clear()
     bucket._file_names.clear()
     bucket._populate_failed = False
 
-    def _list_and_process():
-        """List and process all objects in the bucket incrementally (streaming)."""
+    def _list_and_process() -> int:
+        """List and process all objects in the bucket incrementally (streaming).
+        Returns total bytes processed.
+        """
+        total_local = 0
         b2_bucket = client.get_bucket_by_id(bucket.id_)
         # Stream objects instead of loading all into memory
         for fv, _ in b2_bucket.ls(recursive=True):
-            total_local = fv.size
+            total_local += fv.size
             bucket.add_file(fv.file_name, fv.size, fv.content_sha1)
-            # Use nonlocal to update total
-            nonlocal_total[0] += total_local
+        return total_local
 
-    # Use a list to allow modification from nested function
-    nonlocal_total = [0]
     try:
         # Retry wraps the entire streaming operation with timeout
-        retry_with_backoff(run_with_timeout, _list_and_process)
-        total = nonlocal_total[0]
+        total = retry_with_backoff(run_with_timeout, _list_and_process)
     except Exception as exc:
         logging.warning(f"Error listing objects in {bucket.name}: {exc}")
         bucket._populate_failed = True
         # Don't set used_bytes - keep previous value or 0 to avoid false empty state
+        return
 
     if not bucket._populate_failed:
         bucket.used_bytes = total
@@ -517,8 +544,16 @@ def build_account_state(accounts: dict[str, Account], parallel: bool = False) ->
                 executor.submit(_process_account, account): account
                 for account in accounts.values()
             }
+            errors = []
             for future in as_completed(future_to_account):
-                future.result()
+                account = future_to_account[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    errors.append(f"Account {account.name}: {exc}")
+                    logging.error(f"Failed to process account {account.name}: {exc}")
+            if errors:
+                raise RuntimeError(f"Failed to process {len(errors)} account(s): " + "; ".join(errors))
     else:
         # Sequential with small delay between accounts to avoid rate limiting
         for i, account in enumerate(accounts.values()):
@@ -745,6 +780,11 @@ def upload_file(bucket: Bucket, abs_path: Path, object_name: str, size: int) -> 
     """Upload a file to B2 using streaming and verify SHA-1 after upload.
 
     If file already exists in B2 with matching SHA-1, skip upload.
+
+    Note: There is a TOCTOU race between checking for existing file and uploading.
+    B2 does not support atomic compare-and-swap for uploads. If another process
+    uploads the same file between our check and upload, a new version will be
+    created. The post-upload SHA-1 verification ensures data integrity.
     """
     if bucket.account is None:
         raise ValueError("Bucket must have an associated account")
@@ -804,6 +844,13 @@ def upload_file(bucket: Bucket, abs_path: Path, object_name: str, size: int) -> 
 
         if local_sha1 != remote_sha1:
             logging.error(f"SHA-1 mismatch for {object_name}: local={local_sha1}, remote={remote_sha1}")
+            # C3: Attempt to delete the corrupted upload to avoid leaving bad file in B2
+            try:
+                b2_bucket = client.get_bucket_by_id(bucket.id_)
+                b2_bucket.delete_file_version(object_name, file_version.id_)
+                logging.info(f"Deleted mismatched file version {object_name} (id={file_version.id_})")
+            except Exception as del_exc:
+                logging.warning(f"Failed to delete mismatched file {object_name}: {del_exc}")
             return False
 
         logging.info(f"Uploaded {object_name} ({size} bytes) \u2192 {account.name}:{bucket.name} [SHA-1 verified]")
@@ -1044,31 +1091,53 @@ def _execute_operation(
                 if pbar:
                     pbar.update(1)
         else:
-            # Parallel uploads
+            # Parallel uploads - submit in batches to avoid unbounded queue
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_path = {executor.submit(process_item, item): item[0] for item in items}
-                for future in as_completed(future_to_path):
-                    path, ok, err = future.result()
-                    log_progress(path, ok, err)
-                    if ok:
-                        success += 1
-                        # Thread-safe state save batching
-                        with save_lock:
-                            files_since_save += 1
-                            if state:
-                                state.mark_uploaded(str(path))
-                                if files_since_save >= SAVE_BATCH_SIZE:
-                                    state.save(args.source)
-                                    files_since_save = 0
-                    else:
-                        failed = True
-                        error_msg = err
-                        # Cancel remaining futures
-                        for f in future_to_path:
-                            f.cancel()
-                        break
-                    if pbar:
-                        pbar.update(1)
+                batch_size = max_workers * 4  # Keep queue bounded
+                pending = list(items)
+                future_to_path = {}
+
+                def submit_batch(batch):
+                    for item in batch:
+                        future_to_path[executor.submit(process_item, item)] = item[0]
+
+                # Submit initial batch
+                submit_batch(pending[:batch_size])
+                pending = pending[batch_size:]
+
+                while future_to_path:
+                    # Wait for at least one to complete
+                    done, _ = wait(future_to_path.keys(), return_when=FIRST_COMPLETED)
+                    for future in done:
+                        path = future_to_path.pop(future)
+                        path_res, ok, err = future.result()
+                        log_progress(path_res, ok, err)
+                        if ok:
+                            success += 1
+                            # Thread-safe state save batching
+                            with save_lock:
+                                files_since_save += 1
+                                if state:
+                                    state.mark_uploaded(str(path_res))
+                                    if files_since_save >= SAVE_BATCH_SIZE:
+                                        state.save(args.source)
+                                        files_since_save = 0
+                        else:
+                            failed = True
+                            error_msg = err
+                            # Cancel remaining futures
+                            for f in future_to_path:
+                                f.cancel()
+                            future_to_path.clear()
+                            break
+                        if pbar:
+                            pbar.update(1)
+
+                    # Submit more work to keep workers busy
+                    if not failed and pending:
+                        next_batch = pending[:batch_size]
+                        pending = pending[batch_size:]
+                        submit_batch(next_batch)
     except KeyboardInterrupt:
         logging.warning("Interrupted by user, saving state...")
         if state:
@@ -1279,38 +1348,47 @@ def _execute_command(args: argparse.Namespace, accounts: dict[str, Account], com
         print("🔍  VERIFY ONLY MODE - Checking SHA-1 of files in B2")
         print(f"{'=' * 60}\n")
         build_account_state(accounts, parallel=False)
+
+        # Load state if available to get exact object names used
+        state = OperationState.load(source)
+        state_allocations = {}
+        if state:
+            for entry in state.allocations:
+                state_allocations[entry.abs_path] = entry.object_name
+
         mismatches = 0
         verified = 0
         for src_file in source_files:
-            # Find which bucket this file would go to (use allocation or check all)
+            # Use object_name from state if available, otherwise fall back to rel_path
+            object_name = state_allocations.get(str(src_file.abs_path), src_file.rel_path)
             found = False
             for account in accounts.values():
                 for bucket in account.buckets:
                     if bucket._populate_failed:
                         continue
-                    if bucket.has_file(src_file.rel_path):
+                    if bucket.has_file(object_name):
                         # File exists in B2, verify SHA-1
                         client = get_b2_client(account)
                         def _get_file_info():
                             b2_bucket = client.get_bucket_by_id(bucket.id_)
-                            return b2_bucket.get_file_info_by_name(src_file.rel_path)
+                            return b2_bucket.get_file_info_by_name(object_name)
                         file_version = retry_with_backoff(run_with_timeout, _get_file_info)
                         if file_version and file_version.content_sha1:
                             local_sha1 = compute_sha1(src_file.abs_path)
                             if file_version.content_sha1 == local_sha1:
-                                logging.info(f"✓ {src_file.rel_path} SHA-1 matches")
+                                logging.info(f"✓ {object_name} SHA-1 matches")
                                 verified += 1
                             else:
-                                logging.error(f"✗ {src_file.rel_path} SHA-1 MISMATCH: local={local_sha1}, remote={file_version.content_sha1}")
+                                logging.error(f"✗ {object_name} SHA-1 MISMATCH: local={local_sha1}, remote={file_version.content_sha1}")
                                 mismatches += 1
                         else:
-                            logging.warning(f"? {src_file.rel_path} SHA-1 not available from B2")
+                            logging.warning(f"? {object_name} SHA-1 not available from B2")
                         found = True
                         break
                 if found:
                     break
             if not found:
-                logging.warning(f"! {src_file.rel_path} not found in B2")
+                logging.warning(f"! {object_name} not found in B2")
         print(f"\n{'=' * 60}")
         print(f"Verified: {verified}, Mismatches: {mismatches}, Not found: {len(source_files) - verified - mismatches}")
         if mismatches > 0:
@@ -1323,33 +1401,43 @@ def _execute_command(args: argparse.Namespace, accounts: dict[str, Account], com
         print("🔍  CHECK MODE - Verifying files in B2 match local")
         print(f"{'=' * 60}\n")
         build_account_state(accounts, parallel=False)
+
+        # Load state if available to get exact object names used
+        state = OperationState.load(source)
+        state_allocations = {}
+        if state:
+            for entry in state.allocations:
+                state_allocations[entry.abs_path] = entry.object_name
+
         mismatches = 0
         missing = 0
         for src_file in source_files:
+            # Use object_name from state if available, otherwise fall back to rel_path
+            object_name = state_allocations.get(str(src_file.abs_path), src_file.rel_path)
             found = False
             for account in accounts.values():
                 for bucket in account.buckets:
                     if bucket._populate_failed:
                         continue
-                    if bucket.has_file(src_file.rel_path):
+                    if bucket.has_file(object_name):
                         client = get_b2_client(account)
                         def _get_file_info():
                             b2_bucket = client.get_bucket_by_id(bucket.id_)
-                            return b2_bucket.get_file_info_by_name(src_file.rel_path)
+                            return b2_bucket.get_file_info_by_name(object_name)
                         file_version = retry_with_backoff(run_with_timeout, _get_file_info)
                         if file_version and file_version.content_sha1:
                             local_sha1 = compute_sha1(src_file.abs_path)
                             if file_version.content_sha1 != local_sha1:
-                                logging.error(f"✗ {src_file.rel_path} SHA-1 MISMATCH")
+                                logging.error(f"✗ {object_name} SHA-1 MISMATCH")
                                 mismatches += 1
                         else:
-                            logging.warning(f"? {src_file.rel_path} SHA-1 not available from B2")
+                            logging.warning(f"? {object_name} SHA-1 not available from B2")
                         found = True
                         break
                 if found:
                     break
             if not found:
-                logging.error(f"✗ {src_file.rel_path} MISSING from B2")
+                logging.error(f"✗ {object_name} MISSING from B2")
                 missing += 1
         print(f"\n{'=' * 60}")
         print(f"OK: {len(source_files) - mismatches - missing}, Mismatches: {mismatches}, Missing: {missing}")
@@ -1364,8 +1452,6 @@ def _execute_command(args: argparse.Namespace, accounts: dict[str, Account], com
         filtered_allocation = {}
         skipped_count = 0
         skipped_size = 0
-        # Build abs_path -> rel_path lookup
-        rel_path_map = {f.abs_path: f.rel_path for f in source_files}
         for abs_path, (bucket, object_name) in allocation.items():
             if bucket._populate_failed:
                 filtered_allocation[abs_path] = (bucket, object_name)
@@ -1374,17 +1460,17 @@ def _execute_command(args: argparse.Namespace, accounts: dict[str, Account], com
                 filtered_allocation[abs_path] = (bucket, object_name)
                 continue
             client = get_b2_client(bucket.account)
-            # Check using the original file name (rel_path), not the allocated unique name
-            check_name = rel_path_map.get(abs_path, object_name)
+            # Check using the object_name that will be used for upload (not rel_path)
+            # object_name is the unique name allocated (may have "Copy of (N)" prefix)
             def _get_file_info():
                 b2_bucket = client.get_bucket_by_id(bucket.id_)
-                return b2_bucket.get_file_info_by_name(check_name)
+                return b2_bucket.get_file_info_by_name(object_name)
             existing_file = retry_with_backoff(run_with_timeout, _get_file_info)
             if existing_file is not None:
                 remote_sha1 = existing_file.content_sha1
                 local_sha1 = compute_sha1(abs_path)
                 if remote_sha1 is not None and remote_sha1 == local_sha1:
-                    logging.info(f"Skipping {check_name} - already exists with matching SHA-1")
+                    logging.info(f"Skipping {object_name} - already exists with matching SHA-1")
                     skipped_count += 1
                     skipped_size += abs_path.stat().st_size
                     continue
