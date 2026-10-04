@@ -892,6 +892,7 @@ def _execute_operation(
         success_msg: Success message suffix
         post_success: Optional callback on success (e.g., cleanup_empty_dirs for move)
     """
+    simple_log = getattr(args, 'simple_log', False)
     # If resuming, rebuild allocation from state
     if resume and state:
         allocation = {}
@@ -973,17 +974,36 @@ def _execute_operation(
     files_since_save = 0
     SAVE_BATCH_SIZE = 5  # Save state every N files
     save_lock = threading.Lock()  # Protect files_since_save and state.save()
+    processed = 0
 
-    # Progress bar
-    pbar = tqdm(total=total_files, desc=progress_desc, unit="file",
-                disable=args.quiet, leave=True,
-                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]")
+    # Progress bar or simple log
+    if simple_log:
+        logging.info(f"Starting {progress_desc.lower()} {total_files} files...")
+        pbar = None
+    else:
+        pbar = tqdm(total=total_files, desc=progress_desc, unit="file",
+                    disable=args.quiet, leave=True,
+                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]")
+
+    def log_progress(path: Path, ok: bool, err: str | None = None) -> None:
+        """Log progress for simple-log mode."""
+        if simple_log:
+            processed_nonlocal[0] += 1
+            current = processed_nonlocal[0]
+            if ok:
+                rel = path.name
+                logging.info(f"[{current}/{total_files}] ✓ {rel}")
+            else:
+                logging.error(f"[{current}/{total_files}] ✗ {path.name}: {err}")
+
+    processed_nonlocal = [0]
 
     try:
         if max_workers == 1:
             # Sequential
             for item in items:
                 path, ok, err = process_item(item)
+                log_progress(path, ok, err)
                 if ok:
                     success += 1
                     files_since_save += 1
@@ -996,13 +1016,15 @@ def _execute_operation(
                     failed = True
                     error_msg = err
                     break
-                pbar.update(1)
+                if pbar:
+                    pbar.update(1)
         else:
             # Parallel uploads
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_path = {executor.submit(process_item, item): item[0] for item in items}
                 for future in as_completed(future_to_path):
                     path, ok, err = future.result()
+                    log_progress(path, ok, err)
                     if ok:
                         success += 1
                         # Thread-safe state save batching
@@ -1020,9 +1042,11 @@ def _execute_operation(
                         for f in future_to_path:
                             f.cancel()
                         break
-                    pbar.update(1)
+                    if pbar:
+                        pbar.update(1)
     finally:
-        pbar.close()
+        if pbar:
+            pbar.close()
         # Final state save
         if state and files_since_save > 0:
             state.save(args.source)
@@ -1038,7 +1062,10 @@ def _execute_operation(
     if post_success:
         post_success(args.source)
 
-    print(f"\n== Done. {success}/{total_files} {success_msg}.")
+    if simple_log:
+        logging.info(f"Done. {success}/{total_files} {success_msg}.")
+    else:
+        print(f"\n== Done. {success}/{total_files} {success_msg}.")
     return success
 
 
@@ -1069,6 +1096,8 @@ def main() -> None:
                              help="Verify files in B2 match local (no upload), exit with code 1 if mismatch")
     move_parser.add_argument("--verify-only", action="store_true",
                              help="Only verify SHA-1 of already uploaded files (no upload)")
+    move_parser.add_argument("--simple-log", action="store_true",
+                             help="Simple line-based logging per file (no progress bar, works in Colab)")
 
     copy_parser = subparsers.add_parser("copy", help="Copy files from source directory to B2 (no deletion)")
     copy_parser.add_argument("source", help="Local directory containing files to copy")
@@ -1084,6 +1113,8 @@ def main() -> None:
                              help="Verify files in B2 match local (no upload), exit with code 1 if mismatch")
     copy_parser.add_argument("--verify-only", action="store_true",
                              help="Only verify SHA-1 of already uploaded files (no upload)")
+    copy_parser.add_argument("--simple-log", action="store_true",
+                             help="Simple line-based logging per file (no progress bar, works in Colab)")
 
     args = parser.parse_args()
 
