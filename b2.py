@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Optional, TypeVar
 
 import yaml
-from b2sdk.v2 import B2Api
+from b2sdk.v2 import B2Api, InMemoryAccountInfo
 from b2sdk.v2.exception import B2Error
 from tqdm import tqdm
 
@@ -408,9 +408,14 @@ def load_config(config_path: str) -> dict[str, Account]:
 
 
 def get_b2_client(account: Account) -> B2Api:
-    """Authenticate and return a B2Api client for the given account."""
+    """Authenticate and return a B2Api client for the given account.
+
+    Uses InMemoryAccountInfo to isolate each account's authorization cache,
+    preventing cross-account cache pollution from shared SqliteAccountInfo.
+    """
     if account.client is None:
-        account.client = B2Api()
+        logging.debug(f"Creating NEW B2Api client for account {account.name}")
+        account.client = B2Api(InMemoryAccountInfo())
 
         def _authorize():
             account.client.authorize_account(
@@ -420,6 +425,8 @@ def get_b2_client(account: Account) -> B2Api:
             )
 
         retry_with_backoff(run_with_timeout, _authorize)
+    else:
+        logging.debug(f"Using CACHED B2Api client for account {account.name}")
     return account.client
 
 
@@ -477,7 +484,7 @@ def populate_bucket_files_and_usage(bucket: Bucket) -> None:
 
     def _list_and_process():
         """List and process all objects in the bucket incrementally (streaming)."""
-        b2_bucket = client.get_bucket_by_name(bucket.name)
+        b2_bucket = client.get_bucket_by_id(bucket.id_)
         # Stream objects instead of loading all into memory
         for fv, _ in b2_bucket.ls(recursive=True):
             total_local = fv.size
@@ -745,16 +752,21 @@ def upload_file(bucket: Bucket, abs_path: Path, object_name: str, size: int) -> 
     local_sha1 = compute_sha1(abs_path)
 
     def _do_upload() -> bool:
-        b2_bucket = client.get_bucket_by_name(bucket.name)
-        # Use upload_local_file for streaming upload (avoids loading entire file into memory)
-        b2_bucket.upload_local_file(str(abs_path), object_name)
-        return True
+                b2_bucket = client.get_bucket_by_id(bucket.id_)
+                # Use upload_local_file for streaming upload (avoids loading entire file into memory)
+                b2_bucket.upload_local_file(str(abs_path), object_name)
+                return True
 
     try:
         # Check if file already exists in B2 (for resume/idempotency)
         def _get_file_info():
-            b2_bucket = client.get_bucket_by_name(bucket.name)
-            return b2_bucket.get_file_info_by_name(object_name)
+            b2_bucket = client.get_bucket_by_id(bucket.id_)
+            try:
+                return b2_bucket.get_file_info_by_name(object_name)
+            except B2Error as e:
+                if "File not present" in str(e) or "not_found" in str(e).lower():
+                    return None
+                raise
 
         existing_file = retry_with_backoff(run_with_timeout, _get_file_info)
         if existing_file is not None:
@@ -764,12 +776,14 @@ def upload_file(bucket: Bucket, abs_path: Path, object_name: str, size: int) -> 
                 return True
             else:
                 logging.warning(f"File {object_name} exists but SHA-1 differs (local={local_sha1}, remote={remote_sha1}), will re-upload")
+        else:
+            logging.debug(f"File {object_name} not found in B2, will upload")
 
         retry_with_backoff(run_with_timeout, _do_upload)
 
         # Verify SHA-1 after upload
         def _verify_upload():
-            b2_bucket = client.get_bucket_by_name(bucket.name)
+            b2_bucket = client.get_bucket_by_id(bucket.id_)
             return b2_bucket.get_file_info_by_name(object_name)
 
         file_version = retry_with_backoff(run_with_timeout, _verify_upload)
@@ -1270,7 +1284,7 @@ def _execute_command(args: argparse.Namespace, accounts: dict[str, Account], com
                         # File exists in B2, verify SHA-1
                         client = get_b2_client(account)
                         def _get_file_info():
-                            b2_bucket = client.get_bucket_by_name(bucket.name)
+                            b2_bucket = client.get_bucket_by_id(bucket.id_)
                             return b2_bucket.get_file_info_by_name(src_file.rel_path)
                         file_version = retry_with_backoff(run_with_timeout, _get_file_info)
                         if file_version and file_version.content_sha1:
@@ -1312,7 +1326,7 @@ def _execute_command(args: argparse.Namespace, accounts: dict[str, Account], com
                     if bucket.has_file(src_file.rel_path):
                         client = get_b2_client(account)
                         def _get_file_info():
-                            b2_bucket = client.get_bucket_by_name(bucket.name)
+                            b2_bucket = client.get_bucket_by_id(bucket.id_)
                             return b2_bucket.get_file_info_by_name(src_file.rel_path)
                         file_version = retry_with_backoff(run_with_timeout, _get_file_info)
                         if file_version and file_version.content_sha1:
@@ -1342,6 +1356,8 @@ def _execute_command(args: argparse.Namespace, accounts: dict[str, Account], com
         filtered_allocation = {}
         skipped_count = 0
         skipped_size = 0
+        # Build abs_path -> rel_path lookup
+        rel_path_map = {f.abs_path: f.rel_path for f in source_files}
         for abs_path, (bucket, object_name) in allocation.items():
             if bucket._populate_failed:
                 filtered_allocation[abs_path] = (bucket, object_name)
@@ -1350,15 +1366,17 @@ def _execute_command(args: argparse.Namespace, accounts: dict[str, Account], com
                 filtered_allocation[abs_path] = (bucket, object_name)
                 continue
             client = get_b2_client(bucket.account)
+            # Check using the original file name (rel_path), not the allocated unique name
+            check_name = rel_path_map.get(abs_path, object_name)
             def _get_file_info():
-                b2_bucket = client.get_bucket_by_name(bucket.name)
-                return b2_bucket.get_file_info_by_name(object_name)
+                b2_bucket = client.get_bucket_by_id(bucket.id_)
+                return b2_bucket.get_file_info_by_name(check_name)
             existing_file = retry_with_backoff(run_with_timeout, _get_file_info)
             if existing_file is not None:
                 remote_sha1 = existing_file.content_sha1
                 local_sha1 = compute_sha1(abs_path)
                 if remote_sha1 is not None and remote_sha1 == local_sha1:
-                    logging.info(f"Skipping {object_name} - already exists with matching SHA-1")
+                    logging.info(f"Skipping {check_name} - already exists with matching SHA-1")
                     skipped_count += 1
                     skipped_size += abs_path.stat().st_size
                     continue

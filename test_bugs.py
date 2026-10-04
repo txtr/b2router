@@ -19,6 +19,7 @@ mock_b2api.get_bucket_by_name.return_value.ls.return_value = []
 b2sdk_module = types.ModuleType('b2sdk')
 b2sdk_v2 = types.ModuleType('b2sdk.v2')
 b2sdk_v2.B2Api = MagicMock(return_value=mock_b2api)
+b2sdk_v2.InMemoryAccountInfo = MagicMock()
 # Add exception module for B2Error import
 b2sdk_v2_exception = types.ModuleType('b2sdk.v2.exception')
 b2sdk_v2_exception.B2Error = Exception
