@@ -238,7 +238,7 @@ class OperationState:
     created_at: str
     updated_at: str
     allocations: list[AllocationEntry]
-    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, init=False)
 
     @staticmethod
     def create(source_dir: str, accounts_config: str, allocation: dict[Path, tuple[Bucket, str]]) -> 'OperationState':
@@ -273,7 +273,15 @@ class OperationState:
         )
 
     def to_json(self) -> str:
-        return json.dumps(asdict(self), indent=2)
+        # Exclude _lock from serialization (not JSON serializable)
+        data = {
+            "source_dir": self.source_dir,
+            "accounts_config": self.accounts_config,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "allocations": [asdict(e) for e in self.allocations]
+        }
+        return json.dumps(data, indent=2)
 
     @staticmethod
     def from_json(json_str: str) -> 'OperationState':
