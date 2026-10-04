@@ -1,0 +1,135 @@
+[
+  {
+    "id": "C1",
+    "severity": "CRITICAL",
+    "title": "run_with_timeout doesn't actually cancel B2 SDK operations",
+    "location": "lines 117-133",
+    "details": "ThreadPoolExecutor.cancel() only cancels the future if it hasn't started. Once the B2 SDK call is running, it cannot be interrupted. Long-running uploads/downloads will continue in background threads, potentially leaking threads and consuming resources."
+  },
+  {
+    "id": "C2",
+    "severity": "CRITICAL",
+    "title": "No integrity check on state file load",
+    "location": "lines 319-329",
+    "details": "OperationState.from_json() trusts the loaded JSON completely. No checksum/signature verification. A corrupted or tampered state file could cause incorrect resume behavior."
+  },
+  {
+    "id": "C3",
+    "severity": "CRITICAL",
+    "title": "SHA-1 mismatch after upload leaves file in B2 but returns failure",
+    "location": "lines 805-810",
+    "details": "If upload succeeds but SHA-1 verification fails (line 805-807), the file is already uploaded to B2 but we return False. On retry, this could create a duplicate or cause confusion. Should either delete the uploaded file or handle this case explicitly."
+  },
+  {
+    "id": "C4",
+    "severity": "CRITICAL",
+    "title": "--skip-existing checks wrong name when object_name differs from rel_path",
+    "location": "lines 1361-1397",
+    "details": "--skip-existing checks if rel_path exists in B2, but the actual upload uses object_name (which may have 'Copy of (N)' prefix if there was a collision). This means: 1) Could skip a file that has the same name but different content, 2) Could fail to skip a file that was previously uploaded with a 'Copy of' prefix."
+  },
+  {
+    "id": "H1",
+    "severity": "HIGH",
+    "title": "populate_bucket_files_and_usage double-counts on retry",
+    "location": "lines 471-507",
+    "details": "nonlocal_total = [0] is created once, but retry_with_backoff may call _list_and_process multiple times. Each retry continues accumulating file counts into the same list, causing used_bytes to be double/triple counted on retries."
+  },
+  {
+    "id": "H2",
+    "severity": "HIGH",
+    "title": "build_account_state parallel mode swallows individual account errors",
+    "location": "lines 510-527",
+    "details": "In parallel mode, future.result() will raise the first exception, but if multiple accounts fail, only the first error is seen. Also, there's no per-account retry logic in parallel mode."
+  },
+  {
+    "id": "H3",
+    "severity": "HIGH",
+    "title": "TOCTOU race in upload_file - check-then-upload not atomic",
+    "location": "lines 764-785",
+    "details": "Between checking if file exists in B2 (line 774) and uploading (line 785), another process could upload the same file. B2's upload_local_file will create a new version, not overwrite, so this results in duplicate versions rather than data loss. But it wastes bandwidth and storage."
+  },
+  {
+    "id": "H4",
+    "severity": "HIGH",
+    "title": "--verify-only and --check use rel_path but uploaded name may differ",
+    "location": "lines 1277-1358",
+    "details": "These modes check for files using src_file.rel_path, but the actual uploaded object_name may have 'Copy of (N)' prefix if there was a name collision. This means they won't find files that were uploaded with modified names, reporting false 'not found' or 'missing' errors."
+  },
+  {
+    "id": "H5",
+    "severity": "HIGH",
+    "title": "Unbounded task submission in ThreadPoolExecutor",
+    "location": "lines 1048-1050",
+    "details": "All items are submitted to the executor at once (future_to_path = {executor.submit(...) for item in items}). For 100K+ files, this creates 100K futures immediately, consuming memory. Should use a bounded queue or submit in batches."
+  },
+  {
+    "id": "M1",
+    "severity": "MEDIUM",
+    "title": "SHA-1 computed multiple times for same file",
+    "location": "multiple",
+    "details": "compute_sha1() is called in: OperationState.create(), upload_file(), --skip-existing, --check, --verify-only, and resume verification. For large files, this is expensive. Should cache SHA-1 by file path + mtime."
+  },
+  {
+    "id": "M2",
+    "severity": "MEDIUM",
+    "title": "Cached B2Api client doesn't respect realm changes",
+    "location": "lines 410-430",
+    "details": "If you run the tool with --realm=test, then run again with --realm=production, the cached B2Api client still has the test realm authorization. The client is cached on account.client and never reset when realm changes."
+  },
+  {
+    "id": "M3",
+    "severity": "MEDIUM",
+    "title": "Windows icacls failures silently ignored",
+    "location": "lines 303-316",
+    "details": "If icacls fails (not available, permission denied, etc.), the exception is caught and ignored. The state file may remain world-readable. At minimum should log a debug message."
+  },
+  {
+    "id": "M4",
+    "severity": "MEDIUM",
+    "title": "No protection against uploading from a B2 mount point",
+    "location": "lines 632-655",
+    "details": "If source_dir is a FUSE-mounted B2 bucket, collect_source_files will read files that are being uploaded, potentially causing loops or corruption."
+  },
+  {
+    "id": "M5",
+    "severity": "MEDIUM",
+    "title": "Simple log shows only filename, not relative path",
+    "location": "lines 1013-1022",
+    "details": "log_progress() uses path.name (line 1019) instead of the relative path. In simple-log mode, files with same name in different directories are indistinguishable."
+  },
+  {
+    "id": "M6",
+    "severity": "MEDIUM",
+    "title": "validate_config only checks file path, not content",
+    "location": "lines 331-333",
+    "details": "validate_config() compares self.accounts_config == accounts_config (both are file paths). If the YAML content changes but file path is same, resume proceeds with stale state that may not match current bucket capacities."
+  },
+  {
+    "id": "M7",
+    "severity": "MEDIUM",
+    "title": "Dry-run doesn't account for --skip-existing",
+    "location": "lines 1227-1274",
+    "details": "Dry-run shows allocation before --skip-existing filtering. User sees 'X files to upload' but actual upload would be fewer. Misleading for capacity planning."
+  },
+  {
+    "id": "L1",
+    "severity": "LOW",
+    "title": "No Unicode normalization for filenames",
+    "location": "multiple",
+    "details": "Filenames with different Unicode normalizations (NFC vs NFD) are treated as different by B2 but may appear identical to users. Could cause confusion or duplicates."
+  },
+  {
+    "id": "L2",
+    "severity": "LOW",
+    "title": "Non-atomic state file write on Windows",
+    "location": "line 301",
+    "details": "Path.write_text() is not atomic on Windows. If interrupted during write, state file could be corrupted. Should write to temp file then rename."
+  },
+  {
+    "id": "L3",
+    "severity": "LOW",
+    "title": "Broad exception catch in populate_bucket_files_and_usage",
+    "location": "line 501",
+    "details": "Catches all Exception, not just B2Error. Could mask bugs like AttributeError from SDK changes."
+  }
+]

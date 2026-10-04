@@ -1,0 +1,86 @@
+[
+  {
+    "id": "C1",
+    "severity": "CRITICAL",
+    "title": "run_with_timeout doesn't actually cancel B2 SDK operations",
+    "location": "lines 117-133",
+    "details": "ThreadPoolExecutor.cancel() only cancels the future if it hasn't started. Once the B2 SDK call is running, it cannot be interrupted. Long-running uploads/downloads will continue in background threads, potentially leaking threads and consuming resources."
+  },
+  {
+    "id": "C5",
+    "severity": "CRITICAL",
+    "title": "Cached B2Api client doesn't respect realm changes",
+    "location": "lines 438-458",
+    "details": "If you run the tool with --realm=test, then run again with --realm=production, the cached B2Api client still has the test realm authorization. The client is cached on account.client and never reset when realm changes. This means operations will use wrong realm."
+  },
+  {
+    "id": "C6",
+    "severity": "CRITICAL",
+    "title": "SHA-1 computed twice for each file (allocation + upload)",
+    "location": "lines 262, 795",
+    "details": "OperationState.create() calls compute_sha1() for each file (line 262), then upload_file() calls it again (line 795). For large files, this doubles I/O. Should cache SHA-1 by (path, mtime, size) and reuse."
+  },
+  {
+    "id": "C7",
+    "severity": "CRITICAL",
+    "title": "Simple log shows only filename, not relative path",
+    "location": "lines 1060-1069",
+    "details": "log_progress() uses path.name (line 1066) instead of the relative path. In simple-log mode, files with same name in different directories are indistinguishable. Makes logs useless for debugging."
+  },
+  {
+    "id": "H6",
+    "severity": "HIGH",
+    "title": "No protection against uploading from a B2 mount point",
+    "location": "lines 667-690",
+    "details": "If source_dir is a FUSE-mounted B2 bucket, collect_source_files will read files that are being uploaded, potentially causing loops or corruption."
+  },
+  {
+    "id": "H7",
+    "severity": "HIGH",
+    "title": "validate_config only checks file path, not content",
+    "location": "lines 359-361",
+    "details": "validate_config() compares self.accounts_config == accounts_config (both are file paths). If the YAML content changes but file path is same, resume proceeds with stale state that may not match current bucket capacities."
+  },
+  {
+    "id": "H8",
+    "severity": "HIGH",
+    "title": "Dry-run doesn't account for --skip-existing",
+    "location": "lines 1296-1343",
+    "details": "Dry-run shows allocation before --skip-existing filtering. User sees 'X files to upload' but actual upload would be fewer. Misleading for capacity planning."
+  },
+  {
+    "id": "H9",
+    "severity": "HIGH",
+    "title": "Resume doesn't verify file integrity if state lacks SHA-1",
+    "location": "lines 1006-1009",
+    "details": "If entry.sha1 is None (state created before SHA-1 was added), the check at line 1006 is skipped. File could have changed but will be uploaded without warning."
+  },
+  {
+    "id": "H10",
+    "severity": "HIGH",
+    "title": "Broad exception catch in populate_bucket_files_and_usage",
+    "location": "line 527",
+    "details": "Catches all Exception, not just B2Error. Could mask bugs like AttributeError from SDK changes."
+  },
+  {
+    "id": "M8",
+    "severity": "MEDIUM",
+    "title": "No Unicode normalization for filenames",
+    "location": "multiple",
+    "details": "Filenames with different Unicode normalizations (NFC vs NFD) are treated as different by B2 but may appear identical to users. Could cause confusion or duplicates."
+  },
+  {
+    "id": "L11",
+    "severity": "LOW",
+    "title": "hashlib imported inside get_state_dir function",
+    "location": "line 64",
+    "details": "Import inside function is less efficient and less readable. hashlib already imported at module level (line 16)."
+  },
+  {
+    "id": "L12",
+    "severity": "LOW",
+    "title": "Unused variable 'processed' in _execute_operation",
+    "location": "line 1049",
+    "details": "Variable assigned but never used. Dead code."
+  }
+]
