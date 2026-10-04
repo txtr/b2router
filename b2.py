@@ -732,9 +732,12 @@ def allocate_files(source_files: list[SourceFile], accounts: dict[str, Account])
 def compute_sha1(file_path: Path) -> str:
     """Compute SHA-1 hash of a file."""
     sha1 = hashlib.sha1()
-    with file_path.open('rb') as f:
-        for chunk in iter(lambda: f.read(8192), b''):
-            sha1.update(chunk)
+    try:
+        with file_path.open('rb') as f:
+            for chunk in iter(lambda: f.read(8192), b''):
+                sha1.update(chunk)
+    except KeyboardInterrupt:
+        raise
     return sha1.hexdigest()
 
 
@@ -1066,6 +1069,11 @@ def _execute_operation(
                         break
                     if pbar:
                         pbar.update(1)
+    except KeyboardInterrupt:
+        logging.warning("Interrupted by user, saving state...")
+        if state:
+            state.save(args.source)
+        raise
     finally:
         if pbar:
             pbar.close()
@@ -1422,6 +1430,12 @@ def _execute_command(args: argparse.Namespace, accounts: dict[str, Account], com
             print(f"\n💾  State saved. Resume with:")
             print(f"    b2.py {command_type} --accounts={args.accounts} {source} --resume --yes")
         return
+    except KeyboardInterrupt:
+        print("\n\n⚠️  Interrupted by user. State saved.")
+        if state:
+            print(f"Resume with:")
+            print(f"    b2.py {command_type} --accounts={args.accounts} {source} --resume --yes")
+        raise
 
 
 if __name__ == "__main__":
