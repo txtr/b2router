@@ -25,6 +25,7 @@ COPY --from=builder /root/.local /home/appuser/.local
 
 # Copy application
 COPY b2.py .
+COPY b2router/ ./b2router/
 COPY test_bugs.py .
 COPY accounts.yaml.example .
 
