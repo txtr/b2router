@@ -35,6 +35,9 @@ from b2sdk.v2 import B2Api, InMemoryAccountInfo
 from b2sdk.v2.exception import B2Error
 from tqdm import tqdm
 
+# SHA-1 cache to avoid recomputing for same file
+_sha1_cache: dict[tuple[str, float, int], str] = {}
+
 # Retry configuration
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 1.0  # seconds
@@ -61,7 +64,6 @@ def get_state_dir(source_dir: str) -> Path:
     """
     source_path = Path(source_dir).resolve()
     # Create a unique subdir based on source path hash
-    import hashlib
     path_hash = hashlib.sha256(str(source_path).encode()).hexdigest()[:12]
     
     if sys.platform == "win32":
@@ -203,6 +205,7 @@ class Account:
     buckets: list[Bucket] = field(default_factory=list)
     client: B2Api | None = field(default=None, repr=False)
     realm: str = "production"  # B2 realm (production or test)
+    _cached_realm: str = field(default="production", repr=False, init=False)
 
     def __repr__(self) -> str:
         return f"Account({self.name}, id={self.account_id}, capacity={self.capacity_in_gb} GB)"
@@ -240,6 +243,8 @@ class OperationState:
     allocations: list[AllocationEntry]
     # Integrity checksum of the allocations data
     _checksum: str = field(default="", repr=False)
+    # Cached config checksum for validation
+    _config_checksum_cached: str = field(default="", repr=False, init=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, init=False)
 
     @staticmethod
@@ -356,9 +361,21 @@ class OperationState:
             logging.warning(f"Failed to load state file: {exc}")
             return None
 
+    @staticmethod
+    def _config_checksum(config_path: str) -> str:
+        """Compute SHA-256 checksum of config file content."""
+        try:
+            return hashlib.sha256(Path(config_path).read_bytes()).hexdigest()
+        except Exception:
+            return ""
+
     def validate_config(self, accounts_config: str) -> bool:
         """Validate that the state matches the current config."""
-        return self.accounts_config == accounts_config
+        # Compare config file content hash, not just path
+        if not self._config_checksum_cached:
+            self._config_checksum_cached = OperationState._config_checksum(self.accounts_config)
+        current_checksum = OperationState._config_checksum(accounts_config)
+        return self._config_checksum_cached == current_checksum
 
     def get_pending(self) -> list[AllocationEntry]:
         """Get list of entries not yet uploaded."""
@@ -441,9 +458,15 @@ def get_b2_client(account: Account) -> B2Api:
     Uses InMemoryAccountInfo to isolate each account's authorization cache,
     preventing cross-account cache pollution from shared SqliteAccountInfo.
     """
+    # Invalidate cached client if realm changed
+    if account.client is not None and account._cached_realm != account.realm:
+        logging.debug(f"Realm changed ({account._cached_realm} -> {account.realm}), recreating B2Api client for {account.name}")
+        account.client = None
+
     if account.client is None:
         logging.debug(f"Creating NEW B2Api client for account {account.name}")
         account.client = B2Api(InMemoryAccountInfo())
+        account._cached_realm = account.realm
 
         def _authorize():
             account.client.authorize_account(
@@ -524,11 +547,16 @@ def populate_bucket_files_and_usage(bucket: Bucket) -> None:
     try:
         # Retry wraps the entire streaming operation with timeout
         total = retry_with_backoff(run_with_timeout, _list_and_process)
-    except Exception as exc:
+    except (B2Error, ConnectionError, TimeoutError, OSError, IOError) as exc:
         logging.warning(f"Error listing objects in {bucket.name}: {exc}")
         bucket._populate_failed = True
         # Don't set used_bytes - keep previous value or 0 to avoid false empty state
         return
+    except Exception as exc:
+        # Catch-all for unexpected errors - log and re-raise to surface bugs
+        logging.error(f"Unexpected error listing objects in {bucket.name}: {exc}")
+        bucket._populate_failed = True
+        raise
 
     if not bucket._populate_failed:
         bucket.used_bytes = total
@@ -668,9 +696,21 @@ def collect_source_files(source_dir: str) -> list[SourceFile]:
     """Collect all regular files from source directory, skipping broken symlinks.
 
     Does not follow symlinks to avoid including files outside the source tree.
+    Warns if source appears to be a FUSE mount point (e.g., rclone mount) to prevent loops.
     """
     files = []
     source_path = Path(source_dir).resolve()
+
+    # H6: Check if source might be a B2 FUSE mount (rclone, etc.)
+    # This is a heuristic - FUSE mounts often have these characteristics
+    try:
+        mount_info = Path("/proc/mounts").read_text() if Path("/proc/mounts").exists() else ""
+        if "fuse" in mount_info.lower() and str(source_path) in mount_info:
+            logging.warning(f"Source directory {source_path} appears to be a FUSE mount. "
+                          "Uploading from a B2 mount may cause loops or corruption.")
+    except Exception:
+        pass  # Best effort
+
     for root, _, filenames in os.walk(source_path, followlinks=False):
         for name in filenames:
             abs_path = Path(root) / name
@@ -765,7 +805,17 @@ def allocate_files(source_files: list[SourceFile], accounts: dict[str, Account])
 
 
 def compute_sha1(file_path: Path) -> str:
-    """Compute SHA-1 hash of a file."""
+    """Compute SHA-1 hash of a file with caching."""
+    try:
+        stat_result = file_path.stat()
+        cache_key = (str(file_path), stat_result.st_mtime, stat_result.st_size)
+    except OSError:
+        # If we can't stat, don't cache
+        cache_key = None
+
+    if cache_key and cache_key in _sha1_cache:
+        return _sha1_cache[cache_key]
+
     sha1 = hashlib.sha1()
     try:
         with file_path.open('rb') as f:
@@ -773,7 +823,11 @@ def compute_sha1(file_path: Path) -> str:
                 sha1.update(chunk)
     except KeyboardInterrupt:
         raise
-    return sha1.hexdigest()
+
+    result = sha1.hexdigest()
+    if cache_key:
+        _sha1_cache[cache_key] = result
+    return result
 
 
 def upload_file(bucket: Bucket, abs_path: Path, object_name: str, size: int) -> bool:
@@ -1007,6 +1061,10 @@ def _execute_operation(
                                         local_sha1 = compute_sha1(source_path)
                                         if local_sha1 != entry.sha1:
                                             logging.warning(f"Local file {entry.abs_path} SHA-1 changed, will re-upload")
+                                    else:
+                                        # H9: State lacks SHA-1 (old format), compute and verify
+                                        local_sha1 = compute_sha1(source_path)
+                                        logging.info(f"Computed SHA-1 for {entry.abs_path} (state missing hash): {local_sha1}")
                                     if account_remaining < file_size:
                                         logging.warning(f"Account {account.name} has insufficient capacity ({format_bytes(account_remaining)} remaining, need {format_bytes(file_size)}), skipping {entry.abs_path}")
                                         found = True
@@ -1046,7 +1104,6 @@ def _execute_operation(
     files_since_save = 0
     SAVE_BATCH_SIZE = 5  # Save state every N files
     save_lock = threading.Lock()  # Protect files_since_save and state.save()
-    processed = 0
 
     # Progress bar or simple log
     if simple_log:
@@ -1062,11 +1119,15 @@ def _execute_operation(
         if simple_log:
             processed_nonlocal[0] += 1
             current = processed_nonlocal[0]
-            if ok:
+            # Use relative path for clarity (from source_dir)
+            try:
+                rel: str = str(path.relative_to(args.source))
+            except ValueError:
                 rel = path.name
+            if ok:
                 logging.info(f"[{current}/{total_files}] ✓ {rel}")
             else:
-                logging.error(f"[{current}/{total_files}] ✗ {path.name}: {err}")
+                logging.error(f"[{current}/{total_files}] ✗ {rel}: {err}")
 
     processed_nonlocal = [0]
 
@@ -1336,6 +1397,71 @@ def _execute_command(args: argparse.Namespace, accounts: dict[str, Account], com
         skipped_size = total_size - total_allocated_size
         print(f"  ⚠️  Skipped: {skipped} files ({format_bytes(skipped_size)}) - insufficient capacity")
 
+    # Handle --skip-existing: filter out files already in B2 with matching SHA-1
+    # Do this before dry-run so dry-run reflects actual uploads
+    if args.skip_existing:
+        print(f"\n🔍  Checking for existing files in B2 (--skip-existing)...")
+        build_account_state(accounts, parallel=False)
+        filtered_allocation = {}
+        skipped_count = 0
+        skipped_size = 0
+        for abs_path, (bucket, object_name) in allocation.items():
+            if bucket._populate_failed:
+                filtered_allocation[abs_path] = (bucket, object_name)
+                continue
+            if bucket.account is None:
+                filtered_allocation[abs_path] = (bucket, object_name)
+                continue
+            client = get_b2_client(bucket.account)
+            # Check using the object_name that will be used for upload (not rel_path)
+            # object_name is the unique name allocated (may have "Copy of (N)" prefix)
+            def _get_file_info():
+                b2_bucket = client.get_bucket_by_id(bucket.id_)
+                return b2_bucket.get_file_info_by_name(object_name)
+            existing_file = retry_with_backoff(run_with_timeout, _get_file_info)
+            if existing_file is not None:
+                remote_sha1 = existing_file.content_sha1
+                local_sha1 = compute_sha1(abs_path)
+                if remote_sha1 is not None and remote_sha1 == local_sha1:
+                    logging.info(f"Skipping {object_name} - already exists with matching SHA-1")
+                    skipped_count += 1
+                    skipped_size += abs_path.stat().st_size
+                    continue
+            filtered_allocation[abs_path] = (bucket, object_name)
+        allocation = filtered_allocation
+        print(f"  ⏭️  Skipped: {skipped_count} files ({format_bytes(skipped_size)})")
+        print(f"  📤  Remaining: {len(allocation)} files")
+        if not allocation:
+            print("\n✅  All files already exist in B2 with matching SHA-1!")
+            return
+        # Re-display allocation plan after filtering
+        print(f"\n{'─' * 60}")
+        print("📋  ALLOCATION PLAN (after --skip-existing)")
+        print(f"{'─' * 60}")
+        account_allocations = {}
+        for abs_path, (bucket, object_name) in allocation.items():
+            if bucket.account is None:
+                raise ValueError(f"Bucket {bucket.name} has no associated account")
+            acc_name = bucket.account.name
+            if acc_name not in account_allocations:
+                account_allocations[acc_name] = []
+            account_allocations[acc_name].append((abs_path, bucket, object_name))
+        total_allocated = 0
+        total_allocated_size = 0
+        for acc_name, items in account_allocations.items():
+            acc_size = sum(item[0].stat().st_size for item in items)
+            print(f"\n  📦  Account: {acc_name} ({len(items)} files, {format_bytes(acc_size)})")
+            total_allocated += len(items)
+            total_allocated_size += acc_size
+            for abs_path, bucket, object_name in items[:10]:
+                size_str = format_bytes(abs_path.stat().st_size)
+                rel_path = rel_path_map.get(abs_path, abs_path.name)
+                print(f"      📄  {rel_path} ({size_str}) → {bucket.name}/{object_name}")
+            if len(items) > 10:
+                remaining_size = sum(item[0].stat().st_size for item in items[10:])
+                print(f"      … and {len(items) - 10} more files ({format_bytes(remaining_size)})")
+        print(f"\n  ✅  Total allocated: {total_allocated}/{len(source_files)} files ({format_bytes(total_allocated_size)})")
+
     if dry_run:
         print(f"\n{'=' * 60}")
         print("🔍  DRY RUN COMPLETE - No uploads performed")
@@ -1445,56 +1571,6 @@ def _execute_command(args: argparse.Namespace, accounts: dict[str, Account], com
             sys.exit(1)
         return
 
-    # Handle --skip-existing: filter out files already in B2 with matching SHA-1
-    if args.skip_existing:
-        print(f"\n🔍  Checking for existing files in B2 (--skip-existing)...")
-        build_account_state(accounts, parallel=False)
-        filtered_allocation = {}
-        skipped_count = 0
-        skipped_size = 0
-        for abs_path, (bucket, object_name) in allocation.items():
-            if bucket._populate_failed:
-                filtered_allocation[abs_path] = (bucket, object_name)
-                continue
-            if bucket.account is None:
-                filtered_allocation[abs_path] = (bucket, object_name)
-                continue
-            client = get_b2_client(bucket.account)
-            # Check using the object_name that will be used for upload (not rel_path)
-            # object_name is the unique name allocated (may have "Copy of (N)" prefix)
-            def _get_file_info():
-                b2_bucket = client.get_bucket_by_id(bucket.id_)
-                return b2_bucket.get_file_info_by_name(object_name)
-            existing_file = retry_with_backoff(run_with_timeout, _get_file_info)
-            if existing_file is not None:
-                remote_sha1 = existing_file.content_sha1
-                local_sha1 = compute_sha1(abs_path)
-                if remote_sha1 is not None and remote_sha1 == local_sha1:
-                    logging.info(f"Skipping {object_name} - already exists with matching SHA-1")
-                    skipped_count += 1
-                    skipped_size += abs_path.stat().st_size
-                    continue
-            filtered_allocation[abs_path] = (bucket, object_name)
-        allocation = filtered_allocation
-        print(f"  ⏭️  Skipped: {skipped_count} files ({format_bytes(skipped_size)})")
-        print(f"  📤  Remaining: {len(allocation)} files")
-        if not allocation:
-            print("\n✅  All files already exist in B2 with matching SHA-1!")
-            return
-        print(f"\n{'=' * 60}")
-        print("⚠️  CONFIRMATION REQUIRED")
-        print(f"{'=' * 60}")
-        action = "move" if command_type == "move" else "copy"
-        print(f"This will {action} {len(allocation)} files to B2.")
-        print("Type 'yes' to confirm, or anything else to cancel:")
-        try:
-            response = input("> ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print("\nCancelled.")
-            return
-        if response != "yes":
-            print("Cancelled.")
-            return
 
     print(f"\n{'=' * 60}")
     action = "Uploading" if command_type == "move" else "Copying"
