@@ -8,6 +8,7 @@ from typing import Callable, TypeVar
 
 from b2sdk.v2 import B2Api, InMemoryAccountInfo
 from b2sdk.v2.exception import B2Error
+from b2sdk._internal.account_info.exception import MissingAccountData
 
 from .models import Account, Bucket
 from .exceptions import AuthenticationError, BucketError
@@ -25,10 +26,18 @@ def _call_with_token_refresh(account: Account, func: Callable[[B2Api], T]) -> T:
     client = get_b2_client(account)
     try:
         return func(client)
-    except B2Error as exc:
-        # Check for 401 Unauthorized (expired token)
-        if "401" in str(exc) or "unauthorized" in str(exc).lower() or "expired" in str(exc).lower():
-            logging.warning(f"Token expired for account {account.name}, re-authorizing...")
+    except (B2Error, MissingAccountData) as exc:
+        # Check for 401 Unauthorized (expired token) or missing account data (b2sdk InMemoryAccountInfo bug)
+        is_auth_error = isinstance(exc, B2Error) and (
+            "401" in str(exc) or "unauthorized" in str(exc).lower() or "expired" in str(exc).lower()
+        )
+        is_missing_data = isinstance(exc, MissingAccountData)
+        
+        if is_auth_error or is_missing_data:
+            if is_auth_error:
+                logging.warning(f"Token expired for account {account.name}, re-authorizing...")
+            else:
+                logging.warning(f"Missing account data for {account.name} (b2sdk InMemoryAccountInfo bug), re-authorizing...")
             # Force re-authorization on next get_b2_client call
             account.client = None
             client = get_b2_client(account)

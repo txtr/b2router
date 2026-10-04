@@ -24,10 +24,21 @@ b2sdk_v2.InMemoryAccountInfo = MagicMock()
 b2sdk_v2_exception = types.ModuleType('b2sdk.v2.exception')
 b2sdk_v2_exception.B2Error = Exception
 b2sdk_v2.exception = b2sdk_v2_exception
+# Add internal account_info exception for MissingAccountData
+b2sdk_internal = types.ModuleType('b2sdk._internal')
+b2sdk_internal_account_info = types.ModuleType('b2sdk._internal.account_info')
+b2sdk_internal_account_info_exception = types.ModuleType('b2sdk._internal.account_info.exception')
+b2sdk_internal_account_info_exception.MissingAccountData = Exception
+b2sdk_internal_account_info.exception = b2sdk_internal_account_info_exception
+b2sdk_internal.account_info = b2sdk_internal_account_info
+b2sdk_module._internal = b2sdk_internal
 b2sdk_module.v2 = b2sdk_v2
 sys.modules['b2sdk'] = b2sdk_module
 sys.modules['b2sdk.v2'] = b2sdk_v2
 sys.modules['b2sdk.v2.exception'] = b2sdk_v2_exception
+sys.modules['b2sdk._internal'] = b2sdk_internal
+sys.modules['b2sdk._internal.account_info'] = b2sdk_internal_account_info
+sys.modules['b2sdk._internal.account_info.exception'] = b2sdk_internal_account_info_exception
 
 # Now import b2.py
 import b2
