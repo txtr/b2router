@@ -112,23 +112,35 @@ def cleanup_empty_dirs(source_dir: str) -> None:
     """Remove empty directories after file moves.
 
     Does not follow symlinks to avoid traversing outside the source tree.
+    Uses retry with backoff to handle race conditions where file handles
+    may not be released immediately after parallel uploads.
     """
+    import os
     import time
-    # Small delay to ensure all file handles are released after parallel uploads
-    time.sleep(0.1)
+    from pathlib import Path
+    
     source_path = Path(source_dir).resolve()
-    for root, dirs, files in os.walk(source_path, topdown=False, followlinks=False):
-        for dir_name in dirs:
-            dir_path = Path(root) / dir_name
-            try:
-                if not any(dir_path.iterdir()):
-                    dir_path.rmdir()
-                    logging.info(f"Removed empty directory: {dir_path}")
-            except OSError:
-                pass  # Directory not empty or other error
-
-
-import os
+    
+    # Retry a few times with increasing delay to handle race conditions
+    for attempt in range(5):
+        try:
+            for root, dirs, files in os.walk(source_path, topdown=False, followlinks=False):
+                for dir_name in dirs:
+                    dir_path = Path(root) / dir_name
+                    try:
+                        if not any(dir_path.iterdir()):
+                            dir_path.rmdir()
+                            logging.info(f"Removed empty directory: {dir_path}")
+                    except OSError:
+                        pass  # Directory not empty or other error
+            break  # Success, exit retry loop
+        except OSError as exc:
+            if attempt < 4:
+                delay = 0.1 * (2 ** attempt)  # 0.1, 0.2, 0.4, 0.8, 1.6 seconds
+                logging.debug(f"cleanup_empty_dirs retry {attempt+1}/5 after {delay}s: {exc}")
+                time.sleep(delay)
+            else:
+                logging.warning(f"cleanup_empty_dirs failed after 5 retries: {exc}")
 
 
 def _upload_and_delete(bucket: Bucket, abs_path: Path, object_name: str, size: int) -> Tuple[Path, bool, Optional[str]]:

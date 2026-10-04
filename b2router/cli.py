@@ -5,6 +5,7 @@ import logging
 import sys
 from pathlib import Path
 
+from . import __version__
 from .config import load_config
 from .commands.list import list_all
 from .commands.move import run_move
@@ -44,7 +45,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("-q", "--quiet", action="store_true",
                        help="Suppress non-error output")
     parser.add_argument("--version", action="version",
-                       version=f"%(prog)s 1.0.0")
+                       version=f"%(prog)s {__version__}")
     parser.add_argument("--realm", default="production",
                        choices=["production", "test"],
                        help="B2 realm (default: production)")
