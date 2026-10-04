@@ -3,6 +3,7 @@
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
+from concurrent import futures
 from typing import Callable, TypeVar
 
 from b2sdk.v2 import B2Api, InMemoryAccountInfo
@@ -14,6 +15,25 @@ from .retry import retry_with_backoff, run_with_timeout
 from .allocation import CAP_SAFETY
 
 T = TypeVar('T')
+
+# Token expiration handling
+B2_TOKEN_EXPIRY_SECONDS = 24 * 3600  # 24 hours
+
+
+def _call_with_token_refresh(account: Account, func: Callable[[B2Api], T]) -> T:
+    """Call a function with B2Api, refreshing token on 401 errors."""
+    client = get_b2_client(account)
+    try:
+        return func(client)
+    except B2Error as exc:
+        # Check for 401 Unauthorized (expired token)
+        if "401" in str(exc) or "unauthorized" in str(exc).lower() or "expired" in str(exc).lower():
+            logging.warning(f"Token expired for account {account.name}, re-authorizing...")
+            # Force re-authorization on next get_b2_client call
+            account.client = None
+            client = get_b2_client(account)
+            return func(client)
+        raise
 
 
 def get_b2_client(account: Account) -> B2Api:
@@ -50,12 +70,10 @@ def discover_and_add_buckets_for_account(account: Account) -> None:
     # Clear existing buckets to make this idempotent (safe to call multiple times)
     account.buckets.clear()
 
-    client = get_b2_client(account)
-
-    def _list_buckets():
+    def _list_buckets(client: B2Api):
         return client.list_buckets()
 
-    b2_buckets_info = retry_with_backoff(run_with_timeout, _list_buckets)
+    b2_buckets_info = retry_with_backoff(run_with_timeout, lambda: _call_with_token_refresh(account, _list_buckets))
     # First pass: create buckets with placeholder capacity
     for b2_bucket in b2_buckets_info:
         # Handle both possible SDK attribute names for bucket ID
@@ -84,12 +102,11 @@ def populate_bucket_files_and_usage(bucket: Bucket) -> None:
     """
     if bucket.account is None:
         raise BucketError("Bucket must have an associated account")
-    client = get_b2_client(bucket.account)
     bucket.files.clear()
     bucket._file_names.clear()
     bucket._populate_failed = False
 
-    def _list_and_process() -> int:
+    def _list_and_process(client: B2Api) -> int:
         """List and process all objects in the bucket incrementally (streaming).
         Returns total bytes processed.
         """
@@ -103,7 +120,7 @@ def populate_bucket_files_and_usage(bucket: Bucket) -> None:
 
     try:
         # Retry wraps the entire streaming operation with timeout
-        total = retry_with_backoff(run_with_timeout, _list_and_process)
+        total = retry_with_backoff(run_with_timeout, lambda: _call_with_token_refresh(bucket.account, _list_and_process))  # type: ignore[arg-type]
     except (B2Error, ConnectionError, TimeoutError, OSError, IOError) as exc:
         logging.warning(f"Error listing objects in {bucket.name}: {exc}")
         bucket._populate_failed = True
@@ -152,7 +169,3 @@ def build_account_state(accounts: dict[str, Account], parallel: bool = False) ->
             if i > 0:
                 time.sleep(0.5)  # Rate limit mitigation
             _process_account(account)
-
-
-# Need to import futures
-from concurrent import futures

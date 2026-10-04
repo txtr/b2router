@@ -15,7 +15,7 @@ Options:
 
 # Re-export for backwards compatibility with tests and existing code
 from b2router.config import load_config
-from b2router.allocation import allocate_files, get_unique_object_name
+from b2router.allocation import allocate_files, get_unique_object_name, validate_object_name
 from b2router.upload import delete_source_file, cleanup_empty_dirs
 from b2router.utils import collect_source_files, format_bytes
 from b2router.b2_client import discover_and_add_buckets_for_account, populate_bucket_files_and_usage
@@ -30,6 +30,7 @@ __all__ = [
     "load_config",
     "allocate_files",
     "get_unique_object_name",
+    "validate_object_name",
     "delete_source_file",
     "cleanup_empty_dirs",
     "collect_source_files",

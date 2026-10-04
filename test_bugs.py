@@ -271,6 +271,54 @@ assert f1 != f4
 assert hash(f1) == hash(f2)
 print("PASS: FileMetadata equality includes size and sha1")
 
+# Test 19: validate_object_name UTF-8 validation
+print("\n=== Test 19: validate_object_name UTF-8 validation ===")
+import b2
+# Valid names should pass
+b2.validate_object_name("normal_file.txt")
+b2.validate_object_name("file with spaces.txt")
+b2.validate_object_name("unicode_文件.txt")
+print("  Valid names pass")
+
+# Invalid control characters should fail
+try:
+    b2.validate_object_name("file\x00name.txt")
+    print("FAIL: should have raised ValueError for null byte")
+except ValueError as e:
+    print(f"  Null byte rejected: {e}")
+
+try:
+    b2.validate_object_name("file\x01name.txt")
+    print("FAIL: should have raised ValueError for control char")
+except ValueError as e:
+    print(f"  Control char rejected: {e}")
+
+try:
+    b2.validate_object_name("file\x7fname.txt")
+    print("FAIL: should have raised ValueError for DEL")
+except ValueError as e:
+    print(f"  DEL rejected: {e}")
+
+# Valid control chars (tab, newline, carriage return) should pass
+b2.validate_object_name("file\tname.txt")
+b2.validate_object_name("file\nname.txt")
+b2.validate_object_name("file\rname.txt")
+print("  Tab/newline/carriage return accepted")
+
+# Test max length (1024 bytes)
+long_name = "a" * 1024
+b2.validate_object_name(long_name)
+print("  1024 byte name accepted")
+
+too_long = "a" * 1025
+try:
+    b2.validate_object_name(too_long)
+    print("FAIL: should have raised ValueError for too long name")
+except ValueError as e:
+    print(f"  >1024 byte name rejected: {e}")
+
+print("PASS: validate_object_name UTF-8 validation works")
+
 # Cleanup
 import shutil
 for path in ['/tmp/empty.yaml', '/tmp/bad.yaml', '/tmp/empty_id.yaml', '/tmp/empty_key.yaml', 

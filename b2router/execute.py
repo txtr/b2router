@@ -161,13 +161,14 @@ def execute_operation(
                     disable=args.quiet, leave=True,
                     bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]")
 
-    processed_nonlocal = [0]
+    processed_count = 0
 
     def log_progress(path: Path, ok: bool, err: Optional[str] = None) -> None:
         """Log progress for simple-log mode."""
+        nonlocal processed_count
         if simple_log:
-            processed_nonlocal[0] += 1
-            current = processed_nonlocal[0]
+            processed_count += 1
+            current = processed_count
             # Use relative path for clarity (from source_dir)
             try:
                 rel: str = str(path.relative_to(args.source))

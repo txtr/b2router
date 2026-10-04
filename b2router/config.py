@@ -30,6 +30,10 @@ def load_config(config_path: str) -> dict[str, Account]:
             account_id = acc_data["account_id"]
             master_key = acc_data["master_key"]
             capacity_in_gb = acc_data["capacity_in_gb"]
+            # Optional realm per account (defaults to production)
+            realm = acc_data.get("realm", "production")
+            if realm not in ("production", "test"):
+                raise ConfigError(f"realm must be 'production' or 'test' in account '{acc_name}'")
 
             # Validate credentials are non-empty
             if not account_id or not str(account_id).strip():
@@ -48,7 +52,8 @@ def load_config(config_path: str) -> dict[str, Account]:
                 name=acc_name,
                 account_id=account_id,
                 master_key=master_key,
-                capacity_in_gb=capacity_in_gb
+                capacity_in_gb=capacity_in_gb,
+                realm=realm
             )
         except KeyError:
             raise
