@@ -36,7 +36,11 @@ from b2sdk.v2.exception import B2Error
 from tqdm import tqdm
 
 # SHA-1 cache to avoid recomputing for same file
+# Use LRU cache with max size to prevent memory leak
+from functools import lru_cache
+
 _sha1_cache: dict[tuple[str, float, int], str] = {}
+_MAX_SHA1_CACHE_SIZE = 10000
 
 # Retry configuration
 MAX_RETRIES = 3
@@ -265,10 +269,15 @@ class OperationState:
                 raise ValueError(f"Object name too long (>1024 bytes): {object_name[:50]}...")
             # Compute SHA-1 for resume verification
             file_sha1 = compute_sha1(abs_path)
+            # Use Path.relative_to for correct relative path computation
+            try:
+                rel_path = str(abs_path.relative_to(Path(source_dir).resolve())).replace(os.sep, "/")
+            except ValueError:
+                rel_path = abs_path.name
             entries.append(AllocationEntry(
                 abs_path=str(abs_path),
                 size=abs_path.stat().st_size,
-                rel_path=str(abs_path).replace(str(Path(source_dir).resolve()), "").lstrip("/"),
+                rel_path=rel_path,
                 bucket_name=bucket.name,
                 bucket_id=bucket.id_,
                 account_name=bucket.account.name,
@@ -759,19 +768,21 @@ def allocate_files(source_files: list[SourceFile], accounts: dict[str, Account])
     """
     # Build list of valid buckets with their accounts
     # Use local tracking to avoid mutating bucket objects
-    bucket_info = []  # list of (bucket, bucket_remaining, account_remaining)
+    # Track account_remaining per account (shared across buckets)
+    account_remaining_map = {}  # account_name -> remaining bytes
+    bucket_info = []  # list of (bucket, bucket_remaining, account_name)
     for account in accounts.values():
         # Calculate total used space across all buckets in this account
         account_used = sum(b.used_bytes for b in account.buckets if not b._populate_failed)
         account_capacity = int(account.capacity_in_gb * (1024 ** 3) * CAP_SAFETY)
-        account_remaining = account_capacity - account_used
+        account_remaining_map[account.name] = account_capacity - account_used
 
         for bucket in account.buckets:
             if bucket._populate_failed:
                 logging.warning(f"Skipping bucket {bucket.name} (account {account.name}) - population failed, cannot determine available space")
                 continue
             bucket_remaining = bucket.remaining_bytes
-            bucket_info.append((bucket, bucket_remaining, account_remaining))
+            bucket_info.append((bucket, bucket_remaining, account.name))
 
     sorted_files = sorted(source_files, key=lambda x: x.size, reverse=True)
     allocation: dict[Path, tuple[Bucket, str]] = {}
@@ -780,8 +791,9 @@ def allocate_files(source_files: list[SourceFile], accounts: dict[str, Account])
         best_idx = None
         best_remaining = None
 
-        for i, (bucket, bucket_remaining, account_remaining) in enumerate(bucket_info):
-            # Use the more restrictive limit
+        for i, (bucket, bucket_remaining, account_name) in enumerate(bucket_info):
+            # Use the more restrictive limit (shared account_remaining)
+            account_remaining = account_remaining_map[account_name]
             effective_remaining = min(bucket_remaining, account_remaining)
 
             if effective_remaining >= src_file.size:
@@ -790,15 +802,16 @@ def allocate_files(source_files: list[SourceFile], accounts: dict[str, Account])
                     best_idx = i
 
         if best_idx is not None:
-            bucket, bucket_remaining, account_remaining = bucket_info[best_idx]
+            bucket, bucket_remaining, account_name = bucket_info[best_idx]
             object_name = get_unique_object_name(bucket, src_file.rel_path)
             allocation[src_file.abs_path] = (bucket, object_name)
-            # Update local tracking only (don't mutate bucket objects)
+            # Update local tracking (both bucket and account level)
             bucket_info[best_idx] = (
                 bucket,
                 bucket_remaining - src_file.size,
-                account_remaining - src_file.size
+                account_name
             )
+            account_remaining_map[account_name] -= src_file.size
         else:
             logging.warning(f"Skipping {src_file.rel_path} ({src_file.size} bytes) – no bucket has enough free space")
     return allocation
@@ -827,6 +840,12 @@ def compute_sha1(file_path: Path) -> str:
     result = sha1.hexdigest()
     if cache_key:
         _sha1_cache[cache_key] = result
+        # Enforce cache size limit (simple FIFO eviction)
+        if len(_sha1_cache) > _MAX_SHA1_CACHE_SIZE:
+            # Remove oldest entries (first N items)
+            keys_to_remove = list(_sha1_cache.keys())[:len(_sha1_cache) - _MAX_SHA1_CACHE_SIZE]
+            for k in keys_to_remove:
+                _sha1_cache.pop(k, None)
     return result
 
 
@@ -1500,13 +1519,18 @@ def _execute_command(args: argparse.Namespace, accounts: dict[str, Account], com
                             return b2_bucket.get_file_info_by_name(object_name)
                         file_version = retry_with_backoff(run_with_timeout, _get_file_info)
                         if file_version and file_version.content_sha1:
-                            local_sha1 = compute_sha1(src_file.abs_path)
-                            if file_version.content_sha1 == local_sha1:
-                                logging.info(f"✓ {object_name} SHA-1 matches")
-                                verified += 1
-                            else:
-                                logging.error(f"✗ {object_name} SHA-1 MISMATCH: local={local_sha1}, remote={file_version.content_sha1}")
+                            try:
+                                local_sha1 = compute_sha1(src_file.abs_path)
+                            except OSError as exc:
+                                logging.error(f"✗ {object_name} LOCAL FILE MISSING: {exc}")
                                 mismatches += 1
+                            else:
+                                if file_version.content_sha1 == local_sha1:
+                                    logging.info(f"✓ {object_name} SHA-1 matches")
+                                    verified += 1
+                                else:
+                                    logging.error(f"✗ {object_name} SHA-1 MISMATCH: local={local_sha1}, remote={file_version.content_sha1}")
+                                    mismatches += 1
                         else:
                             logging.warning(f"? {object_name} SHA-1 not available from B2")
                         found = True
@@ -1552,10 +1576,15 @@ def _execute_command(args: argparse.Namespace, accounts: dict[str, Account], com
                             return b2_bucket.get_file_info_by_name(object_name)
                         file_version = retry_with_backoff(run_with_timeout, _get_file_info)
                         if file_version and file_version.content_sha1:
-                            local_sha1 = compute_sha1(src_file.abs_path)
-                            if file_version.content_sha1 != local_sha1:
-                                logging.error(f"✗ {object_name} SHA-1 MISMATCH")
+                            try:
+                                local_sha1 = compute_sha1(src_file.abs_path)
+                            except OSError as exc:
+                                logging.error(f"✗ {object_name} LOCAL FILE MISSING: {exc}")
                                 mismatches += 1
+                            else:
+                                if file_version.content_sha1 != local_sha1:
+                                    logging.error(f"✗ {object_name} SHA-1 MISMATCH")
+                                    mismatches += 1
                         else:
                             logging.warning(f"? {object_name} SHA-1 not available from B2")
                         found = True
@@ -1576,6 +1605,19 @@ def _execute_command(args: argparse.Namespace, accounts: dict[str, Account], com
     action = "Uploading" if command_type == "move" else "Copying"
     print(f"🚀  STARTING {action.upper()}...")
     print(f"{'=' * 60}\n")
+
+    # Confirmation prompt (unless --yes provided)
+    if not args.yes:
+        print(f"This will {command_type} {len(allocation)} files to B2.")
+        print("Type 'yes' to confirm, or anything else to cancel:")
+        try:
+            response = input("> ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nCancelled.")
+            return
+        if response != "yes":
+            print("Cancelled.")
+            return
 
     try:
         _execute_operation(
