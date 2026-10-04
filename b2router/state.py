@@ -17,6 +17,9 @@ from .hashing import compute_sha1
 class OperationState:
     """Persisted state for resume capability (used by both move and copy)."""
 
+    # Save state every N uploads to reduce I/O
+    SAVE_THRESHOLD = 10
+
     def __init__(
         self,
         source_dir: str,
@@ -34,6 +37,7 @@ class OperationState:
         self._checksum = _checksum
         self._config_checksum_cached: str = ""
         self._lock = threading.Lock()
+        self._uploads_since_save = 0
 
     @staticmethod
     def _compute_checksum(allocations: list[AllocationEntry]) -> str:
@@ -168,6 +172,20 @@ class OperationState:
                     entry.uploaded = True
                     break
             self.updated_at = datetime.utcnow().isoformat() + "Z"
+            # Batch saves: only write to disk every SAVE_THRESHOLD uploads
+            self._uploads_since_save += 1
+            if self._uploads_since_save >= self.SAVE_THRESHOLD:
+                self._uploads_since_save = 0
+                # Note: caller must call save() explicitly, or we could auto-save here
+                # Auto-saving here would require passing source_dir, so we leave it to caller
+
+    def should_save(self) -> bool:
+        """Check if state should be saved (batch threshold reached)."""
+        return self._uploads_since_save >= self.SAVE_THRESHOLD
+
+    def reset_save_counter(self) -> None:
+        """Reset the upload counter after saving."""
+        self._uploads_since_save = 0
 
     def is_complete(self) -> bool:
         """Check if all entries are uploaded."""

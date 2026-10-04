@@ -148,7 +148,8 @@ def execute_operation(
     failed = False
     error_msg = None
     files_since_save = 0
-    SAVE_BATCH_SIZE = 5  # Save state every N files
+    # Use state's SAVE_THRESHOLD if available, otherwise default
+    save_batch_size = state.SAVE_THRESHOLD if state else 10
     save_lock = threading.Lock()  # Protect files_since_save and state.save()
 
     # Progress bar or simple log
@@ -188,7 +189,7 @@ def execute_operation(
                     files_since_save += 1
                     if state:
                         state.mark_uploaded(str(path))
-                        if files_since_save >= SAVE_BATCH_SIZE:
+                        if files_since_save >= save_batch_size:
                             state.save(args.source)
                             files_since_save = 0
                 else:
@@ -226,7 +227,7 @@ def execute_operation(
                                 files_since_save += 1
                                 if state:
                                     state.mark_uploaded(str(path_res))
-                                    if files_since_save >= SAVE_BATCH_SIZE:
+                                    if files_since_save >= save_batch_size:
                                         state.save(args.source)
                                         files_since_save = 0
                         else:
