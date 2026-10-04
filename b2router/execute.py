@@ -117,6 +117,15 @@ def execute_operation(
                                     found = True
                                     break
 
+                                # Validate object name (B2 restrictions: control chars, UTF-8, max 1024 bytes)
+                                try:
+                                    from .allocation import validate_object_name
+                                    validate_object_name(entry.object_name)
+                                except ValueError as exc:
+                                    logging.warning(f"Invalid object name in state for {entry.abs_path}: {exc}, skipping")
+                                    found = True
+                                    break
+
                                 allocation[Path(entry.abs_path)] = (bucket, entry.object_name)
                                 found = True
                                 break

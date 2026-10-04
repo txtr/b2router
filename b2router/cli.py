@@ -117,9 +117,10 @@ def main() -> int:
         logging.error(f"Failed to load configuration: {exc}")
         return 1
 
-    # Store realm for use in get_b2_client
+    # Apply global --realm as default ONLY for accounts that don't have realm specified
     for account in accounts.values():
-        account.realm = args.realm
+        if not hasattr(account, 'realm') or account.realm is None:
+            account.realm = args.realm
 
     if args.command == "list":
         list_all(accounts, parallel=args.parallel)

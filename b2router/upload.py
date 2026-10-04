@@ -1,6 +1,7 @@
 """Upload and file operations for B2 Router."""
 
 import logging
+import time
 from pathlib import Path
 from typing import Tuple, Optional
 
@@ -75,9 +76,22 @@ def upload_file(bucket: Bucket, abs_path: Path, object_name: str, size: int) -> 
 
         if remote_sha1 is None:
             # B2 may not have computed SHA-1 yet for large files (async processing)
-            # Log warning but don't fail - upload succeeded
-            logging.warning(f"B2 has not yet computed SHA-1 for {object_name} (large file async processing). Upload succeeded but SHA-1 not verified.")
-            return True
+            # Poll for SHA-1 with timeout instead of skipping verification
+            logging.info(f"Waiting for B2 to compute SHA-1 for {object_name} (large file)...")
+            max_wait = 300  # 5 minutes max
+            poll_interval = 5
+            waited = 0
+            while waited < max_wait:
+                time.sleep(poll_interval)
+                waited += poll_interval
+                file_version = retry_with_backoff(run_with_timeout, _verify_upload)
+                if file_version and file_version.content_sha1:
+                    remote_sha1 = file_version.content_sha1
+                    logging.info(f"SHA-1 computed after {waited}s: {remote_sha1}")
+                    break
+            if remote_sha1 is None:
+                logging.error(f"B2 did not compute SHA-1 for {object_name} within {max_wait}s timeout. Upload may have succeeded but integrity not verified.")
+                return False
 
         if local_sha1 != remote_sha1:
             logging.error(f"SHA-1 mismatch for {object_name}: local={local_sha1}, remote={remote_sha1}")
