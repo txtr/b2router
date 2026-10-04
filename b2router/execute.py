@@ -222,6 +222,12 @@ def execute_operation(
                 # Submit initial batch
                 submit_batch(pending[:batch_size])
                 pending = pending[batch_size:]
+                
+                # Log that uploads have started (helps with perceived latency on slow connections)
+                if simple_log:
+                    logging.info(f"Submitted {len(future_to_path)} initial uploads, waiting for first completion...")
+                elif pbar:
+                    logging.debug(f"Submitted {len(future_to_path)} initial uploads")
 
                 while future_to_path:
                     # Wait for at least one to complete
@@ -256,6 +262,10 @@ def execute_operation(
                         next_batch = pending[:batch_size]
                         pending = pending[batch_size:]
                         submit_batch(next_batch)
+                        if simple_log:
+                            logging.info(f"Submitted {len(next_batch)} more uploads ({len(future_to_path)} active)")
+                        elif pbar:
+                            logging.debug(f"Submitted {len(next_batch)} more uploads ({len(future_to_path)} active)")
     except KeyboardInterrupt:
         logging.warning("Interrupted by user, saving state...")
         if state:
