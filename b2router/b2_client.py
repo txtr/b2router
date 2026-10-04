@@ -11,6 +11,7 @@ from b2sdk.v2.exception import B2Error
 from .models import Account, Bucket
 from .exceptions import AuthenticationError, BucketError
 from .retry import retry_with_backoff, run_with_timeout
+from .allocation import CAP_SAFETY
 
 T = TypeVar('T')
 
@@ -67,7 +68,7 @@ def discover_and_add_buckets_for_account(account: Account) -> None:
     # The account-level capacity limit is enforced in allocate_files()
     n = len(account.buckets)
     if n > 0:
-        total_capacity_bytes = int(account.capacity_in_gb * (1024 ** 3) * 0.99)  # CAP_SAFETY
+        total_capacity_bytes = int(account.capacity_in_gb * (1024 ** 3) * CAP_SAFETY)
         for bucket in account.buckets:
             bucket.capacity_bytes = total_capacity_bytes
             # used_bytes will be populated by populate_bucket_files_and_usage

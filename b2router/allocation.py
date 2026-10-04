@@ -10,8 +10,27 @@ from .models import SourceFile, Account, Bucket
 CAP_SAFETY = 0.99  # stay 1% under capacity
 
 
+def validate_object_name(name: str) -> None:
+    """Validate that object name doesn't contain B2-forbidden characters.
+    
+    B2 object names must be valid UTF-8 and cannot contain:
+    - Null bytes
+    - Control characters (0x00-0x1F, 0x7F)
+    """
+    if '\x00' in name:
+        raise ValueError("Object name cannot contain null bytes")
+    # Check for control characters (except tab, newline, carriage return which are valid in UTF-8)
+    for ch in name:
+        code = ord(ch)
+        if code < 0x20 and ch not in ('\t', '\n', '\r'):
+            raise ValueError(f"Object name contains forbidden control character: U+{code:04X}")
+        if code == 0x7F:
+            raise ValueError("Object name contains forbidden DEL character (U+007F)")
+
+
 def get_unique_object_name(bucket: Bucket, base_name: str) -> str:
     """Generate a unique object name by appending 'Copy of (N)' prefix if needed."""
+    validate_object_name(base_name)
     if not bucket.has_file(base_name):
         # Validate length even for original name
         if len(base_name.encode('utf-8')) > 1024:

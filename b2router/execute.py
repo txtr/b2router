@@ -2,6 +2,7 @@
 
 import argparse
 import logging
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from pathlib import Path
@@ -12,6 +13,7 @@ from tqdm import tqdm
 from .models import SourceFile, AllocationEntry
 from .state import OperationState
 from .exceptions import B2RouterError
+from .allocation import CAP_SAFETY
 
 if TYPE_CHECKING:
     from .models import Account, Bucket
@@ -88,7 +90,7 @@ def execute_operation(
 
                                 # Check account capacity
                                 account_used = sum(b.used_bytes for b in account.buckets if not b._populate_failed)
-                                account_capacity = int(account.capacity_in_gb * (1024 ** 3) * 0.99)
+                                account_capacity = int(account.capacity_in_gb * (1024 ** 3) * CAP_SAFETY)
                                 account_remaining = account_capacity - account_used
 
                                 # Get source file size for capacity check
@@ -171,9 +173,9 @@ def execute_operation(
             except ValueError:
                 rel = path.name
             if ok:
-                logging.info(f"[{current}/{total_files}] ✓ {rel}")
+                print(f"[{current}/{total_files}] ✓ {rel}")
             else:
-                logging.error(f"[{current}/{total_files}] ✗ {rel}: {err}")
+                print(f"[{current}/{total_files}] ✗ {rel}: {err}", file=sys.stderr)
 
     try:
         if max_workers == 1:

@@ -1,13 +1,13 @@
 """Verification commands for B2 Router (--verify-only, --check)."""
 
 import logging
-import sys
 from typing import TYPE_CHECKING
 
 from ..state import OperationState
 from ..b2_client import build_account_state, get_b2_client
 from ..hashing import compute_sha1
 from ..retry import retry_with_backoff, run_with_timeout
+from ..exceptions import VerificationError
 
 if TYPE_CHECKING:
     from ..models import Account, SourceFile, Bucket
@@ -31,6 +31,9 @@ def verify_files(
     if state:
         for entry in state.allocations:
             state_allocations[entry.abs_path] = entry.object_name
+    else:
+        logging.warning("No state file found for verification; using relative paths as object names. "
+                       "Files with 'Copy of (N)' prefixes may not be verified correctly.")
 
     mismatches = 0
     missing = 0
@@ -96,7 +99,7 @@ def run_verify_only(args, accounts: dict[str, 'Account'], source_files: list['So
     print(f"\n{'=' * 60}")
     print(f"Verified: {verified}, Mismatches: {mismatches}, Not found: {len(source_files) - verified - mismatches}")
     if mismatches > 0:
-        sys.exit(1)
+        raise VerificationError(f"{mismatches} SHA-1 mismatch(es) found")
     return 0
 
 
@@ -111,5 +114,5 @@ def run_check(args, accounts: dict[str, 'Account'], source_files: list['SourceFi
     print(f"\n{'=' * 60}")
     print(f"OK: {len(source_files) - mismatches - missing}, Mismatches: {mismatches}, Missing: {missing}")
     if mismatches > 0 or missing > 0:
-        sys.exit(1)
+        raise VerificationError(f"{mismatches} mismatch(es), {missing} missing file(s)")
     return 0

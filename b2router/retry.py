@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, TypeVar
 
 from .exceptions import B2RouterError
+from b2sdk.v2.exception import B2Error
 
 T = TypeVar('T')
 
@@ -18,6 +19,9 @@ RETRY_MAX_DELAY = 30.0  # seconds
 # Overall timeout for B2 API calls (seconds)
 B2_API_TIMEOUT = 300
 
+# Default exceptions to retry - includes B2Error for B2 API transient errors
+DEFAULT_RETRY_EXCEPTIONS = (B2Error, ConnectionError, TimeoutError, OSError, IOError)
+
 
 def retry_with_backoff(
     func: Callable[..., T],
@@ -25,7 +29,7 @@ def retry_with_backoff(
     max_retries: int = MAX_RETRIES,
     base_delay: float = RETRY_BASE_DELAY,
     max_delay: float = RETRY_MAX_DELAY,
-    retry_exceptions: tuple[type[Exception], ...] = (ConnectionError, TimeoutError, OSError, IOError),
+    retry_exceptions: tuple[type[Exception], ...] = DEFAULT_RETRY_EXCEPTIONS,
     **kwargs
 ) -> T:
     """Execute function with exponential backoff retry for transient errors."""

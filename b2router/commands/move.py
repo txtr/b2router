@@ -16,6 +16,7 @@ from ..execute import execute_operation
 from ..commands.verify import run_verify_only, run_check
 from ..hashing import compute_sha1
 from ..retry import retry_with_backoff, run_with_timeout
+from ..exceptions import VerificationError
 
 if TYPE_CHECKING:
     from ..models import Bucket
@@ -93,15 +94,20 @@ def run_move(args: argparse.Namespace, accounts: dict[str, Account]) -> int:
 
     # Handle --verify-only and --check
     if args.verify_only:
-        return run_verify_only(args, accounts, source_files, source)
+        try:
+            return run_verify_only(args, accounts, source_files, source)
+        except VerificationError as exc:
+            logging.error(str(exc))
+            return 1
     if args.check:
-        return run_check(args, accounts, source_files, source)
+        try:
+            return run_check(args, accounts, source_files, source)
+        except VerificationError as exc:
+            logging.error(str(exc))
+            return 1
 
     # Confirmation prompt (unless --yes provided)
     if not args.yes:
-        print(f"\n{'=' * 60}")
-        print(f"🚀  STARTING UPLOADING...")
-        print(f"{'=' * 60}\n")
         print(f"This will move {len(allocation)} files to B2.")
         print("Type 'yes' to confirm, or anything else to cancel:")
         try:
@@ -112,6 +118,10 @@ def run_move(args: argparse.Namespace, accounts: dict[str, Account]) -> int:
         if response != "yes":
             print("Cancelled.")
             return 0
+
+    print(f"\n{'=' * 60}")
+    print(f"🚀  STARTING UPLOADING...")
+    print(f"{'=' * 60}\n")
 
     try:
         execute_operation(
@@ -139,6 +149,9 @@ def print_allocation_plan(
     suffix: str = ""
 ) -> None:
     """Print the allocation plan grouped by account."""
+    # Build abs_path -> (rel_path, size) lookup
+    file_info_map = {f.abs_path: (f.rel_path, f.size) for f in source_files}
+
     # Group by account for display
     account_allocations: dict[str, list[tuple[Path, 'Bucket', str]]] = {}
     for abs_path, (bucket, object_name) in allocation.items():
@@ -151,24 +164,22 @@ def print_allocation_plan(
 
     total_allocated = 0
     total_allocated_size = 0
-    # Build abs_path -> rel_path lookup
-    rel_path_map = {f.abs_path: f.rel_path for f in source_files}
 
     print(f"\n{'─' * 60}")
     print(f"📋  ALLOCATION PLAN{suffix}")
     print(f"{'─' * 60}")
 
     for acc_name, items in account_allocations.items():
-        acc_size = sum(item[0].stat().st_size for item in items)
+        acc_size = sum(file_info_map[item[0]][1] for item in items)
         print(f"\n  📦  Account: {acc_name} ({len(items)} files, {format_bytes(acc_size)})")
         total_allocated += len(items)
         total_allocated_size += acc_size
         for abs_path, bucket, object_name in items[:10]:
-            size_str = format_bytes(abs_path.stat().st_size)
-            rel_path = rel_path_map.get(abs_path, abs_path.name)
+            rel_path, size = file_info_map[abs_path]
+            size_str = format_bytes(size)
             print(f"      📄  {rel_path} ({size_str}) → {bucket.name}/{object_name}")
         if len(items) > 10:
-            remaining_size = sum(item[0].stat().st_size for item in items[10:])
+            remaining_size = sum(file_info_map[item[0]][1] for item in items[10:])
             print(f"      … and {len(items) - 10} more files ({format_bytes(remaining_size)})")
 
     print(f"\n  ✅  Total allocated: {total_allocated}/{len(source_files)} files ({format_bytes(total_allocated_size)})")
@@ -185,7 +196,7 @@ def filter_existing_files(
 ) -> dict[Path, tuple['Bucket', str]]:
     """Filter out files that already exist in B2 with matching SHA-1."""
     print(f"\n🔍  Checking for existing files in B2 (--skip-existing)...")
-    build_account_state(accounts, parallel=False)
+    # Note: build_account_state was already called, reuse existing bucket data
     filtered_allocation = {}
     skipped_count = 0
     skipped_size = 0
@@ -212,7 +223,9 @@ def filter_existing_files(
             if remote_sha1 is not None and remote_sha1 == local_sha1:
                 logging.info(f"Skipping {object_name} - already exists with matching SHA-1")
                 skipped_count += 1
-                skipped_size += abs_path.stat().st_size
+                # Use size from source_files lookup
+                size = next((f.size for f in source_files if f.abs_path == abs_path), abs_path.stat().st_size)
+                skipped_size += size
                 continue
         filtered_allocation[abs_path] = (bucket, object_name)
     allocation = filtered_allocation

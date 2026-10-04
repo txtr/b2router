@@ -3,6 +3,7 @@
 from ..models import Account
 from ..b2_client import build_account_state
 from ..utils import format_bytes
+from ..allocation import CAP_SAFETY
 
 
 def list_all(accounts: dict[str, Account], parallel: bool = False) -> None:
@@ -27,7 +28,7 @@ def list_all(accounts: dict[str, Account], parallel: bool = False) -> None:
         print(f"    Realm: {getattr(account, 'realm', 'production')}")
 
         account_used = sum(b.used_bytes for b in account.buckets if not b._populate_failed)
-        account_capacity = int(account.capacity_in_gb * (1024 ** 3) * 0.99)
+        account_capacity = int(account.capacity_in_gb * (1024 ** 3) * CAP_SAFETY)
         account_used_gb = account_used / (1024 ** 3)
         account_capacity_gb = account_capacity / (1024 ** 3)
         pct = (account_used_gb / account_capacity_gb * 100) if account_capacity_gb > 0 else 0
@@ -40,7 +41,7 @@ def list_all(accounts: dict[str, Account], parallel: bool = False) -> None:
         filled = int(bar_width * account_used_gb / account_capacity_gb) if account_capacity_gb > 0 else 0
         filled = max(0, min(filled, bar_width))  # Clamp
         bar = "█" * filled + "░" * (bar_width - filled)
-        print(f"    Capacity: {account_capacity_gb:.2f} GB / {account.capacity_in_gb} GB (safety: 99%)")
+        print(f"    Capacity: {account_capacity_gb:.2f} GB / {account.capacity_in_gb} GB (safety: {CAP_SAFETY*100:.0f}%)")
         print(f"    Used:     {account_used_gb:.2f} GB ({pct:.1f}%) [{bar}]")
 
         account_buckets = 0

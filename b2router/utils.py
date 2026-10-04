@@ -23,6 +23,7 @@ def collect_source_files(source_dir: str) -> list['SourceFile']:
 
     Does not follow symlinks to avoid including files outside the source tree.
     Warns if source appears to be a FUSE mount point (e.g., rclone mount) to prevent loops.
+    Handles PermissionError on directories gracefully.
     """
     import logging
     import os
@@ -40,7 +41,27 @@ def collect_source_files(source_dir: str) -> list['SourceFile']:
         logging.warning(f"Source directory {source_path} appears to be a FUSE mount. "
                       "Uploading from a B2 mount may cause loops or corruption.")
 
-    for root, _, filenames in os.walk(source_path, followlinks=False):
+    def walk_with_permission_handling(top):
+        """Walk directory tree with PermissionError handling."""
+        dirs = []
+        nondirs = []
+        try:
+            with os.scandir(top) as it:
+                for entry in it:
+                    if entry.is_dir(follow_symlinks=False):
+                        dirs.append(entry.name)
+                    else:
+                        nondirs.append(entry.name)
+        except PermissionError as exc:
+            logging.warning(f"Permission denied accessing directory {top}: {exc}")
+            return
+
+        yield top, dirs, nondirs
+        for dirname in dirs:
+            new_path = os.path.join(top, dirname)
+            yield from walk_with_permission_handling(new_path)
+
+    for root, _, filenames in walk_with_permission_handling(source_path):
         for name in filenames:
             abs_path = Path(root) / name
             try:
