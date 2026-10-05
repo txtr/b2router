@@ -1,2 +1,2 @@
 b2sdk>=2.0.0
-pyyaml>=6.0
+pyyaml>=6.0.3
