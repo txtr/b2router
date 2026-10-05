@@ -14,26 +14,34 @@ from .retry import retry_with_backoff, run_with_timeout
 from .exceptions import UploadError
 
 
-def upload_file(bucket: Bucket, abs_path: Path, object_name: str, size: int) -> bool:
+def upload_file(bucket: Bucket, abs_path: Path, object_name: str, size: int, skip_pre_hash: bool = False) -> bool:
     """Upload a file to B2 using streaming and verify SHA-1 after upload.
 
-    If file already exists in B2 with matching SHA-1, skip upload.
+    If file already exists in B2 with matching SHA-1, skip upload (unless skip_pre_hash=True).
 
     Note: There is a TOCTOU race between checking for existing file and uploading.
     B2 does not support atomic compare-and-swap for uploads. If another process
     uploads the same file between our check and upload, a new version will be
     created. The post-upload SHA-1 verification ensures data integrity.
+
+    Args:
+        skip_pre_hash: If True, skip pre-upload SHA-1 computation and existence check.
+                       Useful for copy operations where deduplication is not needed.
+                       SHA-1 is still computed after upload for verification.
     """
     if bucket.account is None:
         raise UploadError("Bucket must have an associated account")
     account = bucket.account
     client = get_b2_client(account)
 
-    # Compute local SHA-1 before upload
-    local_sha1 = compute_sha1(abs_path)
     size_mb = size / (1024 * 1024)
     if size_mb >= 100:
         logging.info(f"Uploading large file: {object_name} ({size_mb:.1f} MB)")
+
+    # Compute local SHA-1 before upload (unless skipped)
+    local_sha1 = None
+    if not skip_pre_hash:
+        local_sha1 = compute_sha1(abs_path)
 
     def _do_upload() -> bool:
         b2_bucket = client.get_bucket_by_id(bucket.id_)
@@ -42,26 +50,29 @@ def upload_file(bucket: Bucket, abs_path: Path, object_name: str, size: int) -> 
         return True
 
     try:
-        # Check if file already exists in B2 (for resume/idempotency)
-        def _get_file_info():
-            b2_bucket = client.get_bucket_by_id(bucket.id_)
-            try:
-                return b2_bucket.get_file_info_by_name(object_name)
-            except B2Error as e:
-                if "File not present" in str(e) or "not_found" in str(e).lower():
-                    return None
-                raise
+        # Check if file already exists in B2 (for resume/idempotency) - only if not skipping pre-hash
+        if not skip_pre_hash:
+            def _get_file_info():
+                b2_bucket = client.get_bucket_by_id(bucket.id_)
+                try:
+                    return b2_bucket.get_file_info_by_name(object_name)
+                except B2Error as e:
+                    if "File not present" in str(e) or "not_found" in str(e).lower():
+                        return None
+                    raise
 
-        existing_file = retry_with_backoff(run_with_timeout, _get_file_info)
-        if existing_file is not None:
-            remote_sha1 = existing_file.content_sha1
-            if remote_sha1 is not None and remote_sha1 == local_sha1:
-                logging.info(f"File {object_name} already exists with matching SHA-1, skipping upload")
-                return True
+            existing_file = retry_with_backoff(run_with_timeout, _get_file_info)
+            if existing_file is not None:
+                remote_sha1 = existing_file.content_sha1
+                if remote_sha1 is not None and remote_sha1 == local_sha1:
+                    logging.info(f"File {object_name} already exists with matching SHA-1, skipping upload")
+                    return True
+                else:
+                    logging.warning(f"File {object_name} exists but SHA-1 differs (local={local_sha1}, remote={remote_sha1}), will re-upload")
             else:
-                logging.warning(f"File {object_name} exists but SHA-1 differs (local={local_sha1}, remote={remote_sha1}), will re-upload")
+                logging.debug(f"File {object_name} not found in B2, will upload")
         else:
-            logging.debug(f"File {object_name} not found in B2, will upload")
+            logging.debug(f"Skipping pre-upload existence check for {object_name}")
 
         # Upload with timeout scaled by file size
         upload_timeout = 300 + int(size_mb / 50) * 60  # 5 min base + 1 min per 50MB
@@ -103,6 +114,10 @@ def upload_file(bucket: Bucket, abs_path: Path, object_name: str, size: int) -> 
             if remote_sha1 is None:
                 logging.error(f"B2 did not compute SHA-1 for {object_name} within {max_wait}s timeout. Upload may have succeeded but integrity not verified.")
                 return False
+
+        # Compute local SHA-1 now if we skipped it before
+        if skip_pre_hash:
+            local_sha1 = compute_sha1(abs_path)
 
         if local_sha1 != remote_sha1:
             logging.error(f"SHA-1 mismatch for {object_name}: local={local_sha1}, remote={remote_sha1}")
@@ -171,7 +186,7 @@ def cleanup_empty_dirs(source_dir: str) -> None:
 
 def _upload_and_delete(bucket: Bucket, abs_path: Path, object_name: str, size: int) -> Tuple[Path, bool, Optional[str]]:
     """Upload a file and delete source on success. Returns (abs_path, success, error_msg)."""
-    if upload_file(bucket, abs_path, object_name, size):
+    if upload_file(bucket, abs_path, object_name, size, skip_pre_hash=False):
         if delete_source_file(abs_path):
             return (abs_path, True, None)
         else:
@@ -182,7 +197,7 @@ def _upload_and_delete(bucket: Bucket, abs_path: Path, object_name: str, size: i
 
 def _upload_only(bucket: Bucket, abs_path: Path, object_name: str, size: int) -> Tuple[Path, bool, Optional[str]]:
     """Upload a file without deleting source. Returns (abs_path, success, error_msg)."""
-    if upload_file(bucket, abs_path, object_name, size):
+    if upload_file(bucket, abs_path, object_name, size, skip_pre_hash=True):
         return (abs_path, True, None)
     else:
         return (abs_path, False, f"Upload failed for {abs_path} to {bucket.name}")
