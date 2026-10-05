@@ -1,1 +1,1 @@
-"""Commands package for B2 Router."""
+# commands package

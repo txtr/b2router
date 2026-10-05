@@ -1,141 +1,83 @@
-"""Copy command for B2 Router."""
+"""Copy command for b2router_simple - sequential upload, no deletion."""
 
-import argparse
 import logging
-import sys
-from pathlib import Path
-from typing import TYPE_CHECKING
-
-from ..models import Account, SourceFile
-from ..state import OperationState
-from ..utils import format_bytes, collect_source_files
-from ..b2_client import build_account_state
-from ..allocation import allocate_files
-from ..upload import _upload_only
-from ..execute import execute_operation
-from ..commands.verify import run_verify_only, run_check
-from ..commands.common import print_allocation_plan, filter_existing_files
-from ..exceptions import VerificationError
-
-if TYPE_CHECKING:
-    from ..models import Bucket
+from ..b2_client import build_buckets, upload_file, get_file_info
+from ..allocation import allocate_files, print_allocation_plan
+from ..utils import collect_source_files, format_bytes
 
 
-def run_copy(args: argparse.Namespace, accounts: dict[str, Account]) -> int:
-    """Execute copy command."""
-    source = args.source
-    dry_run = args.dry_run
-    resume = args.resume
-    parallel_uploads = min(args.parallel_uploads, 10)
-
-    if not Path(source).is_dir():
-        logging.error(f"Source directory not found: {source}")
-        return 1
-
-    source_files = collect_source_files(source)
+def run_copy(accounts, source_dir: str) -> int:
+    """Copy files from source_dir to B2 buckets."""
+    # Collect source files
+    source_files = collect_source_files(source_dir)
     if not source_files:
-        logging.info("No files found in source directory.")
+        print("No files found in source directory")
         return 0
 
-    total_size = sum(f.size for f in source_files)
-    print(f"\n{'=' * 60}")
-    print(f"        B2 ROUTER - COPY OPERATION")
-    print(f"{'=' * 60}")
-    print(f"📁  Source:      {source}")
-    print(f"📄  Files:       {len(source_files)}")
-    print(f"📦  Total size:  {format_bytes(total_size)}")
-    print(f"⚙️  Mode:        {'Dry-run' if dry_run else 'Execute'}")
-    print(f"🔄  Resume:      {'Yes' if resume else 'No'}")
-    print(f"🔀  Parallel:    {parallel_uploads}")
-    if resume:
-        print(f"🔁  Resuming from saved state...")
+    print(f"Found {len(source_files)} files ({format_bytes(sum(f.size for f in source_files))})")
 
-    state = None
-    if resume:
-        state = OperationState.load(source)
-        if not state:
-            logging.error(f"No saved state found to resume. Use without --resume for new copy.")
-            return 1
-        # Validate config matches
-        if not state.validate_config(args.accounts):
-            logging.error(f"Config mismatch: state was created with different accounts file. Use without --resume for new copy.")
-            return 1
-        print(f"📋  State loaded: {state.created_at} (updated {state.updated_at})")
-        print("🔍  Querying B2 accounts...")
-        build_account_state(accounts, parallel=False)
-    else:
-        print("🔍  Querying B2 accounts...")
-        build_account_state(accounts, parallel=False)
-
-    print("📊  Allocating files...")
-    allocation = allocate_files(source_files, accounts)
-    if not allocation:
-        print("⚠️  No files could be allocated (insufficient capacity).")
-        return 0
-
-    # Display allocation plan
-    print_allocation_plan(allocation, source_files, accounts)
-
-    # Handle --skip-existing: filter out files already in B2 with matching SHA-1
-    if args.skip_existing:
-        allocation = filter_existing_files(allocation, accounts, source_files)
-        if not allocation:
-            print("\n✅  All files already exist in B2 with matching SHA-1!")
-            return 0
-        # Re-display allocation plan after filtering
-        print_allocation_plan(allocation, source_files, accounts, " (after --skip-existing)")
-
-    if dry_run:
-        print(f"\n{'=' * 60}")
-        print("🔍  DRY RUN COMPLETE - No uploads performed")
-        print(f"{'=' * 60}")
-        return 0
-
-    # Handle --verify-only and --check
-    if args.verify_only:
-        try:
-            return run_verify_only(args, accounts, source_files, source)
-        except VerificationError as exc:
-            logging.error(str(exc))
-            return 1
-    if args.check:
-        try:
-            return run_check(args, accounts, source_files, source)
-        except VerificationError as exc:
-            logging.error(str(exc))
-            return 1
-
-    # Confirmation prompt (unless --yes provided)
-    if not args.yes:
-        print(f"This will copy {len(allocation)} files to B2.")
-        print("Type 'yes' to confirm, or anything else to cancel:")
-        try:
-            response = input("> ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print("\nCancelled.")
-            return 0
-        if response != "yes":
-            print("Cancelled.")
-            return 0
-
-    print(f"\n{'=' * 60}")
-    print(f"🚀  STARTING COPYING...")
-    print(f"{'=' * 60}\n")
-
-    try:
-        execute_operation(
-            args, accounts, source_files, allocation, state, resume, parallel_uploads,
-            operation_type="copy",
-            upload_func=_upload_only,
-            progress_desc="Copying",
-            success_msg="files successfully copied",
-            post_success=None,  # No cleanup for copy
+    # Build buckets and get current usage
+    buckets = build_buckets(accounts)
+    for bucket in buckets:
+        api = __import__('b2sdk.v2', fromlist=['B2Api']).B2Api(
+            __import__('b2sdk.v2', fromlist=['InMemoryAccountInfo']).InMemoryAccountInfo()
         )
-    except Exception as exc:
-        logging.error(f"Copy failed: {exc}")
-        if state:
-            print(f"\n💾  State saved. Resume with:")
-            print(f"    b2router copy --accounts={args.accounts} {source} --resume --yes")
-        return 1
+        acc = next(a for a in accounts if a.name == bucket.account_name)
+        api.authorize_account("production", acc.account_id, acc.master_key)
 
-    return 0
+        # Get current usage
+        used = sum(s for _, s in list_files_in_bucket(api, bucket.bucket_id))
+        bucket.used_bytes = used
+
+    # Allocate
+    allocations = allocate_files(source_files, buckets)
+    if not allocations:
+        print("No files could be allocated (all too large)")
+        return 0
+
+    print_allocation_plan(allocations, source_files, buckets)
+
+    # Execute uploads sequentially
+    print("\nStarting upload...")
+    success = 0
+    failed = 0
+
+    # Group allocations by bucket to reuse API connections
+    by_bucket: dict[str, list] = {}
+    for a in allocations:
+        by_bucket.setdefault(a.bucket.bucket_id, []).append(a)
+
+    for bucket_id, entries in by_bucket.items():
+        bucket = entries[0].bucket
+        acc = next(a for a in accounts if a.name == bucket.account_name)
+        api = __import__('b2sdk.v2', fromlist=['B2Api']).B2Api(
+            __import__('b2sdk.v2', fromlist=['InMemoryAccountInfo']).InMemoryAccountInfo()
+        )
+        api.authorize_account("production", acc.account_id, acc.master_key)
+
+        for i, entry in enumerate(entries, 1):
+            # Check if file already exists in B2
+            existing = get_file_info(api, bucket.bucket_id, entry.object_name)
+            if existing:
+                print(f"[{i}/{len(entries)}] ⊘ {entry.object_name} (already exists)")
+                success += 1
+                continue
+
+            print(f"[{i}/{len(entries)}] ↑ {entry.object_name} ({format_bytes(entry.source_file.size)})")
+            if upload_file(api, bucket.bucket_id, str(entry.source_file.path), entry.object_name):
+                print(f"  ✓")
+                success += 1
+            else:
+                print(f"  ✗ FAILED")
+                failed += 1
+
+    print(f"\n{'=' * 60}")
+    print(f"Done. {success} succeeded, {failed} failed")
+    print(f"{'=' * 60}")
+    return 0 if failed == 0 else 1
+
+
+def list_files_in_bucket(api, bucket_id: str):
+    """Import from b2_client to avoid circular import."""
+    from ..b2_client import list_files_in_bucket as _list
+    return _list(api, bucket_id)

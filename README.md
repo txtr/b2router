@@ -5,24 +5,18 @@
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Code Style](https://img.shields.io/badge/code%20style-ruff-black.svg)](https://github.com/astral-sh/ruff)
 
-Route files from a local directory to Backblaze B2 buckets across multiple accounts with greedy best-fit allocation.
+Lean, fast CLI for routing files from a local directory to Backblaze B2 buckets across multiple accounts. Designed for Colab and simple automation.
 
 ## Features
 
-- **Multi-account management** - Manage 100+ B2 accounts with individual capacity limits
-- **Greedy best-fit allocation** - Intelligently distributes files across buckets while respecting account-level capacity
-- **Streaming uploads** - Handles large files (GB+) without memory issues
-- **Atomic operations** - Upload then delete; fail-fast on any error
-- **Resume capability** - Persisted state enables recovery from interruptions
-- **Parallel uploads** - 1-10 concurrent workers with progress tracking
-- **Progress bar** - Real-time ETA, transfer rate, and elapsed time
-- **Retry with backoff** - Exponential backoff + jitter for transient B2 errors
-- **Symlink safety** - Never follows symlinks; prevents directory traversal
-- **Comprehensive tests** - 18 test cases covering edge cases
-- **Copy command** - Upload without deleting source files
-- **Config validation** - Duplicate account_id detection
-- **B2 realm support** - Production and test environments
+- **Multi-account management** - Manage multiple B2 accounts with individual capacity limits
+- **Greedy best-fit allocation** - Intelligently distributes files across buckets while respecting account-level capacity (minimal free space)
+- **Single-threaded, sequential uploads** - Simple, predictable, no parallel complexity
+- **Copy & Move commands** - Copy (keep local) or Move (delete local after upload)
+- **Auto-discovers buckets** - No bucket_name in config; uses first bucket per account via B2 SDK
+- **Fail-fast on errors** - No retry backoff, no partial failures
 - **Type safety** - Full mypy type checking
+- **Zero dependencies beyond b2sdk + pyyaml** - ~600 lines total
 
 ## Quick Start
 
@@ -39,25 +33,13 @@ cp accounts.yaml.example accounts.yaml
 # Edit accounts.yaml with your B2 Application Keys
 
 # List all buckets and files
-python b2.py --accounts=accounts.yaml list --parallel
+python b2.py --accounts=accounts.yaml list
 
-# Dry-run move (preview allocation)
-python b2.py --accounts=accounts.yaml move /path/to/data --dry-run
+# Copy files to B2 (keeps local files)
+python b2.py --accounts=accounts.yaml copy /path/to/data
 
-# Execute move
-python b2.py --accounts=accounts.yaml move /path/to/data --yes
-
-# Dry-run copy (preview allocation)
-python b2.py --accounts=accounts.yaml copy /path/to/data --dry-run
-
-# Execute copy (no deletion of local files)
-python b2.py --accounts=accounts.yaml copy /path/to/data --yes
-
-# Resume interrupted move
-python b2.py --accounts=accounts.yaml move /path/to/data --resume --yes
-
-# Resume interrupted copy
-python b2.py --accounts=accounts.yaml copy /path/to/data --resume --yes
+# Move files to B2 (deletes local files after upload)
+python b2.py --accounts=accounts.yaml move /path/to/data
 ```
 
 ## Configuration
@@ -69,8 +51,10 @@ accounts:
   my-account:
     account_id: "your_application_key_id"
     master_key: "your_application_key"
-    capacity_in_gb: 10
+    capacity_gb: 10  # optional, default 10
 ```
+
+**Note**: No `bucket_name` needed - the tool auto-discovers the first bucket in each account.
 
 See [accounts.yaml.example](accounts.yaml.example) for the full template.
 
@@ -78,42 +62,24 @@ See [accounts.yaml.example](accounts.yaml.example) for the full template.
 
 | Command | Description |
 |---------|-------------|
-| `list` | Query and display all accounts/buckets/files |
-| `move` | Move files from source directory to B2 |
-| `copy` | Copy files from source directory to B2 (no deletion) |
+| `list`  | Query and display all accounts/buckets/files |
+| `move`  | Move files from source directory to B2 (deletes local) |
+| `copy`  | Copy files from source directory to B2 (keeps local) |
 
 ### Global Options
 - `--accounts PATH` - Config file (default: `accounts.yaml`)
-- `-v, --verbose` - Debug output
-- `-q, --quiet` - Errors only (disables progress bar)
-- `--version` - Show version and exit
-- `--realm {production,test}` - B2 realm (default: production)
 
 ### Move/Copy Options
-- `--dry-run` - Preview allocation without uploading
-- `--yes` - Skip confirmation prompt
-- `--parallel-uploads N` - Concurrent uploads (1-10, default: 1)
-- `--resume` - Resume from previous interrupted operation
+- `source` - Local directory path (required positional argument)
 
-## Documentation
+## Allocation Algorithm
 
-- [Architecture Overview](docs/ARCHITECTURE.md) - Detailed system design
-- [Contributing Guide](CONTRIBUTING.md) - How to contribute
-- [Security Policy](SECURITY.md) - Vulnerability reporting
-- [Code of Conduct](CODE_OF_CONDUCT.md) - Community standards
+Uses **greedy best-fit decreasing**:
+1. Sort files by size descending (largest first)
+2. For each file, place in the bucket with **least remaining space** that can fit it
+3. If no bucket fits, skip file (with warning)
 
-## Testing
-
-```bash
-# Run all tests
-python test_bugs.py
-
-# Run with verbose output
-python test_bugs.py -v
-
-# Lint code
-ruff check b2.py
-```
+This minimizes fragmentation and free space across accounts.
 
 ## Docker
 
@@ -123,7 +89,7 @@ docker build -t b2router .
 
 # Run (mount config and source directory)
 docker run --rm -v ./accounts.yaml:/app/accounts.yaml -v /data:/data \
-  b2router move /data --yes
+  b2router copy /data
 ```
 
 ## Security

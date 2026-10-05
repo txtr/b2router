@@ -31,3 +31,6 @@ test_accounts.yaml
 # OS
 .DS_Store
 Thumbs.db
+
+# Type checking cache
+.mypy_cache/

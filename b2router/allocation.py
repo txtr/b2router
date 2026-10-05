@@ -1,114 +1,114 @@
-"""File allocation algorithm for B2 Router."""
+"""Allocation algorithm - efficient bin packing for minimal free space.
 
-import logging
+Uses a greedy best-fit decreasing algorithm:
+1. Sort files by size descending
+2. For each file, place in the bucket with least remaining space that fits
+3. If no bucket fits, skip (file too large)
+"""
+
+from dataclasses import dataclass
+from typing import List, Dict, Tuple
 from pathlib import Path
-from typing import Dict, Tuple, List
 
-from .models import SourceFile, Account, Bucket
-
-
-CAP_SAFETY = 0.99  # stay 1% under capacity
+from .b2_client import Bucket
+from .utils import SourceFile
 
 
-def validate_object_name(name: str) -> None:
-    """Validate that object name doesn't contain B2-forbidden characters.
+@dataclass
+class AllocationEntry:
+    source_file: SourceFile
+    bucket: Bucket
+    object_name: str
 
-    B2 object names must be valid UTF-8 and cannot contain:
-    - Null bytes
-    - Control characters (0x00-0x1F, 0x7F)
-    - Must be <= 1024 bytes when UTF-8 encoded
+
+def allocate_files(
+    source_files: List[SourceFile],
+    buckets: List[Bucket]
+) -> List[AllocationEntry]:
+    """Allocate files to buckets using best-fit decreasing.
+
+    Args:
+        source_files: Files to allocate
+        buckets: Available buckets with capacity and current usage
+
+    Returns:
+        List of AllocationEntry mapping each file to a bucket
     """
-    if '\x00' in name:
-        raise ValueError("Object name cannot contain null bytes")
-    # Check for control characters (except tab, newline, carriage return which are valid in UTF-8)
-    for ch in name:
-        code = ord(ch)
-        if code < 0x20 and ch not in ('\t', '\n', '\r'):
-            raise ValueError(f"Object name contains forbidden control character: U+{code:04X}")
-        if code == 0x7F:
-            raise ValueError("Object name contains forbidden DEL character (U+007F)")
-    # Validate UTF-8 encoding and length
-    try:
-        encoded = name.encode('utf-8')
-    except UnicodeEncodeError as exc:
-        raise ValueError(f"Object name is not valid UTF-8: {exc}")
-    if len(encoded) > 1024:
-        raise ValueError(f"Object name too long ({len(encoded)} bytes, max 1024)")
+    # Sort files by size descending (largest first for better packing)
+    sorted_files = sorted(source_files, key=lambda f: f.size, reverse=True)
 
+    # Track remaining capacity per bucket (keyed by bucket_id)
+    bucket_remaining = {b.bucket_id: b.capacity_bytes - b.used_bytes for b in buckets}
+    bucket_map = {b.bucket_id: b for b in buckets}
 
-def get_unique_object_name(bucket: Bucket, base_name: str) -> str:
-    """Generate a unique object name by appending 'Copy of (N)' prefix if needed."""
-    validate_object_name(base_name)
-    if not bucket.has_file(base_name):
-        # Validate length even for original name
-        if len(base_name.encode('utf-8')) > 1024:
-            raise ValueError(f"Object name too long (>1024 bytes): {base_name[:50]}...")
-        return base_name
-    counter = 1
-    max_attempts = 10000  # Prevent infinite loop
-    while counter <= max_attempts:
-        candidate = f"Copy of ({counter}) {base_name}"
-        # Validate length after adding prefix
-        if len(candidate.encode('utf-8')) > 1024:
-            counter += 1
+    allocations = []
+
+    for file in sorted_files:
+        # Find bucket with least remaining space that can fit this file
+        best_bucket_id = None
+        best_remaining = float('inf')
+
+        for bucket_id, remaining in bucket_remaining.items():
+            if remaining >= file.size and remaining < best_remaining:
+                best_bucket_id = bucket_id
+                best_remaining = remaining
+
+        if best_bucket_id is None:
+            # File too large for any bucket - skip with warning
+            import logging
+            logging.warning(f"File {file.rel_path} ({file.size} bytes) too large for any bucket, skipping")
             continue
-        if not bucket.has_file(candidate):
-            return candidate
-        counter += 1
-    raise RuntimeError(f"Could not generate unique name for {base_name} after {max_attempts} attempts")
+
+        # Allocate to best bucket
+        best_bucket = bucket_map[best_bucket_id]
+        object_name = file.rel_path
+        allocations.append(AllocationEntry(
+            source_file=file,
+            bucket=best_bucket,
+            object_name=object_name,
+        ))
+        bucket_remaining[best_bucket_id] -= file.size
+
+    return allocations
 
 
-def allocate_files(source_files: list[SourceFile], accounts: dict[str, Account]) -> dict[Path, tuple[Bucket, str]]:
-    """Allocate files to buckets using greedy best-fit algorithm with account-level capacity.
+def print_allocation_plan(
+    allocations: List[AllocationEntry],
+    source_files: List[SourceFile],
+    buckets: List[Bucket]
+) -> None:
+    """Print human-readable allocation plan grouped by account."""
+    from .utils import format_bytes
 
-    Skips buckets where population failed to avoid over-allocation.
-    Respects account total capacity limit across all buckets.
-    """
-    # Build list of valid buckets with their accounts
-    # Track account_remaining per account (shared across buckets)
-    account_remaining_map: dict[str, int] = {}  # account_name -> remaining bytes
-    bucket_info: list[tuple[Bucket, int, str]] = []  # list of (bucket, bucket_remaining, account_name)
-    for account in accounts.values():
-        # Calculate total used space across all buckets in this account
-        account_used = sum(b.used_bytes for b in account.buckets if not b._populate_failed)
-        account_capacity = int(account.capacity_in_gb * (1024 ** 3) * CAP_SAFETY)
-        account_remaining_map[account.name] = account_capacity - account_used
+    total_allocated = sum(a.source_file.size for a in allocations)
+    total_files = len(allocations)
 
-        for bucket in account.buckets:
-            if bucket._populate_failed:
-                logging.warning(f"Skipping bucket {bucket.name} (account {account.name}) - population failed, cannot determine available space")
-                continue
-            bucket_remaining = bucket.remaining_bytes
-            bucket_info.append((bucket, bucket_remaining, account.name))
+    print(f"\n{'=' * 60}")
+    print("ALLOCATION PLAN")
+    print(f"{'=' * 60}")
+    print(f"\nTotal files: {total_files} ({format_bytes(total_allocated)})")
 
-    sorted_files = sorted(source_files, key=lambda x: x.size, reverse=True)
-    allocation: dict[Path, tuple[Bucket, str]] = {}
+    # Group by account
+    by_account: Dict[str, List[AllocationEntry]] = {}
+    for a in allocations:
+        by_account.setdefault(a.bucket.account_name, []).append(a)
 
-    for src_file in sorted_files:
-        best_idx = None
-        best_remaining = None
+    for acc_name in sorted(by_account.keys()):
+        entries = by_account[acc_name]
+        acc_size = sum(e.source_file.size for e in entries)
+        bucket = entries[0].bucket
+        remaining = bucket.capacity_bytes - bucket.used_bytes - acc_size
 
-        for i, (bucket, bucket_remaining, account_name) in enumerate(bucket_info):
-            # Use the more restrictive limit (shared account_remaining)
-            account_remaining = account_remaining_map[account_name]
-            effective_remaining = min(bucket_remaining, account_remaining)
+        print(f"\n  Account: {acc_name} ({len(entries)} files, {format_bytes(acc_size)})")
+        print(f"    Bucket: {bucket.bucket_name} | Remaining after: {format_bytes(remaining)}")
 
-            if effective_remaining >= src_file.size:
-                if best_remaining is None or effective_remaining < best_remaining:
-                    best_remaining = effective_remaining
-                    best_idx = i
+        for e in entries:
+            print(f"    {e.source_file.rel_path} ({format_bytes(e.source_file.size)})")
 
-        if best_idx is not None:
-            bucket, bucket_remaining, account_name = bucket_info[best_idx]
-            object_name = get_unique_object_name(bucket, src_file.rel_path)
-            allocation[src_file.abs_path] = (bucket, object_name)
-            # Update local tracking (both bucket and account level)
-            bucket_info[best_idx] = (
-                bucket,
-                bucket_remaining - src_file.size,
-                account_name
-            )
-            account_remaining_map[account_name] -= src_file.size
-        else:
-            logging.warning(f"Skipping {src_file.rel_path} ({src_file.size} bytes) – no bucket has enough free space")
-    return allocation
+    # Show skipped files
+    allocated_paths = {a.source_file.rel_path for a in allocations}
+    skipped = [f for f in source_files if f.rel_path not in allocated_paths]
+    if skipped:
+        print(f"\n  Skipped (too large): {len(skipped)} files")
+        for f in skipped:
+            print(f"    {f.rel_path} ({format_bytes(f.size)})")
