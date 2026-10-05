@@ -1,15 +1,10 @@
 # Backblaze B2 Account Configuration
-# Copy to accounts.yaml and replace with actual credentials.
+# Copy this file to accounts.yaml and replace with actual credentials.
 # Bucket is auto-discovered (first bucket per account via B2 API).
 # capacity_gb is the total storage limit for the account.
 
 accounts:
-  backblaze0000:
-    account_id: ""
-    master_key: ""
-    capacity_gb: 10
-
-  backblaze0001:
-    account_id: ""
-    master_key: ""
+  my-account:
+    account_id: "your_application_key_id_here"
+    master_key: "your_application_key_here"
     capacity_gb: 10

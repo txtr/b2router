@@ -1,9 +1,20 @@
-"""Move command for b2router_simple - sequential upload + delete local."""
+"""Move command for b2router - sequential upload + delete local."""
 
 import logging
+from pathlib import Path
 from ..b2_client import build_buckets, upload_file, get_file_info
 from ..allocation import allocate_files, print_allocation_plan
 from ..utils import collect_source_files, format_bytes
+
+# Google Drive shortcut extensions that aren't real files
+GDOC_EXTENSIONS = {'.gdoc', '.gsheet', '.gslides', '.gdraw', '.gform', '.gscript', '.gmap', '.gsite'}
+
+logger = logging.getLogger(__name__)
+
+
+def is_gdoc_file(path: Path) -> bool:
+    """Check if file is a Google Drive shortcut (not a real file)."""
+    return path.suffix.lower() in GDOC_EXTENSIONS
 
 
 def run_move(accounts, source_dir: str) -> int:
@@ -14,9 +25,11 @@ def run_move(accounts, source_dir: str) -> int:
         print("No files found in source directory")
         return 0
 
-    print(f"Found {len(source_files)} files ({format_bytes(sum(f.size for f in source_files))})")
+    total_size = sum(f.size for f in source_files)
+    print(f"Found {len(source_files)} files ({format_bytes(total_size)})")
 
     # Build buckets and get current usage
+    print("Authorizing accounts and discovering buckets...")
     buckets = build_buckets(accounts)
     for bucket in buckets:
         api = __import__('b2sdk.v2', fromlist=['B2Api']).B2Api(
@@ -27,8 +40,10 @@ def run_move(accounts, source_dir: str) -> int:
 
         used = sum(s for _, s in list_files_in_bucket(api, bucket.bucket_id))
         bucket.used_bytes = used
+        print(f"  {bucket.account_name}: {bucket.bucket_name} (used: {format_bytes(used)})")
 
     # Allocate
+    print("Computing allocation plan...")
     allocations = allocate_files(source_files, buckets)
     if not allocations:
         print("No files could be allocated (all too large)")
@@ -40,6 +55,7 @@ def run_move(accounts, source_dir: str) -> int:
     print("\nStarting move...")
     success = 0
     failed = 0
+    skipped = 0
 
     by_bucket: dict[str, list] = {}
     for a in allocations:
@@ -53,36 +69,48 @@ def run_move(accounts, source_dir: str) -> int:
         )
         api.authorize_account("production", acc.account_id, acc.master_key)
 
+        print(f"\n--- Processing bucket: {bucket.bucket_name} ({bucket.account_name}) ---")
+
         for i, entry in enumerate(entries, 1):
+            # Skip Google Drive shortcut files
+            if is_gdoc_file(entry.source_file.path):
+                print(f"[{i}/{len(entries)}] ⊘ {entry.object_name} (skipped: Google Drive shortcut)")
+                skipped += 1
+                continue
+
             existing = get_file_info(api, bucket.bucket_id, entry.object_name)
             if existing:
-                print(f"[{i}/{len(entries)}] ⊘ {entry.object_name} (already exists)")
-                success += 1
-                # Still delete local since it's a move
+                print(f"[{i}/{len(entries)}] ⊘ {entry.object_name} (already exists in B2)")
+                print(f"    Deleting local file...")
                 try:
                     entry.source_file.path.unlink()
-                    print(f"  ✓ (deleted local)")
+                    print(f"    ✓ Local file deleted")
+                    success += 1
                 except OSError as e:
-                    print(f"  ✗ Failed to delete local: {e}")
+                    print(f"    ✗ Failed to delete local: {e}")
                     failed += 1
                 continue
 
-            print(f"[{i}/{len(entries)}] ↑ {entry.object_name} ({format_bytes(entry.source_file.size)})")
+            print(f"[{i}/{len(entries)}] ↑ Uploading: {entry.object_name} ({format_bytes(entry.source_file.size)})")
+            print(f"    Source: {entry.source_file.path}")
+            print(f"    Destination: {bucket.bucket_name}/{entry.object_name}")
+
             if upload_file(api, bucket.bucket_id, str(entry.source_file.path), entry.object_name):
-                # Delete local file on success
+                print(f"    ✓ Upload successful")
+                print(f"    Deleting local file...")
                 try:
                     entry.source_file.path.unlink()
-                    print(f"  ✓ (deleted local)")
+                    print(f"    ✓ Local file deleted")
                     success += 1
                 except OSError as e:
-                    print(f"  ✗ Uploaded but failed to delete local: {e}")
+                    print(f"    ✗ Uploaded but failed to delete local: {e}")
                     failed += 1
             else:
-                print(f"  ✗ FAILED")
+                print(f"    ✗ FAILED")
                 failed += 1
 
     print(f"\n{'=' * 60}")
-    print(f"Done. {success} succeeded, {failed} failed")
+    print(f"Done. {success} succeeded, {failed} failed, {skipped} skipped")
     print(f"{'=' * 60}")
     return 0 if failed == 0 else 1
 
