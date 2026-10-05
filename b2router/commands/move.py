@@ -7,7 +7,10 @@ from ..allocation import allocate_files, print_allocation_plan
 from ..utils import collect_source_files, format_bytes
 
 # Google Drive shortcut extensions that aren't real files
-GDOC_EXTENSIONS = {'.gdoc', '.gsheet', '.gslides', '.gdraw', '.gform', '.gscript', '.gmap', '.gsite'}
+GDOC_EXTENSIONS = {
+    '.gdoc', '.gsheet', '.gslides', '.gdraw', '.gform', '.gscript', '.gmap', '.gsite',
+    '.gvid', '.gscript', '.gfolder', '.glink', '.gscript', '.gtable', '.gscript'
+}
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +98,28 @@ def run_move(accounts, source_dir: str) -> int:
             print(f"    Source: {entry.source_file.path}")
             print(f"    Destination: {bucket.bucket_name}/{entry.object_name}")
 
-            if upload_file(api, bucket.bucket_id, str(entry.source_file.path), entry.object_name):
+            try:
+                upload_success = upload_file(api, bucket.bucket_id, str(entry.source_file.path), entry.object_name)
+            except OSError as e:
+                if e.errno == 95:  # Operation not supported (Google Drive shortcut)
+                    print(f"    ⊘ Skipped: Google Drive shortcut (not a real file)")
+                    skipped += 1
+                    continue
+                print(f"    ✗ Upload error: {e}")
+                failed += 1
+                continue
+            except Exception as e:
+                error_msg = str(e)
+                if "storage cap exceeded" in error_msg.lower() or "cap exceeded" in error_msg.lower():
+                    print(f"    ⊘ Skipped: Bucket storage cap exceeded")
+                    skipped += 1
+                    # Try next bucket? For now just skip this file
+                    continue
+                print(f"    ✗ Upload error: {e}")
+                failed += 1
+                continue
+
+            if upload_success:
                 print(f"    ✓ Upload successful")
                 print(f"    Deleting local file...")
                 try:
