@@ -31,6 +31,9 @@ def upload_file(bucket: Bucket, abs_path: Path, object_name: str, size: int) -> 
 
     # Compute local SHA-1 before upload
     local_sha1 = compute_sha1(abs_path)
+    size_mb = size / (1024 * 1024)
+    if size_mb >= 100:
+        logging.info(f"Uploading large file: {object_name} ({size_mb:.1f} MB)")
 
     def _do_upload() -> bool:
         b2_bucket = client.get_bucket_by_id(bucket.id_)
@@ -60,7 +63,11 @@ def upload_file(bucket: Bucket, abs_path: Path, object_name: str, size: int) -> 
         else:
             logging.debug(f"File {object_name} not found in B2, will upload")
 
-        retry_with_backoff(run_with_timeout, _do_upload)
+        # Upload with timeout scaled by file size
+        upload_timeout = 300 + int(size_mb / 50) * 60  # 5 min base + 1 min per 50MB
+        upload_timeout = min(upload_timeout, 3600)  # cap at 1 hour
+        logging.debug(f"Uploading {object_name} with {upload_timeout}s timeout")
+        retry_with_backoff(lambda fn, *a, **kw: run_with_timeout(fn, *a, **kw, timeout=upload_timeout), _do_upload)
 
         # Verify SHA-1 after upload
         def _verify_upload():
@@ -76,11 +83,15 @@ def upload_file(bucket: Bucket, abs_path: Path, object_name: str, size: int) -> 
 
         if remote_sha1 is None:
             # B2 may not have computed SHA-1 yet for large files (async processing)
-            # Poll for SHA-1 with timeout instead of skipping verification
-            logging.info(f"Waiting for B2 to compute SHA-1 for {object_name} (large file)...")
-            max_wait = 300  # 5 minutes max
+            # Poll for SHA-1 with timeout scaled by file size
+            # Base 5 min + 1 min per 100MB, max 30 minutes
+            size_mb = size / (1024 * 1024)
+            base_wait = 300  # 5 minutes
+            extra_wait = int(size_mb / 100) * 60  # 1 min per 100MB
+            max_wait = min(base_wait + extra_wait, 1800)  # cap at 30 minutes
             poll_interval = 5
             waited = 0
+            logging.info(f"Waiting for B2 to compute SHA-1 for {object_name} ({size_mb:.1f} MB, max wait {max_wait}s)...")
             while waited < max_wait:
                 time.sleep(poll_interval)
                 waited += poll_interval
@@ -98,7 +109,8 @@ def upload_file(bucket: Bucket, abs_path: Path, object_name: str, size: int) -> 
             # Attempt to delete the corrupted upload to avoid leaving bad file in B2
             try:
                 b2_bucket = client.get_bucket_by_id(bucket.id_)
-                b2_bucket.delete_file_version(object_name, file_version.id_)
+                # B2 SDK expects: delete_file_version(file_id, file_name)
+                b2_bucket.delete_file_version(file_version.id_, object_name)
                 logging.info(f"Deleted mismatched file version {object_name} (id={file_version.id_})")
             except Exception as del_exc:
                 logging.warning(f"Failed to delete mismatched file {object_name}: {del_exc}")
