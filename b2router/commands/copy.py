@@ -3,6 +3,7 @@
 import logging
 from pathlib import Path
 from ..b2_client import build_buckets, upload_file, get_file_info
+from ..b2_client import B2Error
 from ..allocation import allocate_files, print_allocation_plan
 from ..utils import collect_source_files, format_bytes
 
@@ -74,14 +75,32 @@ def run_copy(accounts, source_dir: str) -> int:
 
         print(f"\n--- Processing bucket: {bucket.bucket_name} ({bucket.account_name}) ---")
 
+        bucket_transaction_cap = False  # Track if bucket hit transaction cap
+
         for i, entry in enumerate(entries, 1):
+            # Skip remaining files if bucket hit transaction cap
+            if bucket_transaction_cap:
+                print(f"[{i}/{len(entries)}] ⊘ {entry.object_name} (skipped: bucket transaction cap exceeded)")
+                skipped += 1
+                continue
+
             # Skip Google Drive shortcut files
             if is_gdoc_file(entry.source_file.path):
                 print(f"[{i}/{len(entries)}] ⊘ {entry.object_name} (skipped: Google Drive shortcut)")
                 skipped += 1
                 continue
 
-            existing = get_file_info(api, bucket.bucket_id, entry.object_name)
+            try:
+                existing = get_file_info(api, bucket.bucket_id, entry.object_name)
+            except B2Error as e:
+                error_msg = str(e)
+                if "transaction cap exceeded" in error_msg.lower():
+                    print(f"[{i}/{len(entries)}] ⊘ {entry.object_name} (skipped: bucket transaction cap exceeded)")
+                    bucket_transaction_cap = True
+                    skipped += 1
+                    continue
+                raise
+
             if existing:
                 print(f"[{i}/{len(entries)}] ⊘ {entry.object_name} (already exists in B2)")
                 success += 1
@@ -99,6 +118,16 @@ def run_copy(accounts, source_dir: str) -> int:
                     skipped += 1
                     continue
                 print(f"    ✗ Upload error: {e}")
+                failed += 1
+                continue
+            except B2Error as e:
+                error_msg = str(e)
+                if "transaction cap exceeded" in error_msg.lower():
+                    print(f"    ⊘ Skipped: Bucket transaction cap exceeded")
+                    bucket_transaction_cap = True
+                    skipped += 1
+                    continue
+                print(f"    ✗ Upload error: {error_msg}")
                 failed += 1
                 continue
 
