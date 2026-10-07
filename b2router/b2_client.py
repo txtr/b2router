@@ -45,15 +45,16 @@ def list_files_in_bucket(api: B2Api, bucket_id: str) -> Iterator[Tuple[str, int]
         yield file_version.file_name, file_version.size
 
 
-def upload_file(api: B2Api, bucket_id: str, local_path: str, object_name: str) -> bool:
-    """Upload a file to B2. Returns True on success."""
+def upload_file(api: B2Api, bucket_id: str, local_path: str, object_name: str) -> Tuple[bool, str]:
+    """Upload a file to B2. Returns (success, error_message)."""
     try:
         bucket = api.get_bucket_by_id(bucket_id)
         bucket.upload_local_file(local_path, object_name)
-        return True
+        return True, ""
     except B2Error as e:
-        logger.error(f"Upload failed for {object_name}: {e}")
-        return False
+        error_msg = str(e)
+        logger.error(f"Upload failed for {object_name}: {error_msg}")
+        return False, error_msg
 
 
 def delete_file(api: B2Api, bucket_id: str, file_name: str, file_id: str) -> bool:

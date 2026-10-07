@@ -92,19 +92,10 @@ def run_copy(accounts, source_dir: str) -> int:
             print(f"    Destination: {bucket.bucket_name}/{entry.object_name}")
 
             try:
-                upload_success = upload_file(api, bucket.bucket_id, str(entry.source_file.path), entry.object_name)
+                upload_success, error_msg = upload_file(api, bucket.bucket_id, str(entry.source_file.path), entry.object_name)
             except OSError as e:
                 if e.errno == 95:  # Operation not supported (Google Drive shortcut)
                     print(f"    ⊘ Skipped: Google Drive shortcut (not a real file)")
-                    skipped += 1
-                    continue
-                print(f"    ✗ Upload error: {e}")
-                failed += 1
-                continue
-            except Exception as e:
-                error_msg = str(e)
-                if "storage cap exceeded" in error_msg.lower() or "cap exceeded" in error_msg.lower():
-                    print(f"    ⊘ Skipped: Bucket storage cap exceeded")
                     skipped += 1
                     continue
                 print(f"    ✗ Upload error: {e}")
@@ -115,8 +106,13 @@ def run_copy(accounts, source_dir: str) -> int:
                 print(f"    ✓ Upload successful")
                 success += 1
             else:
-                print(f"    ✗ FAILED")
-                failed += 1
+                # Check for storage cap exceeded
+                if "storage cap exceeded" in error_msg.lower() or "cap exceeded" in error_msg.lower():
+                    print(f"    ⊘ Skipped: Bucket storage cap exceeded")
+                    skipped += 1
+                else:
+                    print(f"    ✗ FAILED: {error_msg}")
+                    failed += 1
 
     print(f"\n{'=' * 60}")
     print(f"Done. {success} succeeded, {failed} failed, {skipped} skipped")
