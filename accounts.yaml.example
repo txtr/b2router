@@ -1,0 +1,12 @@
+# B2 Account configuration
+# Copy to accounts.yaml and fill in your credentials
+accounts:
+  - name: "account-1"
+    account_id: "your_key_id_here"
+    account_key: "your_application_key_here"
+    capacity_in_mb: 10240  # 10 GB
+
+  - name: "account-2"
+    account_id: "another_key_id"
+    account_key: "another_application_key"
+    capacity_in_mb: 10240  # 10 GB
