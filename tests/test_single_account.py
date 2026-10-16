@@ -8,12 +8,12 @@ from b2router.services.account import Account
 
 def main(account_name: str = "account-1") -> None:
     reader = ConfigReader("accounts.yaml")
-    accounts = reader.read()
+    config = reader.read()
 
-    acc = next((a for a in accounts if a.name == account_name), None)
+    acc = next((a for a in config.accounts if a.name == account_name), None)
     if not acc:
         print(f"Account '{account_name}' not found in config")
-        print(f"Available: {[a.name for a in accounts]}")
+        print(f"Available: {[a.name for a in config.accounts]}")
         sys.exit(1)
 
     print(f"Initializing Account({acc.name})...")

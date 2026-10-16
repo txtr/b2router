@@ -23,26 +23,44 @@ class AccountConfig:
         return self.capacity_in_mb * 1024 * 1024
 
 
+@dataclass
+class Config:
+    """Parsed configuration from accounts.yaml."""
+
+    max_files_per_account: int
+    accounts: list[AccountConfig]
+
+
 class ConfigReader:
     """Reads and parses account configuration from YAML file."""
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
 
-    def read(self) -> list[AccountConfig]:
-        """Read and parse the YAML file, returning list of AccountConfig."""
+    def read(self) -> Config:
+        """Read and parse the YAML file, returning Config."""
         assert self.path.exists(), f"Config file not found: {self.path}"
 
         with self.path.open("r") as f:
             data = yaml.safe_load(f)
 
-        assert data and "accounts" in data, "YAML must contain an 'accounts' list"
+        assert data and "accounts" in data, "YAML must contain an 'accounts' key"
+
+        accounts_data = data["accounts"]
+        assert isinstance(accounts_data, dict), "accounts must be an object with max_files_per_account and accounts list"
+
+        # Read global max_files_per_account (default 1700)
+        max_files = accounts_data.get("max_files_per_account", 1700)
+        assert isinstance(max_files, int) and max_files > 0, "max_files_per_account must be a positive integer"
+
+        account_list = accounts_data.get("accounts")
+        assert isinstance(account_list, list), "accounts must contain a list under 'accounts' key"
 
         accounts = []
-        for acc in data["accounts"]:
+        for acc in account_list:
             accounts.append(self._parse_account(acc))
 
-        return accounts
+        return Config(max_files_per_account=max_files, accounts=accounts)
 
     def _parse_account(self, data: dict[str, Any]) -> AccountConfig:
         """Parse a single account entry."""

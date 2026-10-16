@@ -5,8 +5,6 @@ from typing import Any
 
 from b2router.services.account import Account
 
-MAX_FILES_PER_BUCKET = 1700
-
 
 @dataclass
 class FileCacheEntry:
@@ -42,6 +40,7 @@ class AccountState:
     capacity_bytes: int  # Total capacity from config
     used_bytes: int = 0
     file_count: int = 0
+    max_files: int = 1700  # Max files per bucket for this account
 
     @property
     def remaining_bytes(self) -> int:
@@ -49,7 +48,7 @@ class AccountState:
 
     @property
     def remaining_files(self) -> int:
-        return MAX_FILES_PER_BUCKET - self.file_count
+        return self.max_files - self.file_count
 
     @property
     def utilization(self) -> float:
@@ -75,6 +74,15 @@ class AccountPool:
         self._accounts: dict[str, Account] = {}
         self._states: dict[str, AccountState] = {}  # name -> AccountState
         self._file_cache: dict[str, FileCacheEntry] = {}  # file_name -> FileCacheEntry
+        self._default_max_files: int = 1700
+
+    def set_max_files_per_account(self, max_files: int) -> None:
+        """Set the default max files per account for all accounts."""
+        assert max_files > 0, "max_files must be positive"
+        self._default_max_files = max_files
+        # Update existing accounts
+        for state in self._states.values():
+            state.max_files = max_files
 
     def add(self, name: str, application_key_id: str, application_key: str, capacity_mb: int = 0) -> Account:
         """Create and add an Account to the pool. Enriches file cache once at startup."""
@@ -86,6 +94,7 @@ class AccountPool:
             name=name,
             account=account,
             capacity_bytes=capacity_bytes,
+            max_files=self._default_max_files,
         )
         self._enrich_file_cache(name, account)
         return account

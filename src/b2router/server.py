@@ -9,10 +9,13 @@ from b2router.web import run_server
 def load_accounts() -> None:
     """Load accounts from accounts.yaml into the pool."""
     reader = ConfigReader("accounts.yaml")
-    accounts = reader.read()
+    config = reader.read()
 
-    for acc in accounts:
+    for acc in config.accounts:
         account_pool.add(acc.name, acc.account_id, acc.account_key, acc.capacity_in_mb or 0)
+
+    # Set max files per account from config
+    account_pool.set_max_files_per_account(config.max_files_per_account)
 
     print(f"Loaded {len(account_pool)} accounts into pool")
 

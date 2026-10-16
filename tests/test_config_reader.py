@@ -11,17 +11,18 @@ from b2router.core.config_reader import ConfigReader
 def test_config_reader(config_file: str = "accounts.yaml") -> dict:
     """Test ConfigReader and return structured results for programmatic use."""
     reader = ConfigReader(config_file)
-    accounts = reader.read()
+    config = reader.read()
 
     results = {
         "config_file": config_file,
-        "total_accounts": len(accounts),
+        "max_files_per_account": config.max_files_per_account,
+        "total_accounts": len(config.accounts),
         "accounts": [],
         "errors": [],
         "warnings": [],
     }
 
-    for acc in accounts:
+    for acc in config.accounts:
         if not acc.account_id:
             results["errors"].append(f"{acc.name}: missing account_id")
         if not acc.account_key:
@@ -44,6 +45,7 @@ def test_config_reader(config_file: str = "accounts.yaml") -> dict:
 def print_results(results: dict) -> None:
     """Print formatted results to stdout."""
     print(f"Config file: {results['config_file']}")
+    print(f"Max files per account: {results['max_files_per_account']}")
     print(f"Total accounts: {results['total_accounts']}")
     print("=" * 60)
 
