@@ -44,17 +44,15 @@ class ConfigReader:
         with self.path.open("r") as f:
             data = yaml.safe_load(f)
 
-        assert data and "accounts" in data, "YAML must contain an 'accounts' key"
-
-        accounts_data = data["accounts"]
-        assert isinstance(accounts_data, dict), "accounts must be an object with max_files_per_account and accounts list"
+        assert data, "YAML file is empty"
 
         # Read global max_files_per_account (default 1700)
-        max_files = accounts_data.get("max_files_per_account", 1700)
+        max_files = data.get("max_files_per_account", 1700)
         assert isinstance(max_files, int) and max_files > 0, "max_files_per_account must be a positive integer"
 
-        account_list = accounts_data.get("accounts")
-        assert isinstance(account_list, list), "accounts must contain a list under 'accounts' key"
+        # Read accounts list
+        account_list = data.get("accounts")
+        assert isinstance(account_list, list), "YAML must contain an 'accounts' list"
 
         accounts = []
         for acc in account_list:
