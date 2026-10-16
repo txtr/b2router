@@ -225,7 +225,11 @@ class AccountPool:
         content: bytes,
         content_type: str = "application/octet-stream",
     ) -> Account:
-        """Upload file to best-fit account. Panics if no account can fit."""
+        """Upload file to best-fit account. Fails if file already exists."""
+        # Fail if file already exists in cache (uploaded at startup)
+        if file_name in self._file_cache:
+            raise AssertionError(f"File '{file_name}' already exists in the pool")
+
         file_size = len(content)
         account = self.select_best_account(file_size)
         assert account is not None, f"No account can fit file of size {file_size} bytes"
