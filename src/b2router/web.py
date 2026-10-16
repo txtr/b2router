@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from flask import Flask, render_template_string
+from flask import Flask, render_template_string, Response, stream_with_context, abort
+import requests
 
 from b2router.services import account_pool
 
@@ -25,6 +26,9 @@ HTML_TEMPLATE = """
         .stat-value { font-weight: 700; color: #2c3e50; }
         .accounts-badge { display: inline-block; background: #e0e0e0; padding: 0.2rem 0.5rem; border-radius: 3px; margin-right: 0.25rem; font-size: 0.85rem; }
         .size { font-family: monospace; }
+        .btn { display: inline-block; padding: 0.4rem 0.8rem; background: #0066cc; color: white; text-decoration: none; border-radius: 4px; font-size: 0.85rem; border: none; cursor: pointer; }
+        .btn:hover { background: #0052a3; }
+        .btn:disabled { background: #999; cursor: not-allowed; }
     </style>
 </head>
 <body>
@@ -49,6 +53,7 @@ HTML_TEMPLATE = """
                 <th>Upload Time</th>
                 <th>Action</th>
                 <th>Accounts ({{ stats.accounts_with_files }})</th>
+                <th>Download</th>
             </tr>
         </thead>
         <tbody>
@@ -64,6 +69,9 @@ HTML_TEMPLATE = """
                     {% for acc in file.accounts %}
                     <span class="accounts-badge">{{ acc }}</span>
                     {% endfor %}
+                </td>
+                <td>
+                    <a href="/download/{{ file.file_name }}" class="btn">Download</a>
                 </td>
             </tr>
             {% endfor %}
@@ -110,6 +118,41 @@ def create_app() -> Flask:
             HTML_TEMPLATE,
             files=formatted_files,
             stats=stats_formatted,
+        )
+
+    @app.route("/download/<path:file_name>")
+    def download_file(file_name: str):
+        """Stream file download from B2."""
+        # Find which account has this file
+        accounts = account_pool.get_file_accounts(file_name)
+        if not accounts:
+            abort(404, description=f"File '{file_name}' not found in any account")
+
+        # Use the first account that has the file
+        account_name = accounts[0]
+        account = account_pool[account_name]
+
+        # Use B2 SDK to download (handles auth for private buckets)
+        downloaded_file = account.bucket.download_file_by_name(file_name)
+
+        # Get content type from cache
+        file_info = account_pool.get_file(file_name)
+        content_type = file_info.content_type if file_info else "application/octet-stream"
+
+        def generate():
+            # Stream from B2 response
+            with downloaded_file.response as r:
+                r.raise_for_status()
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        yield chunk
+
+        return Response(
+            stream_with_context(generate()),
+            headers={
+                "Content-Type": content_type,
+                "Content-Disposition": f'attachment; filename="{file_name}"',
+            },
         )
 
     @app.route("/api/files")
