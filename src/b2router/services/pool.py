@@ -8,7 +8,7 @@ from b2router.services.account import Account
 
 @dataclass
 class FileCacheEntry:
-    """Cache entry for a file across multiple accounts."""
+    """Cache entry for a file across multiple accounts (built at startup, never modified)."""
 
     file_name: str
     file_id: str
@@ -17,14 +17,6 @@ class FileCacheEntry:
     upload_timestamp: int
     action: str
     accounts: list[str]  # Account names that have this file
-
-    def add_account(self, account_name: str) -> None:
-        assert account_name not in self.accounts
-        self.accounts.append(account_name)
-
-    def remove_account(self, account_name: str) -> None:
-        assert account_name in self.accounts
-        self.accounts.remove(account_name)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -40,14 +32,14 @@ class FileCacheEntry:
 
 
 class AccountPool:
-    """Pool managing multiple B2 Account instances with centralized file cache."""
+    """Pool managing multiple B2 Account instances with centralized file cache (built once at startup)."""
 
     def __init__(self) -> None:
         self._accounts: dict[str, Account] = {}
         self._file_cache: dict[str, FileCacheEntry] = {}  # file_name -> FileCacheEntry
 
     def add(self, name: str, application_key_id: str, application_key: str) -> Account:
-        """Create and add an Account to the pool."""
+        """Create and add an Account to the pool. Enriches file cache once at startup."""
         assert name not in self._accounts, f"Account '{name}' already exists"
         account = Account(application_key_id=application_key_id, application_key=application_key)
         self._accounts[name] = account
@@ -55,19 +47,14 @@ class AccountPool:
         return account
 
     def _enrich_file_cache(self, account_name: str, account: Account) -> None:
-        """Fetch files from account and update centralized file cache."""
+        """Fetch files from account and build centralized file cache (once at startup)."""
         files = account.list_files()
         for f in files:
             file_name = f["file_name"]
             if file_name in self._file_cache:
                 entry = self._file_cache[file_name]
-                entry.add_account(account_name)
-                # Update metadata (use latest from this account)
-                entry.file_id = f["file_id"]
-                entry.size = f["size"]
-                entry.content_type = f["content_type"]
-                entry.upload_timestamp = f["upload_timestamp"]
-                entry.action = f["action"]
+                assert account_name not in entry.accounts
+                entry.accounts.append(account_name)
             else:
                 self._file_cache[file_name] = FileCacheEntry(
                     file_name=f["file_name"],
@@ -78,16 +65,6 @@ class AccountPool:
                     action=f["action"],
                     accounts=[account_name],
                 )
-
-    def _remove_account_from_file_cache(self, account_name: str) -> None:
-        """Remove account from all file cache entries."""
-        to_delete = []
-        for file_name, entry in self._file_cache.items():
-            entry.remove_account(account_name)
-            if not entry.accounts:
-                to_delete.append(file_name)
-        for file_name in to_delete:
-            del self._file_cache[file_name]
 
     def get(self, name: str) -> Account | None:
         """Get account by name."""
@@ -100,13 +77,11 @@ class AccountPool:
         return account
 
     def remove(self, name: str) -> None:
-        """Remove account from pool and file cache."""
-        assert name in self._accounts, f"Account '{name}' not in pool"
-        self._remove_account_from_file_cache(name)
-        del self._accounts[name]
+        """Remove account from pool (not supported after cache built - use clear())."""
+        assert False, "Cannot remove individual account after cache built. Use clear() to reset pool."
 
     def clear(self) -> None:
-        """Remove all accounts and clear file cache."""
+        """Remove all accounts and clear file cache (for testing/reset)."""
         self._accounts.clear()
         self._file_cache.clear()
 
@@ -125,7 +100,7 @@ class AccountPool:
     def names(self) -> list[str]:
         return list(self._accounts.keys())
 
-    # --- File Cache Methods ---
+    # --- File Cache Methods (read-only after startup) ---
 
     def get_file(self, file_name: str) -> FileCacheEntry | None:
         """Get file cache entry by name."""
@@ -162,18 +137,6 @@ class AccountPool:
             "total_account_references": total_account_refs,
             "accounts_with_files": len(all_accounts),
         }
-
-    def refresh_all(self) -> None:
-        """Refresh file cache for all accounts."""
-        self._file_cache.clear()
-        for name, account in self._accounts.items():
-            self._enrich_file_cache(name, account)
-
-    def refresh_account(self, account_name: str) -> None:
-        """Refresh file cache for a single account."""
-        account = self._accounts[account_name]
-        self._remove_account_from_file_cache(account_name)
-        self._enrich_file_cache(account_name, account)
 
     def get_default(self) -> Account | None:
         """Get the first account (default), or None if empty."""
