@@ -52,9 +52,8 @@ class AccountPool:
         for f in files:
             file_name = f["file_name"]
             if file_name in self._file_cache:
-                entry = self._file_cache[file_name]
-                assert account_name not in entry.accounts
-                entry.accounts.append(account_name)
+                existing = self._file_cache[file_name]
+                assert False, f"Duplicate filename '{file_name}' found in account '{account_name}' (already in account '{existing.accounts[0]}')"
             else:
                 self._file_cache[file_name] = FileCacheEntry(
                     file_name=f["file_name"],
