@@ -12,6 +12,7 @@ class Account:
 
     application_key_id: str
     application_key: str
+    name: str = field(default="", init=True, repr=True)  # Account name from pool
     api: B2Api = field(init=False, repr=False)
     bucket: Bucket | None = field(default=None, init=False, repr=False)
     bucket_name: str = field(default="", init=False, repr=False)

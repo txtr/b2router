@@ -12,7 +12,7 @@ def load_accounts() -> None:
     accounts = reader.read()
 
     for acc in accounts:
-        account_pool.add(acc.name, acc.account_id, acc.account_key)
+        account_pool.add(acc.name, acc.account_id, acc.account_key, acc.capacity_in_mb or 0)
 
     print(f"Loaded {len(account_pool)} accounts into pool")
 
