@@ -228,8 +228,8 @@ def create_app() -> Flask:
             except Exception as e:
                 flash(f"Failed to upload '{filename}': {e}", "error")
 
-        # After processing all files, redirect to index to see updated file list
-        return redirect(url_for("index"))
+        # After processing all files, stay on upload page to allow more uploads
+        return redirect(url_for("upload_file"))
 
     @app.route("/download/<path:file_name>")
     def download_file(file_name: str):
