@@ -5,7 +5,7 @@ from flask import Flask, render_template_string, Response, stream_with_context, 
 from b2router.services import account_pool
 
 
-HTML_TEMPLATE = """
+INDEX_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -45,27 +45,13 @@ HTML_TEMPLATE = """
 <body>
     <h1>B2 Router - File Cache</h1>
     <p>Centralized view of files across all B2 accounts</p>
+    <p><a href="/upload">Upload Files</a></p>
 
     <div class="stats">
         <div class="stat">Unique Files: <span class="stat-value">{{ stats.unique_files }}</span></div>
         <div class="stat">Total Size: <span class="stat-value">{{ stats.total_size_mb }} MB</span></div>
         <div class="stat">Total References: <span class="stat-value">{{ stats.total_account_references }}</span></div>
         <div class="stat">Accounts with Files: <span class="stat-value">{{ stats.accounts_with_files }}</span></div>
-    </div>
-
-    <h2>Upload File</h2>
-    <div class="upload-form">
-        <form action="/upload" method="POST" enctype="multipart/form-data" id="uploadForm">
-            <div class="form-group">
-                <label for="file">Select File:</label>
-                <input type="file" name="file" id="file" required>
-            </div>
-            <div class="form-group">
-                <label for="filename">Destination Filename (optional):</label>
-                <input type="text" name="filename" id="filename" placeholder="Leave empty to use original filename">
-            </div>
-            <button type="submit" class="btn btn-success">Upload</button>
-        </form>
     </div>
 
     {% if files %}
@@ -111,6 +97,72 @@ HTML_TEMPLATE = """
 </html>
 """
 
+UPLOAD_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Upload Files - B2 Router</title>
+    <style>
+        body { font-family: system-ui, sans-serif; margin: 2rem; }
+        h1 { color: #333; }
+        h2 { color: #555; margin-top: 2rem; }
+        table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
+        th, td { border: 1px solid #ddd; padding: 0.75rem; text-align: left; }
+        th { background-color: #f4f4f4; font-weight: 600; }
+        tr:nth-child(even) { background-color: #fafafa; }
+        tr:hover { background-color: #f0f0f0; }
+        .stats { display: flex; gap: 2rem; margin: 1rem 0; padding: 1rem; background: #f9f9f9; border-radius: 4px; }
+        .stat { font-weight: 500; }
+        .stat-value { font-weight: 700; color: #2c3e50; }
+        .accounts-badge { display: inline-block; background: #e0e0e0; padding: 0.2rem 0.5rem; border-radius: 3px; margin-right: 0.25rem; font-size: 0.85rem; }
+        .size { font-family: monospace; }
+        .btn { display: inline-block; padding: 0.4rem 0.8rem; background: #0066cc; color: white; text-decoration: none; border-radius: 4px; font-size: 0.85rem; border: none; cursor: pointer; }
+        .btn:hover { background: #0052a3; }
+        .btn:disabled { background: #999; cursor: not-allowed; }
+        .btn-success { background: #28a745; }
+        .btn-success:hover { background: #218838; }
+        .upload-form { background: #f8f9fa; padding: 1.5rem; border-radius: 4px; margin-bottom: 2rem; }
+        .form-group { margin-bottom: 1rem; }
+        label { display: block; margin-bottom: 0.5rem; font-weight: 500; }
+        input[type="file"] { padding: 0.5rem; }
+        input[type="text"] { padding: 0.5rem; width: 300px; }
+        .alert { padding: 1rem; border-radius: 4px; margin-bottom: 1rem; }
+        .alert-success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .alert-error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        .progress { margin-top: 1rem; }
+    </style>
+</head>
+<body>
+    <h1>B2 Router - Upload Files</h1>
+    <p>Upload one or more files to the B2 Router pool (best-fit routing).</p>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for category, message in messages %}
+          <div class="alert alert-{{ category }}">{{ message }}</div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+
+    <h2>Upload Files</h2>
+    <div class="upload-form">
+        <form action="/upload" method="POST" enctype="multipart/form-data" id="uploadForm">
+            <div class="form-group">
+                <label for="file">Select Files:</label>
+                <input type="file" name="file" id="file" multiple required>
+            </div>
+            <p>Files will be uploaded with their original filenames. If a file with the same name already exists, the upload will be rejected.</p>
+            <button type="submit" class="btn btn-success">Upload</button>
+        </form>
+    </div>
+
+    <p><a href="/">Back to File List</a></p>
+</body>
+</html>
+"""
+
 
 def create_app() -> Flask:
     app = Flask(__name__)
@@ -143,41 +195,40 @@ def create_app() -> Flask:
         }
 
         return render_template_string(
-            HTML_TEMPLATE,
+            INDEX_TEMPLATE,
             files=formatted_files,
             stats=stats_formatted,
         )
 
-    @app.route("/upload", methods=["POST"])
+    @app.route("/upload", methods=["GET", "POST"])
     def upload_file():
-        """Handle file upload via best-fit routing."""
-        if "file" not in request.files:
-            flash("No file selected", "error")
-            return redirect(url_for("index"))
+        if request.method == "GET":
+            return render_template_string(UPLOAD_TEMPLATE)
 
-        file = request.files["file"]
-        if file.filename == "":
-            flash("No file selected", "error")
-            return redirect(url_for("index"))
+        # POST: handle multiple file upload
+        uploaded_files = request.files.getlist("file")
+        if not uploaded_files or all(not f.filename for f in uploaded_files):
+            flash("No files selected", "error")
+            return redirect(url_for("upload_file"))
 
-        # Use custom filename if provided, otherwise use original
-        filename = request.form.get("filename", "").strip()
-        if not filename:
+        any_success = False
+        for file in uploaded_files:
+            if not file.filename:
+                continue  # skip empty or None
             filename = file.filename
+            content = file.read()
+            content_type = file.content_type or "application/octet-stream"
 
-        # Read file content
-        content = file.read()
-        content_type = file.content_type or "application/octet-stream"
+            try:
+                account = account_pool.upload_file(filename, content, content_type)
+                flash(f"File '{filename}' uploaded to {account.name} ({len(content):,} bytes)", "success")
+                any_success = True
+            except AssertionError as e:
+                flash(f"Failed to upload '{filename}': {e}", "error")
+            except Exception as e:
+                flash(f"Failed to upload '{filename}': {e}", "error")
 
-        try:
-            # Upload via best-fit routing
-            account = account_pool.upload_file(filename, content, content_type)
-            flash(f"File uploaded to {account.name} ({len(content):,} bytes)", "success")
-        except AssertionError as e:
-            flash(str(e), "error")
-        except Exception as e:
-            flash(f"Upload failed: {e}", "error")
-
+        # After processing all files, redirect to index to see updated file list
         return redirect(url_for("index"))
 
     @app.route("/download/<path:file_name>")
