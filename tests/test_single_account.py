@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test script to initialize a single Account from config and print its cache."""
+"""Test script to initialize a single Account from config and print its files."""
 
 import sys
 from b2router.core.config_reader import ConfigReader
@@ -19,22 +19,15 @@ def main(account_name: str = "account-1") -> None:
     print(f"Initializing Account({acc.name})...")
     account = Account(application_key_id=acc.account_id, application_key=acc.account_key)
 
-    if acc.capacity_in_mb:
-        account.cache["capacity_mb"] = acc.capacity_in_mb
-        account.cache["capacity_bytes"] = acc.capacity_bytes
+    files = account.list_files()
 
     print("\n" + "=" * 60)
-    print("ACCOUNT CACHE")
+    print("ACCOUNT FILES")
     print("=" * 60)
-
-    for key, value in account.cache.items():
-        if key == "files":
-            print(f"  {key}: {len(value)} file(s)")
-            for f in value:
-                print(f"    - {f['file_name']} ({f['size']} bytes)")
-        else:
-            print(f"  {key}: {value}")
-
+    print(f"Bucket: {account.bucket_name}")
+    print(f"Files: {len(files)}")
+    for f in files:
+        print(f"  - {f['file_name']} ({f['size']} bytes)")
     print("=" * 60)
 
 

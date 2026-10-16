@@ -15,27 +15,26 @@ def main() -> None:
     for acc in accounts:
         print(f"Initializing {acc.name}...")
         account_pool.add(acc.name, acc.account_id, acc.account_key)
-        if acc.capacity_in_mb:
-            account = account_pool[acc.name]
-            account.cache["capacity_mb"] = acc.capacity_in_mb
-            account.cache["capacity_bytes"] = acc.capacity_bytes
+        # Capacity info stored in account config, not in cache anymore
 
     print("\n" + "=" * 60)
-    print("ACCOUNT CACHES")
+    print("ACCOUNT POOL FILE CACHE")
     print("=" * 60)
 
+    # Show file cache stats
+    stats = account_pool.file_cache_stats()
+    print(f"\nFile Cache Stats: {stats}")
+
+    # Show files per account
     for name in account_pool.names():
-        account = account_pool[name]
+        files = account_pool.list_files_for_account(name)
         print(f"\n--- {name} ---")
-        for key, value in account.cache.items():
-            if key == "files":
-                print(f"  {key}: {len(value)} file(s)")
-                for f in value[:5]:  # Show first 5 files
-                    print(f"    - {f['file_name']} ({f['size']} bytes)")
-                if len(value) > 5:
-                    print(f"    ... and {len(value) - 5} more")
-            else:
-                print(f"  {key}: {value}")
+        print(f"  Bucket: {account_pool[name].bucket_name}")
+        print(f"  Files: {len(files)}")
+        for f in files[:5]:
+            print(f"    - {f['file_name']} ({f['size']} bytes)")
+        if len(files) > 5:
+            print(f"    ... and {len(files) - 5} more")
 
     print("\n" + "=" * 60)
     print(f"Total accounts in pool: {len(account_pool)}")
