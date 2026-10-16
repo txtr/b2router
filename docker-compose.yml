@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  b2router:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./accounts.yaml:/app/accounts.yaml:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
