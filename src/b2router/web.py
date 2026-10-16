@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from flask import Flask, render_template_string, Response, stream_with_context, abort
-import requests
+from flask import Flask, render_template_string, Response, stream_with_context, abort, request, redirect, url_for, flash
 
 from b2router.services import account_pool
 
@@ -16,6 +15,7 @@ HTML_TEMPLATE = """
     <style>
         body { font-family: system-ui, sans-serif; margin: 2rem; }
         h1 { color: #333; }
+        h2 { color: #555; margin-top: 2rem; }
         table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
         th, td { border: 1px solid #ddd; padding: 0.75rem; text-align: left; }
         th { background-color: #f4f4f4; font-weight: 600; }
@@ -29,6 +29,17 @@ HTML_TEMPLATE = """
         .btn { display: inline-block; padding: 0.4rem 0.8rem; background: #0066cc; color: white; text-decoration: none; border-radius: 4px; font-size: 0.85rem; border: none; cursor: pointer; }
         .btn:hover { background: #0052a3; }
         .btn:disabled { background: #999; cursor: not-allowed; }
+        .btn-success { background: #28a745; }
+        .btn-success:hover { background: #218838; }
+        .upload-form { background: #f8f9fa; padding: 1.5rem; border-radius: 4px; margin-bottom: 2rem; }
+        .form-group { margin-bottom: 1rem; }
+        label { display: block; margin-bottom: 0.5rem; font-weight: 500; }
+        input[type="file"] { padding: 0.5rem; }
+        input[type="text"] { padding: 0.5rem; width: 300px; }
+        .alert { padding: 1rem; border-radius: 4px; margin-bottom: 1rem; }
+        .alert-success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .alert-error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        .progress { margin-top: 1rem; }
     </style>
 </head>
 <body>
@@ -42,7 +53,23 @@ HTML_TEMPLATE = """
         <div class="stat">Accounts with Files: <span class="stat-value">{{ stats.accounts_with_files }}</span></div>
     </div>
 
+    <h2>Upload File</h2>
+    <div class="upload-form">
+        <form action="/upload" method="POST" enctype="multipart/form-data" id="uploadForm">
+            <div class="form-group">
+                <label for="file">Select File:</label>
+                <input type="file" name="file" id="file" required>
+            </div>
+            <div class="form-group">
+                <label for="filename">Destination Filename (optional):</label>
+                <input type="text" name="filename" id="filename" placeholder="Leave empty to use original filename">
+            </div>
+            <button type="submit" class="btn btn-success">Upload</button>
+        </form>
+    </div>
+
     {% if files %}
+    <h2>Files</h2>
     <table>
         <thead>
             <tr>
@@ -87,6 +114,7 @@ HTML_TEMPLATE = """
 
 def create_app() -> Flask:
     app = Flask(__name__)
+    app.secret_key = "dev-secret-change-in-production"
 
     @app.route("/")
     def index():
@@ -119,6 +147,38 @@ def create_app() -> Flask:
             files=formatted_files,
             stats=stats_formatted,
         )
+
+    @app.route("/upload", methods=["POST"])
+    def upload_file():
+        """Handle file upload via best-fit routing."""
+        if "file" not in request.files:
+            flash("No file selected", "error")
+            return redirect(url_for("index"))
+
+        file = request.files["file"]
+        if file.filename == "":
+            flash("No file selected", "error")
+            return redirect(url_for("index"))
+
+        # Use custom filename if provided, otherwise use original
+        filename = request.form.get("filename", "").strip()
+        if not filename:
+            filename = file.filename
+
+        # Read file content
+        content = file.read()
+        content_type = file.content_type or "application/octet-stream"
+
+        try:
+            # Upload via best-fit routing
+            account = account_pool.upload_file(filename, content, content_type)
+            flash(f"File uploaded to {account.name} ({len(content):,} bytes)", "success")
+        except AssertionError as e:
+            flash(str(e), "error")
+        except Exception as e:
+            flash(f"Upload failed: {e}", "error")
+
+        return redirect(url_for("index"))
 
     @app.route("/download/<path:file_name>")
     def download_file(file_name: str):
