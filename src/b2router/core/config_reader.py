@@ -31,14 +31,12 @@ class ConfigReader:
 
     def read(self) -> list[AccountConfig]:
         """Read and parse the YAML file, returning list of AccountConfig."""
-        if not self.path.exists():
-            raise FileNotFoundError(f"Config file not found: {self.path}")
+        assert self.path.exists(), f"Config file not found: {self.path}"
 
         with self.path.open("r") as f:
             data = yaml.safe_load(f)
 
-        if not data or "accounts" not in data:
-            raise ValueError("YAML must contain an 'accounts' list")
+        assert data and "accounts" in data, "YAML must contain an 'accounts' list"
 
         accounts = []
         for acc in data["accounts"]:
@@ -53,9 +51,7 @@ class ConfigReader:
         account_key = data.get("account_key")
         capacity_mb = data.get("capacity_in_mb")
 
-        if not all([name, account_id, account_key]):
-            missing = [k for k, v in [("name", name), ("account_id", account_id), ("account_key", account_key)] if not v]
-            raise ValueError(f"Account missing required fields: {', '.join(missing)}")
+        assert all([name, account_id, account_key]), f"Account missing required fields: {', '.join(k for k, v in [('name', name), ('account_id', account_id), ('account_key', account_key)] if not v)}"
 
         return AccountConfig(
             name=str(name),

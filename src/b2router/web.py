@@ -122,7 +122,6 @@ def create_app() -> Flask:
         """JSON API endpoint for account status."""
         return {
             "active": account_pool.names(),
-            "failed": account_pool.failed_names(),
             "stats": account_pool.stats(),
         }
 

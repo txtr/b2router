@@ -5,8 +5,6 @@ from typing import Any
 
 from b2sdk.v2 import InMemoryAccountInfo, B2Api, Bucket
 
-from b2router.core.logging import logger
-
 
 @dataclass
 class Account:
@@ -28,16 +26,13 @@ class Account:
     def _fetch_bucket(self) -> None:
         """Fetch the single bucket for this account."""
         buckets = self.api.list_buckets()
-        if len(buckets) != 1:
-            raise ValueError(f"Expected exactly 1 bucket, found {len(buckets)}")
+        assert len(buckets) == 1, f"Expected exactly 1 bucket, found {len(buckets)}"
         self.bucket = buckets[0]
         self.bucket_name = buckets[0].name
-        logger.info("account_bucket_fetched", bucket=self.bucket_name)
 
     def list_files(self) -> list[dict[str, Any]]:
         """List all files in the bucket and update cached totals."""
-        if not self.bucket:
-            self._fetch_bucket()
+        assert self.bucket is not None, "Bucket not initialized"
         files = []
         total_size = 0
         for file_version, _ in self.bucket.ls(latest_only=True):
