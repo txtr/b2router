@@ -7,8 +7,6 @@ license = {text = "MIT"}
 requires-python = ">=3.11"
 dependencies = [
     "b2sdk>=2.0.0,<3.0.0",
-    "pydantic-settings>=2.3.0",
-    "python-dotenv>=1.0.1",
     "structlog>=24.1.0",
     "pyyaml>=6.0.1",
 ]

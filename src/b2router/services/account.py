@@ -6,7 +6,6 @@ from typing import Any
 from b2sdk.v2 import InMemoryAccountInfo, B2Api, Bucket
 from b2sdk.v2.exception import FileNotPresent
 
-from b2router.core.config import settings
 from b2router.core.logging import logger
 
 
@@ -79,11 +78,3 @@ class Account:
 
     def get(self, key: str, default: Any = None) -> Any:
         return self.cache.get(key, default)
-
-
-def create_account() -> Account:
-    """Factory to create Account from settings."""
-    return Account(
-        application_key_id=settings.b2_application_key_id,
-        application_key=settings.b2_application_key,
-    )

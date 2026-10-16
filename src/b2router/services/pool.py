@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from b2router.core.config import settings
 from b2router.core.logging import logger
 from b2router.services.account import Account
 
@@ -41,14 +40,6 @@ class AccountPool:
         self._accounts[name] = account
         logger.info("account_added", name=name, bucket=account.cache.get("bucket", {}).get("name"))
         return account
-
-    def add_from_settings(self, name: str) -> Account | None:
-        """Add account using credentials from settings."""
-        return self.add(
-            name=name,
-            application_key_id=settings.b2_application_key_id,
-            application_key=settings.b2_application_key,
-        )
 
     def get(self, name: str) -> Account | None:
         """Get account by name."""
