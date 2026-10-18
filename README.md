@@ -109,16 +109,16 @@ b2router/
 ```yaml
 max_files_per_account: 1700
 accounts:
-  - name: "account-1"
-    account_id: "f059ee450928"
+  - account_id: "f059ee450928"
     account_key: "005a216fca39fe8cfe8216043591e947c16a538340"
     capacity_in_mb: 10240  # 10 GB (optional; omit for unlimited)
   # ... more accounts
 ```
 
 - `max_files_per_account`: Global default per account (default 1700, overridden per-account if specified)
-- Each account requires: `name`, `account_id`, `account_key`
+- Each account requires: `account_id`, `account_key`
 - `capacity_in_mb`: If set, enforces byte capacity limit; `capacity_bytes` property converts MB → bytes
+- Account name is auto-generated from `account_id` (e.g., `account-f059ee45`)
 
 ## API Endpoints
 

@@ -11,7 +11,6 @@ import yaml
 class AccountConfig:
     """Configuration for a single B2 account."""
 
-    name: str
     account_id: str
     account_key: str
     capacity_in_mb: int | None = None
@@ -21,6 +20,11 @@ class AccountConfig:
         if self.capacity_in_mb is None:
             return None
         return self.capacity_in_mb * 1024 * 1024
+
+    @property
+    def name(self) -> str:
+        """Generate a display name from account_id (first 8 chars)."""
+        return f"account-{self.account_id[:8]}"
 
 
 @dataclass
@@ -62,15 +66,13 @@ class ConfigReader:
 
     def _parse_account(self, data: dict[str, Any]) -> AccountConfig:
         """Parse a single account entry."""
-        name = data.get("name")
         account_id = data.get("account_id")
         account_key = data.get("account_key")
         capacity_mb = data.get("capacity_in_mb")
 
-        assert all([name, account_id, account_key]), f"Account missing required fields: {', '.join(k for k, v in [('name', name), ('account_id', account_id), ('account_key', account_key)] if not v)}"
+        assert all([account_id, account_key]), f"Account missing required fields: {', '.join(k for k, v in [('account_id', account_id), ('account_key', account_key)] if not v)}"
 
         return AccountConfig(
-            name=str(name),
             account_id=str(account_id),
             account_key=str(account_key),
             capacity_in_mb=capacity_mb,
