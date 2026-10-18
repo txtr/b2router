@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+
+{% block title %}B2 Router - File Cache{% endblock %}
+
+{% block content %}
+<h1>B2 Router - File Cache</h1>
+<p>Centralized view of files across all B2 accounts</p>
+
+<div class="stats">
+    <div class="stat">
+        <div class="stat-label">Unique Files</div>
+        <div class="stat-value">{{ stats.unique_files }}</div>
+    </div>
+    <div class="stat">
+        <div class="stat-label">Total Size</div>
+        <div class="stat-value">{{ stats.total_size_mb }} MB</div>
+    </div>
+    <div class="stat">
+        <div class="stat-label">Total References</div>
+        <div class="stat-value">{{ stats.total_account_references }}</div>
+    </div>
+    <div class="stat">
+        <div class="stat-label">Accounts with Files</div>
+        <div class="stat-value">{{ stats.accounts_with_files }}</div>
+    </div>
+</div>
+
+{% if files %}
+<div class="toolbar">
+    <input type="search" id="fileSearch" placeholder="Filter files..." aria-label="Filter files">
+</div>
+
+<table id="fileTable">
+    <thead>
+        <tr>
+            <th>File Name</th>
+            <th>File ID</th>
+            <th class="size">Size</th>
+            <th>Content Type</th>
+            <th>Upload Time</th>
+            <th>Action</th>
+            <th>Accounts</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for file in files %}
+        <tr data-name="{{ file.file_name }}">
+            <td>{{ file.file_name }}</td>
+            <td><code>{{ file.file_id }}</code></td>
+            <td class="size">{{ file.size_mb }} MB ({{ file.size }} bytes)</td>
+            <td>{{ file.content_type }}</td>
+            <td>{{ file.upload_time }}</td>
+            <td>{{ file.action }}</td>
+            <td>
+                {% for acc in file.accounts %}
+                <span class="badge">{{ acc }}</span>
+                {% endfor %}
+            </td>
+            <td class="actions">
+                <a href="/download/{{ file.file_name }}" class="btn btn-sm">Download</a>
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<div class="empty">
+    <p>No files found in any account.</p>
+    <p><a href="/upload" class="btn btn-success">Upload your first file</a></p>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    const search = document.getElementById('fileSearch');
+    const table = document.getElementById('fileTable');
+    if (!search || !table) return;
+
+    search.addEventListener('input', function() {
+        const query = this.value.toLowerCase();
+        const rows = table.querySelectorAll('tbody tr');
+        rows.forEach(row => {
+            const name = row.dataset.name.toLowerCase();
+            row.style.display = name.includes(query) ? '' : 'none';
+        });
+    });
+});
+</script>
+{% endblock %}
