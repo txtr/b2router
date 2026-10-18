@@ -5,6 +5,27 @@ from typing import Any, Callable
 
 import requests
 from b2sdk.v2 import InMemoryAccountInfo, B2Api, Bucket, B2HttpApiConfig
+from b2sdk.v2.b2http import B2Http
+from b2sdk.v2.raw_api import B2RawHTTPApi
+from b2sdk._internal.raw_api import AbstractRawApi
+
+
+class CustomB2Http(B2Http):
+    """B2Http with custom timeouts."""
+
+    def __init__(self, api_config, connect_timeout: float = 30.0, read_timeout: float = 120.0):
+        # Store timeouts before calling parent init
+        self._custom_connect_timeout = connect_timeout
+        self._custom_read_timeout = read_timeout
+        super().__init__(api_config)
+
+    @property
+    def CONNECTION_TIMEOUT(self) -> float:
+        return self._custom_connect_timeout
+
+    @property
+    def TIMEOUT_FOR_UPLOAD(self) -> float:
+        return self._custom_read_timeout
 
 
 def _create_session_factory(connect_timeout: float, read_timeout: float) -> Callable[[], requests.Session]:
@@ -13,6 +34,23 @@ def _create_session_factory(connect_timeout: float, read_timeout: float) -> Call
         session = requests.Session()
         session.timeout = (connect_timeout, read_timeout)
         return session
+    return factory
+
+
+def _create_raw_api_factory(
+    api_config: B2HttpApiConfig,
+    connect_timeout: float,
+    read_timeout: float,
+) -> Callable[[B2Http], AbstractRawApi]:
+    """Create a raw API factory that uses custom B2Http with custom timeouts."""
+    def factory(_b2_http: B2Http) -> AbstractRawApi:
+        # Create custom B2Http with our timeouts, using the same api_config
+        custom_http = CustomB2Http(
+            api_config,
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+        )
+        return B2RawHTTPApi(custom_http)
     return factory
 
 
@@ -34,9 +72,15 @@ class Account:
     read_timeout: float = field(default=120.0, init=True, repr=False)
 
     def __post_init__(self) -> None:
-        # Create API config with custom session factory for timeouts
+        # Create API config with custom raw API factory and session factory for timeouts
         api_config = B2HttpApiConfig(
             http_session_factory=_create_session_factory(self.connect_timeout, self.read_timeout),
+        )
+        # Set custom raw API factory that captures the api_config and timeouts
+        api_config.raw_api_class = _create_raw_api_factory(
+            api_config,
+            self.connect_timeout,
+            self.read_timeout,
         )
         self.api = B2Api(InMemoryAccountInfo(), api_config=api_config)
         self.api.authorize_account("production", self.application_key_id, self.application_key)
