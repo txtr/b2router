@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from b2router.services.account import Account
@@ -220,7 +220,6 @@ class AccountPool:
         Returns None if no account can fit.
         """
         best_account: Account | None = None
-        best_state: AccountState | None = None
         best_remaining: int | None = None
 
         for name, state in self._states.items():
@@ -230,7 +229,6 @@ class AccountPool:
             if best_remaining is None or remaining_after < best_remaining:
                 best_remaining = remaining_after
                 best_account = state.account
-                best_state = state
 
         return best_account
 

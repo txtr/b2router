@@ -1,0 +1,15 @@
+<form hx-post="/upload"
+      hx-target="#upload-region"
+      hx-swap="innerHTML"
+      enctype="multipart/form-data">
+    {% if messages %}
+        {% for m in messages %}
+        <div class="alert alert-{{ m.type }}">{{ m.text }}</div>
+        {% endfor %}
+    {% endif %}
+    <div class="form-group">
+        <label for="file">Select Files</label>
+        <input type="file" id="file" name="file" multiple required>
+    </div>
+    <button type="submit" class="btn btn-success">Upload</button>
+</form>
