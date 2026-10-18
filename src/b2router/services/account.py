@@ -1,10 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
-from b2sdk.v2 import InMemoryAccountInfo, B2Api, Bucket
 import requests
+from b2sdk.v2 import InMemoryAccountInfo, B2Api, Bucket, B2HttpApiConfig
+
+
+def _create_session_factory(connect_timeout: float, read_timeout: float) -> Callable[[], requests.Session]:
+    """Create a session factory that produces sessions with custom timeouts."""
+    def factory() -> requests.Session:
+        session = requests.Session()
+        session.timeout = (connect_timeout, read_timeout)
+        return session
+    return factory
 
 
 @dataclass
@@ -25,13 +34,11 @@ class Account:
     read_timeout: float = field(default=120.0, init=True, repr=False)
 
     def __post_init__(self) -> None:
-        # Create a session with custom timeouts
-        session = requests.Session()
-        session.timeout = (self.connect_timeout, self.read_timeout)
-        
-        self.api = B2Api(InMemoryAccountInfo())
-        # Set the custom session on the api's raw_api
-        self.api.session = session
+        # Create API config with custom session factory for timeouts
+        api_config = B2HttpApiConfig(
+            http_session_factory=_create_session_factory(self.connect_timeout, self.read_timeout),
+        )
+        self.api = B2Api(InMemoryAccountInfo(), api_config=api_config)
         self.api.authorize_account("production", self.application_key_id, self.application_key)
         self._fetch_bucket()
 
