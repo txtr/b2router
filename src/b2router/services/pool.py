@@ -133,14 +133,8 @@ class AccountPool:
         return account
 
     def remove(self, name: str) -> None:
-        """Remove account from pool (not supported after cache built - use clear())."""
-        assert False, "Cannot remove individual account after cache built. Use clear() to reset pool."
-
-    def clear(self) -> None:
-        """Remove all accounts and clear file cache (for testing/reset)."""
-        self._accounts.clear()
-        self._states.clear()
-        self._file_cache.clear()
+        """Remove account from pool (not supported after cache built)."""
+        assert False, "Cannot remove individual account after cache built."
 
     def __getitem__(self, name: str) -> Account:
         return self.require(name)
