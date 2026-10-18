@@ -9,7 +9,8 @@ A Flask service for Backblaze B2 account pool management with best-fit upload ro
 
 - **Python 3.11+**
 - **b2sdk 2.13.1** — Backblaze B2 SDK
-- **Flask 3.x** — Web framework and UI
+- **Flask 3.x** — Web framework and routing
+- **HTMX** — Vendored in `static/` for the interactive UI (HTML-over-HTML, no SPA)
 - **pyyaml 6.x** — Configuration parsing
 - **structlog** — Structured logging (dependency)
 - **ruff / mypy** — Linting and type checking (dev)
@@ -20,11 +21,12 @@ A Flask service for Backblaze B2 account pool management with best-fit upload ro
 - **Centralized file cache**: Built once at server startup; provides read-only view of all files across all accounts
 - **Best-fit upload routing**: Selects the account that maximizes packing efficiency (most full account that can still fit the file)
 - **Capacity tracking**: Tracks both byte capacity (configurable per account) and file count limits (default 1700 per account)
-- **Web UI**: 
-  - File listing with metadata (name, size, content type, upload time, accounts)
-  - One-click downloads from B2
-  - Multi-file upload with best-fit routing
-  - Account status dashboard
+- **Web UI** (HTML + HTMX, single-page-ish, no JS framework):
+  - Live file listing with metadata (name, size, content type, upload time, accounts)
+  - Real-time server-side search filtering as you type (HTMX fragment swap)
+  - One-click streaming downloads from B2
+  - Multi-file upload with best-fit routing (HTMX; table + stats refresh live)
+  - Account status dashboard with live stat cards
 - **JSON API endpoints**:
   - `GET /api/files` — List all files with metadata
   - `GET /api/accounts` — Account status and active count
@@ -47,30 +49,41 @@ Provide a minimal, clean B2 account pool management library with centralized cac
 
 ```
 b2router/
-├── Dockerfile         # Python 3.11-slim image, installs package in editable mode
-├── docker-compose.yml # Services b2router build; mounts ./accounts.yaml:/app/accounts.yaml:ro
-├── accounts.yaml      # **Gitignored** — your B2 credentials and account config
+├── Dockerfile            # Python 3.11-slim image, installs package in editable mode
+├── docker-compose.yml    # Builds b2router; mounts ./accounts.yaml:/app/accounts.yaml:ro
+├── accounts.yaml         # **Gitignored** — your B2 credentials and account config
 ├── accounts.yaml.example # Template with placeholder credentials
-├── pyproject.toml     # Project metadata, dependencies, ruff/mypy config
-├── LICENSE            # Apache 2.0
+├── pyproject.toml        # Project metadata, dependencies, ruff/mypy config
+├── LICENSE               # Apache 2.0
 ├── src/
-│   ├── b2router/
-│   │   ├── __init__.py     # "# B2 Router - Flask service for Backblaze B2"
-│   │   ├── core/
-│   │   │   └── config_reader.py  # YAML parsing → AccountConfig / Config dataclasses
-│   │   ├── services/
-│   │   │   ├── account.py      # Account dataclass wrapping B2Api + Bucket
-│   │   │   └── pool.py         # AccountPool with cache, best-fit routing, upload API
-│   │   ├── utils/
-│   │   │   ├── __init__.py     # "# Utils package"
-│   │   │   ├── create_file.py  # CLI: upload test file to a specific account
-│   │   │   └── delete_file.py  # CLI: delete a file from an account
-│   │   └── web.py              # Flask app with templates, routes, API endpoints
-│   └── tests/
-│       ├── __init__.py
-│       ├── test_accounts.py    # Init all accounts, print cache state
-│       ├── test_config_reader.py  # Validate config, output structured results
-│       └── test_single_account.py # Init single account, list its files
+│   └── b2router/
+│       ├── __init__.py           # "# B2 Router - Flask service for Backblaze B2"
+│       ├── server.py             # Entrypoint: load accounts, run Flask
+│       ├── web.py                # Flask app + HTMX fragment endpoints
+│       ├── static/               # Vendored front-end assets
+│       │   ├── htmx.min.js       # HTMX (HTML-over-HTML interactivity)
+│       │   └── style.css         # Theme (light/dark, responsive)
+│       ├── templates/            # Jinja2 templates (HTMX fragments)
+│       │   ├── base.html         # Layout: nav + stylesheet + HTMX
+│       │   ├── index.html        # Shell: stats, search, file table, upload region
+│       │   └── fragments/
+│       │       ├── stats.html    # Stat cards fragment
+│       │       ├── files_table.html  # File table / empty-state fragment
+│       │       └── upload_form.html  # Upload drop-zone fragment
+│       ├── core/
+│       │   └── config_reader.py  # YAML parsing → AccountConfig / Config dataclasses
+│       ├── services/
+│       │   ├── account.py        # Account dataclass wrapping B2Api + Bucket
+│       │   └── pool.py           # AccountPool with cache, best-fit routing, upload API
+│       ├── tests/
+│       │   ├── __init__.py
+│       │   ├── test_accounts.py   # Init all accounts, print cache state
+│       │   ├── test_config_reader.py  # Validate config, output structured results
+│       │   └── test_single_account.py # Init single account, list its files
+│       └── utils/
+│           ├── __init__.py       # "# Utils package"
+│           ├── create_file.py    # CLI: upload test file to a specific account
+│           └── delete_file.py    # CLI: delete a file from an account
 ```
 
 ## Quick Start
@@ -122,14 +135,15 @@ accounts:
 
 ## API Endpoints
 
-| Method | Endpoint          | Description                      |
-|--------|-------------------|----------------------------------|
-| `GET`  | `/`               | File listing web page            |
-| `GET`  | `/upload`         | File upload form                 |
-| `POST` | `/upload`         | Upload one or more files         |
-| `GET`  | `/download/<name>`| Download file from B2            |
-| `GET`  | `/api/files`      | JSON: list all files + stats     |
-| `GET`  | `/api/accounts`   | JSON: active accounts + stats    |
+| Method | Endpoint          | Description                                              |
+|--------|-------------------|----------------------------------------------------------|
+| `GET`  | `/`               | File listing + upload form (HTMX shell)                  |
+| `GET`  | `/files?q=`       | HTMX fragment: file table (server-side search filter)    |
+| `GET`  | `/stats`          | HTMX fragment: account-pool stat cards                   |
+| `POST` | `/upload`         | HTMX: upload files; OOB refresh of table + stats         |
+| `GET`  | `/download/<name>`| Stream a file from B2                                    |
+| `GET`  | `/api/files`      | JSON: file cache + stats                                 |
+| `GET`  | `/api/accounts`   | JSON: active accounts + stats                            |
 
 ## Development
 
