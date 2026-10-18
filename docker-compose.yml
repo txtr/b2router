@@ -9,4 +9,6 @@ services:
       - ./accounts.yaml:/app/accounts.yaml:ro
     environment:
       - PYTHONUNBUFFERED=1
+      - B2_CONNECT_TIMEOUT=30
+      - B2_READ_TIMEOUT=120
     restart: unless-stopped
