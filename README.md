@@ -35,7 +35,7 @@ A FastAPI-style Flask service for Backblaze B2 account pool management with best
 
 - **File cache is static**: Built once at startup and never refreshed. New files uploaded outside the server won't appear until restart.
 - **No duplicate filenames**: Each file name must be unique across the entire pool; uploading a duplicate raises an `AssertionError`.
-- **Accounts immutable after cache build**: Individual accounts cannot be removed after the cache is built. Use `clear()` to reset the pool.
+- **Accounts immutable after cache build**: Individual accounts cannot be removed after the cache is built.
 - **Capacity limits enforced**: Both byte capacity and max file count per account are enforced during upload routing.
 - **Single bucket per account**: The code expects exactly one bucket per account (`assert len(buckets) == 1`).
 
