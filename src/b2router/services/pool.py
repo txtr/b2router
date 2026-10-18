@@ -70,11 +70,17 @@ class AccountState:
 class AccountPool:
     """Pool managing multiple B2 Account instances with centralized file cache (built once at startup)."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        connect_timeout: float = 30.0,
+        read_timeout: float = 120.0,
+    ) -> None:
         self._accounts: dict[str, Account] = {}
         self._states: dict[str, AccountState] = {}  # name -> AccountState
         self._file_cache: dict[str, FileCacheEntry] = {}  # file_name -> FileCacheEntry
         self._default_max_files: int = 1700
+        self._connect_timeout = connect_timeout
+        self._read_timeout = read_timeout
 
     def set_max_files_per_account(self, max_files: int) -> None:
         """Set the default max files per account for all accounts."""
@@ -87,7 +93,13 @@ class AccountPool:
     def add(self, name: str, application_key_id: str, application_key: str, capacity_mb: int = 0) -> Account:
         """Create and add an Account to the pool. Enriches file cache once at startup."""
         assert name not in self._accounts, f"Account '{name}' already exists"
-        account = Account(application_key_id=application_key_id, application_key=application_key, name=name)
+        account = Account(
+            application_key_id=application_key_id,
+            application_key=application_key,
+            name=name,
+            connect_timeout=self._connect_timeout,
+            read_timeout=self._read_timeout,
+        )
         self._accounts[name] = account
         capacity_bytes = capacity_mb * 1024 * 1024
         self._states[name] = AccountState(

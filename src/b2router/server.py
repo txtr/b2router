@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Run the Flask web server with accounts loaded from config."""
 
+import os
+
 from b2router.core.config_reader import ConfigReader
 from b2router.services import account_pool
 from b2router.web import run_server
@@ -10,6 +12,18 @@ def load_accounts() -> None:
     """Load accounts from accounts.yaml into the pool."""
     reader = ConfigReader("accounts.yaml")
     config = reader.read()
+
+    # Configurable timeouts via environment variables (seconds)
+    connect_timeout = float(os.getenv("B2_CONNECT_TIMEOUT", "30"))
+    read_timeout = float(os.getenv("B2_READ_TIMEOUT", "120"))
+
+    # Recreate pool with custom timeouts
+    from b2router.services.pool import AccountPool
+    global account_pool
+    account_pool = AccountPool(
+        connect_timeout=connect_timeout,
+        read_timeout=read_timeout,
+    )
 
     for acc in config.accounts:
         account_pool.add(acc.name, acc.account_id, acc.account_key, acc.capacity_in_mb or 0)

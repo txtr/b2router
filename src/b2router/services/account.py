@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from b2sdk.v2 import InMemoryAccountInfo, B2Api, Bucket
+import requests
 
 
 @dataclass
@@ -19,8 +20,18 @@ class Account:
     _total_size: int = field(default=0, init=False, repr=False)
     _file_count: int = field(default=0, init=False, repr=False)
 
+    # Configurable timeouts (seconds)
+    connect_timeout: float = field(default=30.0, init=True, repr=False)
+    read_timeout: float = field(default=120.0, init=True, repr=False)
+
     def __post_init__(self) -> None:
+        # Create a session with custom timeouts
+        session = requests.Session()
+        session.timeout = (self.connect_timeout, self.read_timeout)
+        
         self.api = B2Api(InMemoryAccountInfo())
+        # Set the custom session on the api's raw_api
+        self.api.session = session
         self.api.authorize_account("production", self.application_key_id, self.application_key)
         self._fetch_bucket()
 
