@@ -28,7 +28,7 @@
                     {% endfor %}
                 </td>
                 <td class="actions">
-                    <a href="/download/{{ file.file_name }}" class="btn btn-sm">Download</a>
+                    <a href="/download/{{ file.file_name }}" class="btn btn-sm btn-ghost">Download</a>
                 </td>
             </tr>
             {% endfor %}
@@ -37,6 +37,10 @@
 </div>
 {% else %}
 <div class="empty">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+        <path stroke-linecap="round" stroke-linejoin="round"
+              d="M19.5 14.25v2.25a2.25 2.25 0 0 1-2.25 2.25H6.75a2.25 2.25 0 0 1-2.25-2.25V6.75a2.25 2.25 0 0 1 2.25-2.25h3m6.75 0l.001 4.5m0 0l-.625.625M12.75 4.5h9m-6.75 0V4.5a2.25 2.25 0 0 0-2.25-2.25H8.25A2.25 2.25 0 0 0 6 4.5v15A2.25 2.25 0 0 0 8.25 21.75h7.5A2.25 2.25 0 0 0 18 19.5V12.75"/>
+    </svg>
     <p>No files found{% if query %} matching “{{ query }}”{% endif %}.</p>
     <p><a href="#upload-region" class="btn btn-success">Upload your first file</a></p>
 </div>
