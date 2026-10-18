@@ -90,6 +90,15 @@ class AccountPool:
         for state in self._states.values():
             state.max_files = max_files
 
+    def configure_timeouts(self, connect_timeout: float, read_timeout: float) -> None:
+        """Set network timeouts used when creating new Account instances.
+
+        Mutates the shared singleton in place so that modules which imported the
+        singleton (e.g. web.py) observe accounts added afterwards.
+        """
+        self._connect_timeout = connect_timeout
+        self._read_timeout = read_timeout
+
     def add(self, name: str, application_key_id: str, application_key: str, capacity_mb: int = 0) -> Account:
         """Create and add an Account to the pool. Enriches file cache once at startup."""
         assert name not in self._accounts, f"Account '{name}' already exists"
