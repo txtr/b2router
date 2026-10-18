@@ -3,7 +3,7 @@
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 
-A FastAPI-style Flask service for Backblaze B2 account pool management with best-fit upload routing, centralized file cache, and a web UI.
+A Flask service for Backblaze B2 account pool management with best-fit upload routing, centralized file cache, and a web UI.
 
 ## Tech Stack
 
@@ -55,7 +55,7 @@ b2router/
 ├── LICENSE            # Apache 2.0
 ├── src/
 │   ├── b2router/
-│   │   ├── __init__.py     # "# B2 Router - FastAPI service for Backblaze B2"
+│   │   ├── __init__.py     # "# B2 Router - Flask service for Backblaze B2"
 │   │   ├── core/
 │   │   │   └── config_reader.py  # YAML parsing → AccountConfig / Config dataclasses
 │   │   ├── services/
