@@ -1,4 +1,5 @@
 from __future__ import annotations
+from datetime import datetime
 
 from typing import Any
 
@@ -17,6 +18,17 @@ from b2router.services import account_pool
 
 def _format_files(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Map raw cache entries (from FileCacheEntry.to_dict) into template dicts."""
+    def _fmt_ts(ts):
+        """Format upload timestamp to human-readable string."""
+        if ts is None:
+            return "-"
+        try:
+            # ts is milliseconds since epoch (13-digit number)
+            dt = datetime.fromtimestamp(ts / 1000)
+            return dt.strftime("%Y-%m-%d %H:%M")
+        except (ValueError, OSError):
+            return str(ts)
+    
     formatted = []
     for f in raw:
         formatted.append({
@@ -25,13 +37,11 @@ def _format_files(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "size": f["size"],
             "size_mb": round(f["size"] / (1024 * 1024), 2),
             "content_type": f["content_type"],
-            "upload_time": str(f["upload_timestamp"]),
+            "upload_time": _fmt_ts(f["upload_timestamp"]),
             "action": f["action"],
             "accounts": f["accounts"],
         })
     return formatted
-
-
 def _format_stats(stats: dict[str, Any]) -> dict[str, Any]:
     return {
         "unique_files": stats["unique_files"],

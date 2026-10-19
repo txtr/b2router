@@ -19,7 +19,7 @@
                     </a>
                 </td>
                 <td class="size">{{ file.size_mb }} MB ({{ file.size }} bytes)</td>
-                <td>{{ file.upload_time[:16].replace('T', ' ') if file.upload_time else '—' }}</td>
+<td>{% if file.upload_time is string and file.upload_time.isdigit() and len(file.upload_time) > 10 %}{{ ((int(file.upload_time) / 1000) | int) | string }}{% else %}{{ file.upload_time }}{% endif %}</td>
             </tr>
             {% endfor %}
         </tbody>
