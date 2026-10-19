@@ -16,5 +16,29 @@
         </nav>
         {% block content %}{% endblock %}
     </div>
+    <script>
+      /* Show selected (not-yet-uploaded) files. Delegates on document so the
+         listener survives HTMX swaps of #upload-region. */
+      document.addEventListener('change', function (e) {
+        if (e.target.type !== 'file') return;
+        var indicator = document.getElementById('selected-files');
+        if (!indicator) return;
+        indicator.innerHTML = '';
+        var files = Array.prototype.slice.call(e.target.files || []);
+        if (!files.length) return;
+        var list = document.createElement('ul');
+        list.className = 'file-list';
+        files.forEach(function (f) {
+          var li = document.createElement('li');
+          li.className = 'file-item';
+          var size = f.size > 1048576 ? (f.size / 1048576).toFixed(1) + ' MB'
+                     : f.size > 1024  ? (f.size / 1024).toFixed(1) + ' KB'
+                                     : f.size + ' B';
+          li.textContent = f.name + ' • ' + size;
+          list.appendChild(li);
+        });
+        indicator.appendChild(list);
+      });
+    </script>
 </body>
 </html>

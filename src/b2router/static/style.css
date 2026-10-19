@@ -210,6 +210,25 @@ code {
   pointer-events: none;
 }
 
+/* Selected-files indicator (populated client-side before upload) */
+.selected-files { margin-top: 0.75rem; }
+.file-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+.file-item {
+  font-size: 0.8rem;
+  padding: 0.35rem 0.6rem;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+}
+
 /* Buttons */
 .btn {
   display: inline-flex;
