@@ -1,6 +1,6 @@
 from __future__ import annotations
-from datetime import datetime
 
+from datetime import datetime
 from typing import Any
 
 from flask import (
@@ -28,7 +28,7 @@ def _format_files(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
             return dt.strftime("%Y-%m-%d %H:%M")
         except (ValueError, OSError):
             return str(ts)
-    
+
     formatted = []
     for f in raw:
         formatted.append({
@@ -43,11 +43,16 @@ def _format_files(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
         })
     return formatted
 def _format_stats(stats: dict[str, Any]) -> dict[str, Any]:
+    free_bytes = stats["total_free_bytes"]
+    used_bytes = stats["total_used_bytes"]
+    capacity_bytes = stats["total_capacity_bytes"]
+    free_mb = round(free_bytes / (1024 * 1024), 1)
+    used_mb = round(used_bytes / (1024 * 1024), 1)
     return {
-        "unique_files": stats["unique_files"],
-        "total_size_mb": round(stats["total_size_bytes"] / (1024 * 1024), 2),
-        "total_account_references": stats["total_account_references"],
-        "accounts_with_files": stats["accounts_with_files"],
+        "total_free_space": "Unlimited" if capacity_bytes == 0 else f"{free_mb} MB",
+        "total_used_space": f"{used_mb} MB",
+        "number_of_files": stats["number_of_files"],
+        "number_of_accounts": stats["number_of_accounts"],
     }
 
 

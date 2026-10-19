@@ -203,11 +203,21 @@ class AccountPool:
         all_accounts = set()
         for e in self._file_cache.values():
             all_accounts.update(e.accounts)
+        # Capacity stats across all accounts
+        total_capacity_bytes = sum(s.capacity_bytes for s in self._states.values())
+        total_used_bytes = sum(s.used_bytes for s in self._states.values())
+        total_free_bytes = (total_capacity_bytes - total_used_bytes
+                            if total_capacity_bytes > 0 else 0)
         return {
             "unique_files": total_files,
             "total_size_bytes": total_size,
             "total_account_references": total_account_refs,
             "accounts_with_files": len(all_accounts),
+            "number_of_files": total_files,
+            "number_of_accounts": len(self._accounts),
+            "total_capacity_bytes": total_capacity_bytes,
+            "total_used_bytes": total_used_bytes,
+            "total_free_bytes": total_free_bytes,
         }
 
     # --- Upload Routing (Best-Fit Packing) ---
