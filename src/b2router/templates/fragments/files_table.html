@@ -4,29 +4,21 @@
         <thead>
             <tr>
                 <th>File Name</th>
-                <th>File ID</th>
                 <th class="size">Size</th>
-                <th>Content Type</th>
                 <th>Upload Time</th>
-                <th>Action</th>
-                <th>Accounts</th>
                 <th>Actions</th>
             </tr>
         </thead>
         <tbody>
             {% for file in files %}
             <tr data-name="{{ file.file_name }}">
-                <td>{{ file.file_name }}</td>
-                <td><code>{{ file.file_id }}</code></td>
-                <td class="size">{{ file.size_mb }} MB ({{ file.size }} bytes)</td>
-                <td>{{ file.content_type }}</td>
-                <td>{{ file.upload_time }}</td>
-                <td>{{ file.action }}</td>
                 <td>
-                    {% for acc in file.accounts %}
-                    <span class="badge">{{ acc }}</span>
-                    {% endfor %}
+                    <a href="/download/{{ file.file_name }}" title="File ID: {{ file.file_id }} • Content Type: {{ file.content_type }} • Accounts: {{ ', '.join(file.accounts|default('none')) }}">
+                        {{ file.file_name }}
+                    </a>
                 </td>
+                <td class="size">{{ file.size_mb }} MB ({{ file.size }} bytes)</td>
+                <td>{{ file.upload_time }}</td>
                 <td class="actions">
                     <a href="/download/{{ file.file_name }}" class="btn btn-sm">Download</a>
                 </td>
