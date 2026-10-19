@@ -6,22 +6,20 @@
                 <th>File Name</th>
                 <th class="size">Size</th>
                 <th>Upload Time</th>
-                <th>Actions</th>
             </tr>
         </thead>
         <tbody>
             {% for file in files %}
             <tr data-name="{{ file.file_name }}">
                 <td>
-                    <a href="/download/{{ file.file_name }}" title="File ID: {{ file.file_id }} • Content Type: {{ file.content_type }} • Accounts: {{ ', '.join(file.accounts|default('none')) }}">
+                    <a href="/download/{{ file.file_name }}" 
+                       title="File ID: {{ file.file_id }} • Content Type: {{ file.content_type }} • Accounts: {{ ', '.join(file.accounts|default('none')) }}"
+                       style="text-decoration: none; color: inherit;">
                         {{ file.file_name }}
                     </a>
                 </td>
                 <td class="size">{{ file.size_mb }} MB ({{ file.size }} bytes)</td>
-                <td>{{ file.upload_time }}</td>
-                <td class="actions">
-                    <a href="/download/{{ file.file_name }}" class="btn btn-sm">Download</a>
-                </td>
+                <td>{{ file.upload_time[:16].replace('T', ' ') if file.upload_time else '—' }}</td>
             </tr>
             {% endfor %}
         </tbody>
