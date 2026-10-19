@@ -169,7 +169,14 @@ code {
   font-size: 0.72rem;
   margin-right: 0.35rem;
 }
-.actions { display: flex; gap: 0.5rem; }
+/* table-cell (not flex) so the cell stretches to the full row height;
+   display:flex on a td collapses it to its content height, breaking
+   alignment with tr and leaving background gaps in zebra/hover rows */
+.actions {
+  display: table-cell;
+  height: 100%;
+  vertical-align: middle;
+}
 
 /* Upload drop zone */
 .upload-dropzone {
