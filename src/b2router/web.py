@@ -25,7 +25,7 @@ def _format_files(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "size": f["size"],
             "size_mb": round(f["size"] / (1024 * 1024), 2),
             "content_type": f["content_type"],
-            "upload_time": f["upload_timestamp"],
+            "upload_time": str(f["upload_timestamp"]),
             "action": f["action"],
             "accounts": f["accounts"],
         })
