@@ -43,14 +43,21 @@ def _format_files(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
         })
     return formatted
 def _format_stats(stats: dict[str, Any]) -> dict[str, Any]:
+    def _human_size(n_bytes: int) -> str:
+        """Format bytes into human-readable B/KB/MB/GB/TB."""
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if n_bytes < 1024 or unit == "TB":
+                if unit == "B":
+                    return f"{n_bytes} {unit}"
+                return f"{round(n_bytes, 1)} {unit}"
+            n_bytes /= 1024
+
     free_bytes = stats["total_free_bytes"]
     used_bytes = stats["total_used_bytes"]
     capacity_bytes = stats["total_capacity_bytes"]
-    free_mb = round(free_bytes / (1024 * 1024), 1)
-    used_mb = round(used_bytes / (1024 * 1024), 1)
     return {
-        "total_free_space": "Unlimited" if capacity_bytes == 0 else f"{free_mb} MB",
-        "total_used_space": f"{used_mb} MB",
+        "total_free_space": "Unlimited" if capacity_bytes == 0 else _human_size(free_bytes),
+        "total_used_space": _human_size(used_bytes),
         "number_of_files": stats["number_of_files"],
         "number_of_accounts": stats["number_of_accounts"],
     }
