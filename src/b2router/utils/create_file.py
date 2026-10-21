@@ -1,55 +1,121 @@
+"""Upload a test object directly to one B2 account.
+
+The running gateway never mutates its cache behind its back, so a file created
+here is only visible after the next restart. This is a debugging tool, not part
+of the HTTP API.
+"""
+
 from __future__ import annotations
 
 import argparse
+import contextlib
+import json
 import os
 import sys
+import tempfile
+from pathlib import Path
 
-from b2router.core.config_reader import ConfigReader
-from b2router.services.account import Account
+from b2router.core.config_reader import AccountSpec, ConfigReader
+from b2router.services.account import AccountClient, AccountCredentials, StorageError
+from b2router.services.pool import Err
+from b2router.settings import Settings
 
 
-def create_test_file(account_name: str, file_name: str, size_mb: int) -> None:
-    """Create a test file of specified size in the given account (uploads directly to B2).
-
-    Note: The pool's file cache is built at server startup and is NOT refreshed.
-    This file will exist in B2 but won't appear in the web UI until server restart.
-    """
-    reader = ConfigReader("accounts.yaml")
-    accounts = reader.read()
-
-    acc = next((a for a in accounts if a.name == account_name), None)
-    if not acc:
-        print(f"Account '{account_name}' not found. Available: {[a.name for a in accounts]}")
-        sys.exit(1)
-
-    account = Account(application_key_id=acc.account_id, application_key=acc.account_key)
-
-    size_bytes = size_mb * 1024 * 1024
-    content = os.urandom(size_bytes)
-
-    print(f"Uploading {file_name} ({size_mb} MB) to account '{account_name}'...")
-    file_version = account.bucket.upload_bytes(
-        content,
-        file_name,
-        content_type="application/octet-stream",
+def _find_account(specs: list[AccountSpec], needle: str) -> AccountSpec | None:
+    return next(
+        (
+            spec
+            for spec in specs
+            if spec.name == needle
+            or spec.application_key_id == needle
+            or spec.name.endswith(needle)
+        ),
+        None,
     )
 
-    print(f"Uploaded successfully!")
-    print(f"  File ID: {file_version.id_}")
-    print(f"  Size: {file_version.size} bytes")
-    print(f"  Content-Type: {file_version.content_type}")
-    print(f"NOTE: File will appear in web UI after server restart (cache is static)")
 
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Upload a file directly to one B2 account")
+    parser.add_argument("account", help="Account name from accounts.yaml")
+    parser.add_argument("name", help="File name to create in B2 (may contain '/')")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--file", help="Upload this local file")
+    source.add_argument("--size-mb", type=int, help="Generate a random file of this size")
+    parser.add_argument("--content-type", default="application/octet-stream")
+    parser.add_argument("--accounts", default=os.environ.get("B2ROUTER_ACCOUNTS", "accounts.yaml"))
+    args = parser.parse_args(argv)
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Create a test file in a B2 account")
-    parser.add_argument("account", help="Account name (from accounts.yaml)")
-    parser.add_argument("filename", help="Name/path of file to create in B2")
-    parser.add_argument("size_mb", type=int, help="Size of file in MB")
-    args = parser.parse_args()
+    result = ConfigReader(args.accounts).read()
+    if isinstance(result, Err):
+        print(json.dumps({"error": result.error.message}), file=sys.stderr)
+        return 2
+    spec = _find_account(result.value.accounts, args.account)
+    if spec is None:
+        print(
+            json.dumps(
+                {
+                    "error": f"Unknown account {args.account!r}",
+                    "available": [account.name for account in result.value.accounts],
+                }
+            ),
+            file=sys.stderr,
+        )
+        return 2
 
-    create_test_file(args.account, args.filename, args.size_mb)
+    settings = Settings.from_env()
+    client = AccountClient(
+        AccountCredentials(
+            name=spec.name,
+            application_key_id=spec.application_key_id,
+            application_key=spec.application_key,
+            connect_timeout=settings.connect_timeout,
+            read_timeout=settings.read_timeout,
+        )
+    )
+
+    generated: str | None = None
+    try:
+        if args.file:
+            local_path = str(Path(args.file))
+            if not Path(local_path).is_file():
+                print(json.dumps({"error": f"Not a file: {local_path}"}), file=sys.stderr)
+                return 2
+        else:
+            if args.size_mb is None or args.size_mb < 0:
+                print(json.dumps({"error": "--size-mb must be >= 0"}), file=sys.stderr)
+                return 2
+            with tempfile.NamedTemporaryFile(prefix="b2router-gen-", delete=False) as handle:
+                generated = handle.name
+                remaining = args.size_mb * 1024 * 1024
+                while remaining > 0:
+                    chunk = os.urandom(min(remaining, 1024 * 1024))
+                    handle.write(chunk)
+                    remaining -= len(chunk)
+            local_path = generated
+
+        version = client.upload_local_file(local_path, args.name, args.content_type)
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "account": spec.name,
+                    "file_name": version.file_name,
+                    "file_id": version.file_id,
+                    "size": version.size,
+                    "content_type": version.content_type,
+                    "uploaded_timestamp": version.upload_timestamp,
+                }
+            )
+        )
+        return 0
+    except StorageError as exc:
+        print(json.dumps({"error": exc.message, "code": exc.code}), file=sys.stderr)
+        return 1
+    finally:
+        if generated:
+            with contextlib.suppress(OSError):
+                os.unlink(generated)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

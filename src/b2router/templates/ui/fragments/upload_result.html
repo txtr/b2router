@@ -1,0 +1,19 @@
+{% if rejected %}
+  <div class="alert alert-warning" role="alert">
+    <div class="fw-semibold mb-1"><i class="bi bi-exclamation-triangle"></i> {{ rejected|length }} file{{ '' if rejected|length == 1 else 's' }} not queued</div>
+    <ul class="mb-0 ps-3 small">
+      {% for item in rejected %}
+        <li><span class="mono">{{ item.file_name }}</span>: {{ item.error.message }} <span class="chip muted">{{ item.error.code }}</span></li>
+      {% endfor %}
+    </ul>
+  </div>
+{% endif %}
+
+{% if jobs %}
+  <div class="alert alert-success py-2" role="status">
+    <i class="bi bi-check2-circle"></i> {{ jobs|length }} transfer{{ '' if jobs|length == 1 else 's' }} queued. Progress updates automatically.
+  </div>
+  {% for job in jobs %}
+    {% include "ui/fragments/job_card.html" %}
+  {% endfor %}
+{% endif %}

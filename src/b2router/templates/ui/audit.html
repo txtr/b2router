@@ -1,0 +1,15 @@
+{% extends "ui/base.html" %}
+{% block title %}Audit · b2router{% endblock %}
+
+{% block content %}
+  <div class="page-head">
+    <div>
+      <div class="page-kicker">Observability</div>
+      <h1 class="page-title">Audit log</h1>
+      <p class="page-subtitle">Every upload, upsert, and delete, with account, size, client, request id, and duration.</p>
+    </div>
+    <span class="chip accent"><i class="bi bi-shield-check"></i> append-only in memory</span>
+  </div>
+
+  {% include "ui/fragments/audit_panel.html" %}
+{% endblock %}

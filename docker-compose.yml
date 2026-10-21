@@ -1,14 +1,37 @@
-version: '3.8'
-
 services:
   b2router:
     build: .
+    image: b2router:dev
+    init: true
     ports:
       - "8000:8000"
     volumes:
-      - ./accounts.yaml:/app/accounts.yaml:ro
+      - ./accounts.yaml:/config/accounts.yaml:ro
+      - b2router-data:/data
     environment:
-      - PYTHONUNBUFFERED=1
-      - B2_CONNECT_TIMEOUT=30
-      - B2_READ_TIMEOUT=120
+      B2ROUTER_HOST: 0.0.0.0
+      B2ROUTER_PORT: "8000"
+      B2ROUTER_ACCOUNTS: /config/accounts.yaml
+      B2ROUTER_TEMP_DIR: /data/tmp
+      B2ROUTER_LOCK_FILE: /data/instance.lock
+      B2ROUTER_LOG_FORMAT: json
+      # Shared token: set in .env or remove for same-origin-only use.
+      B2ROUTER_API_TOKEN: ${B2ROUTER_API_TOKEN:-}
+      # Set a stable key to keep UI sessions across container restarts.
+      B2ROUTER_SECRET_KEY: ${B2ROUTER_SECRET_KEY:-}
+      B2ROUTER_COOKIE_SECURE: ${B2ROUTER_COOKIE_SECURE:-0}
     restart: unless-stopped
+    stop_grace_period: 15s
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  b2router-data:
