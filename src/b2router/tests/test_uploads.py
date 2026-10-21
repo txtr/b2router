@@ -204,13 +204,92 @@ def test_upsert_on_missing_file_creates_it(
     assert pool.get_file("new.txt") is not None
 
 
-def test_upsert_partial_when_old_delete_fails(
+def test_upsert_rolls_back_new_version_when_old_delete_fails(
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    fake = FakeStorage("a")
+    old = fake.seed("stuck.txt", b"old")
+    # The old-version delete exhausts all retries; the rollback then succeeds.
+    fake.delete_failures_remaining = 3
+    pool = AccountPool()
+    pool.add_account(fake, None)
+    manager = UploadManager(pool, AuditLog(), settings)
+    try:
+        job = manager.submit(
+            file_name="stuck.txt",
+            temp_path=_spool(tmp_path, b"much newer data"),
+            file_size=15,
+            content_type="text/plain",
+            operation="upsert",
+            request_id=None,
+            client=None,
+        )
+
+        finished = _wait_state(manager, job.id, timeout=8.0)
+
+        assert finished.state is JobState.FAILED
+        assert finished.error is not None
+        assert finished.error["code"] == "old_version_retained"
+        assert "rolled back" in finished.error["message"]
+        entry = pool.get_file("stuck.txt")
+        assert entry is not None
+        assert entry.file_id == old.file_id
+        assert fake.files["stuck.txt"].file_id == old.file_id
+        assert fake.data == {old.file_id: b"old"}
+        assert [version.file_id for version in fake.all_versions] == [old.file_id]
+        assert pool.get_account_state("a").file_count == 1
+        assert pool.stats()["used_bytes"] == len(b"old")
+    finally:
+        manager.shutdown()
+
+
+def test_upsert_accepts_ambiguous_old_delete_when_old_version_is_gone(
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeStorage("a")
+    old = fake.seed("ambiguous.txt", b"old")
+    pool = AccountPool()
+    pool.add_account(fake, None)
+    manager = UploadManager(pool, AuditLog(), settings)
+
+    def delete_old_but_report_failure(entry) -> bool:  # noqa: ANN001
+        fake.delete_version(entry.file_id, entry.file_name)
+        return False
+
+    monkeypatch.setattr(manager, "_delete_old", delete_old_but_report_failure)
+    try:
+        job = manager.submit(
+            file_name="ambiguous.txt",
+            temp_path=_spool(tmp_path, b"new"),
+            file_size=3,
+            content_type="text/plain",
+            operation="upsert",
+            request_id=None,
+            client=None,
+        )
+
+        finished = _wait_state(manager, job.id)
+
+        assert finished.state is JobState.COMPLETE
+        entry = pool.get_file("ambiguous.txt")
+        assert entry is not None
+        assert entry.file_id != old.file_id
+        assert old.file_id not in fake.data
+        assert [version.file_id for version in fake.all_versions] == [entry.file_id]
+    finally:
+        manager.shutdown()
+
+
+def test_upsert_partial_when_old_delete_and_rollback_fail(
     settings: Settings,
     tmp_path: Path,
 ) -> None:
     fake = FakeStorage("a")
     fake.seed("stuck.txt", b"old")
-    fake.delete_failures_remaining = 10
+    fake.fail_delete = True
     pool = AccountPool()
     pool.add_account(fake, None)
     manager = UploadManager(pool, AuditLog(), settings)
@@ -230,10 +309,11 @@ def test_upsert_partial_when_old_delete_fails(
         assert finished.state is JobState.PARTIAL
         assert finished.error is not None
         assert finished.error["code"] == "old_version_retained"
+        assert finished.error["details"]["rollback_failed"] is True
         entry = pool.get_file("stuck.txt")
         assert entry is not None
         assert entry.file_id in fake.data
-        # Old bytes and the old file slot remain counted because they still exist in B2.
+        # Both copies still exist in B2, so both bytes and slots remain counted.
         assert pool.get_account_state("a").file_count == 2
         assert pool.stats()["used_bytes"] == 15 + 3
     finally:

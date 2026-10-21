@@ -81,7 +81,7 @@
           </form>
           <div id="replace-result" class="mt-3"></div>
           <p class="text-secondary small mt-3 mb-0">
-            If the old delete fails, the job ends <span class="chip warn">partial</span> and startup will require reconciliation.
+            If the old delete fails, the new version is rolled back and the job fails. A double failure ends <span class="chip warn">partial</span> and requires reconciliation.
           </p>
         </div>
       </div>

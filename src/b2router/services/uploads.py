@@ -377,7 +377,7 @@ class UploadManager:
                     actual=version.size,
                 )
 
-            committed = self._complete_upload(job, reservation, old_entry, version, started)
+            committed = self._complete_upload(job, reservation, old_entry, version, client, started)
         except (PoolError, StorageError) as exc:
             if (
                 not committed
@@ -420,11 +420,31 @@ class UploadManager:
         reservation: Reservation,
         old_entry: FileEntry | None,
         version: Any,
+        client: Any,
         started: float,
     ) -> bool:
         if job.operation == "upsert" and old_entry is not None:
             job.set_state(JobState.REPLACING)
             old_deleted = self._delete_old(old_entry)
+            old_exists: bool | None = None
+            if not old_deleted:
+                # A failed delete can be ambiguous. If B2 says the old version
+                # is gone, keep the new one; if it is still there, roll the new
+                # one back so the name does not remain duplicated.
+                old_exists = self._old_version_exists(old_entry)
+                if old_exists is False:
+                    old_deleted = True
+                elif old_exists and self._rollback_new_version(job, client, version):
+                    self._fail(
+                        job,
+                        "old_version_retained",
+                        (
+                            "The replacement was rolled back because the previous version "
+                            "could not be deleted; the original file is unchanged."
+                        ),
+                        started,
+                    )
+                    return True
             entry = self._pool.commit_replace(
                 reservation, old_entry, version, old_deleted=old_deleted
             )
@@ -438,9 +458,15 @@ class UploadManager:
                         "code": "old_version_retained",
                         "message": (
                             "The new version was stored, but the previous version could not "
-                            "be deleted. Remove it manually before restarting."
+                            "be deleted and rolling back the new version also failed. Run "
+                            "b2router-reconcile --apply with the gateway stopped before "
+                            "restarting."
                         ),
-                        "details": old_entry.to_dict(),
+                        "details": {
+                            **old_entry.to_dict(),
+                            "rollback_failed": True,
+                            "old_version_exists": old_exists,
+                        },
                     },
                     old_entry.to_dict(),
                 )
@@ -487,39 +513,15 @@ class UploadManager:
                     self._record_success(job, started)
                 return True
 
-            if job.operation == "upsert" and old_entry is not None:
-                job.set_state(JobState.REPLACING)
-                old_deleted = self._delete_old(old_entry)
-                entry = self._pool.commit_replace(
-                    reservation, old_entry, latest, old_deleted=old_deleted
+            self._complete_upload(job, reservation, old_entry, latest, client, started)
+            if job.state is not JobState.FAILED:
+                log_event(
+                    "upload.recovered",
+                    job_id=job.id,
+                    file_name=job.file_name,
+                    account=job.account_name,
+                    size=latest.size,
                 )
-                if old_deleted:
-                    job.replaced = old_entry.to_dict()
-                    job.complete(entry.to_dict())
-                else:
-                    job.partial(
-                        entry.to_dict(),
-                        {
-                            "code": "old_version_retained",
-                            "message": (
-                                "The new version was stored, but the previous version could "
-                                "not be deleted. Remove it manually before restarting."
-                            ),
-                            "details": old_entry.to_dict(),
-                        },
-                        old_entry.to_dict(),
-                    )
-            else:
-                entry = self._pool.commit_upload(reservation, latest)
-                job.complete(entry.to_dict())
-            log_event(
-                "upload.recovered",
-                job_id=job.id,
-                file_name=job.file_name,
-                account=job.account_name,
-                size=latest.size,
-            )
-            self._record_success(job, started)
             return True
         except (PoolError, StorageError):
             return False
@@ -585,6 +587,71 @@ class UploadManager:
             file_name=entry.file_name,
             account=account_name,
             file_id=entry.file_id,
+            error=str(last_error),
+        )
+        return False
+
+    def _old_version_exists(self, entry: FileEntry) -> bool | None:
+        """Return whether ``entry`` is still stored, or ``None`` if unknown.
+
+        A delete timeout can mean B2 removed the version but the response was
+        lost. Before rolling the new version back, make sure the old one is
+        actually still there; otherwise the rollback would delete the only
+        surviving copy.
+        """
+        account_name = entry.accounts[0]
+        client = self._pool.get(account_name)
+        if client is None:
+            return None
+        try:
+            versions = client.list_versions()
+        except StorageError as exc:
+            log_event(
+                "upload.old_version_state_unknown",
+                level=40,
+                file_name=entry.file_name,
+                account=account_name,
+                file_id=entry.file_id,
+                error=str(exc),
+            )
+            return None
+        return any(version.file_id == entry.file_id for version in versions)
+
+    def _rollback_new_version(self, job: UploadJob, client: Any, version: Any) -> bool:
+        """Delete a newly stored version after its predecessor could not be removed.
+
+        Upserts upload first so a crash cannot lose the previous copy. Once the
+        old-version delete fails, that new copy is the duplicate we must remove
+        before leaving the job failed. This is best-effort: if B2 refuses the
+        rollback too, the job becomes ``partial`` and startup/reconcile is
+        required.
+        """
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                client.delete_version(version.file_id, version.file_name)
+                log_event(
+                    "upload.replacement_rolled_back",
+                    job_id=job.id,
+                    file_name=job.file_name,
+                    account=job.account_name,
+                    file_id=version.file_id,
+                )
+                return True
+            except StorageError as exc:
+                last_error = exc
+                if exc.code == "b2_not_found":
+                    return True
+                if not exc.retryable:
+                    break
+                time.sleep(0.5 * (2**attempt))
+        log_event(
+            "upload.replacement_rollback_failed",
+            level=40,
+            job_id=job.id,
+            file_name=job.file_name,
+            account=job.account_name,
+            file_id=version.file_id,
             error=str(last_error),
         )
         return False

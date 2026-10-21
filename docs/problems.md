@@ -83,12 +83,16 @@ mixed rejections fall back to `400 bad_request`.
 | `job_not_found` | 404 | The job id is unknown, pruned, or was dismissed. |
 | `job_active` | 409 | A running job cannot be cancelled, or the job is already terminal. Dismiss terminal jobs instead. |
 
-A job can itself finish in the `partial` state. That is not an HTTP problem:
-the new bytes were stored, but the previous version could not be deleted. See
-`GET /api/jobs/{id}`; the job carries `error.code = "old_version_retained"`
-and the pool keeps the old bytes accounted for. Run `b2router-reconcile
---apply` with the gateway stopped before restarting, or the startup duplicate
-check will refuse to build the cache.
+An upsert whose old-version delete fails normally rolls the new version back
+and finishes with `failed` plus `error.code = "old_version_retained"`; the
+original file is unchanged. A job finishes in the `partial` state only if the
+old version cannot be confirmed removed and the rollback also fails. That is not
+an HTTP problem: both versions may remain stored, and the pool keeps both sets
+of bytes accounted for.
+See `GET /api/jobs/{id}` for `error.details.rollback_failed`. Run
+`b2router-reconcile --apply` with the gateway stopped before restarting: startup
+lists all visible versions and refuses to build the cache when a file name has
+more than one upload version in the same account.
 
 ### Storage backend problems
 

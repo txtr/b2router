@@ -287,10 +287,34 @@ class AccountPool:
                 )
             try:
                 versions: list[FileVersion] = client.list_files()
+                all_versions: list[FileVersion] = client.list_versions()
             except StorageError as exc:
                 raise PoolError(
                     "account_init_failed", f"Could not initialize {client.name!r}: {exc.message}"
                 ) from exc
+
+            visible_names = {version.file_name for version in versions}
+            versions_by_name: dict[str, list[FileVersion]] = {}
+            for version in all_versions:
+                # A latest-only listing is enough to decide whether a file is
+                # visible, but not whether B2 still stores older versions of
+                # it. Only check visible names so a hide marker cannot
+                # resurrect an otherwise hidden object.
+                if version.file_name in visible_names:
+                    versions_by_name.setdefault(version.file_name, []).append(version)
+            for file_name, file_versions in versions_by_name.items():
+                if len(file_versions) > 1:
+                    raise PoolError(
+                        "duplicate_filename",
+                        (
+                            f"File {file_name!r} has {len(file_versions)} upload versions "
+                            f"in account {client.name!r}. Run b2router-reconcile --apply "
+                            "with the gateway stopped before starting the router."
+                        ),
+                        file_name=file_name,
+                        account=client.name,
+                        version_count=len(file_versions),
+                    )
 
             staged: dict[str, FileEntry] = {}
             for version in versions:
@@ -703,11 +727,11 @@ class AccountPool:
     ) -> FileEntry:
         """Commit a replacement, optionally accounting for the old copy.
 
-        When ``old_deleted`` is false the old version could not be removed from
-        B2; its bytes and slot stay counted against the old account (they are
-        still stored) while the cache points at the newest version. The job is
-        marked partial and the next startup will refuse the duplicate until it
-        is reconciled.
+        When ``old_deleted`` is false the old version could not be removed and
+        the router could not roll the new version back either; both copies are
+        still stored, so both bytes and slots stay counted while the cache
+        points at the newest version. The job is marked partial and the next
+        startup will refuse the duplicate until it is reconciled.
         """
         with self._lock:
             self._require_reservation(reservation)

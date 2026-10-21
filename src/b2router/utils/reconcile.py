@@ -1,10 +1,13 @@
 """Find and optionally remove duplicate/orphaned B2 versions.
 
 The gateway's startup cache is built from the latest version of every file.
-An upsert whose old-version delete failed leaves the new version in place and
-the old bytes behind. Within one account that is invisible to a latest-only
-listing; across accounts startup refuses to run. This tool reports both cases
-and can reconcile them: keep the newest upload for each name, delete the rest.
+An upsert normally rolls back the new version if the old-version delete fails,
+but a double failure or an unclean shutdown can still leave two versions of the
+same name in one account. A latest-only listing cannot see the older copy.
+Startup now lists all visible versions and refuses to run for such an account;
+across accounts it refuses duplicate names as well. This tool reports both
+cases and can reconcile them: keep the newest upload for each name, delete the
+rest.
 
 Always stop the gateway before using ``--apply``. The script takes the same
 single-writer lock as the server so it cannot race a live instance.

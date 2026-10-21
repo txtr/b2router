@@ -167,13 +167,18 @@ curl -sS http://127.0.0.1:8000/api/jobs/job_…
 
 Terminal states are `complete`, `partial`, `failed`, and `cancelled`. The
 result carries the winning `account_name`, `file_id`, and the new cache entry.
-`partial` means the new copy is live but the old version could not be deleted;
-see [Reconciliation](#reconciliation).
+For upserts, `complete` means the old version was removed. If the old version
+cannot be deleted, the router rolls the new version back and reports `failed`,
+so the same file name does not remain duplicated. `partial` is reserved for the
+rare case where the router cannot confirm the old version was removed and the
+rollback also fails; see [Reconciliation](#reconciliation).
 
 ### Upsert
 
 `PUT` routes the new bytes normally (best fit), uploads, then deletes the older
-version of the same name. It creates the file if it did not exist:
+version of the same name. It creates the file if it did not exist. If the old
+version cannot be deleted, the newly uploaded version is deleted again and the
+job fails, leaving the original file unchanged:
 
 ```bash
 curl -sS -X PUT http://127.0.0.1:8000/api/files/report.pdf \
@@ -249,10 +254,15 @@ Stop the gateway and run the reconciler with `--apply` to keep the newest copy.
 
 ### Reconciliation
 
-Same-account upserts can also leave an older version behind when B2 refuses the
-delete. A latest-only listing cannot see it, but the bytes still consume the
-account. `b2router-reconcile` lists *all* upload versions, reports groups with
-more than one copy, and can delete everything except the newest:
+A single account should contain at most one visible upload version of a given
+file name. The router rolls back a new upsert version when the old-version
+delete fails. If both deletes fail, or the process dies between the upload and
+the old-version delete, B2 can still contain two versions. A latest-only
+listing cannot see the older copy, but its bytes still consume the account.
+Startup lists all visible versions and refuses to build the cache for that
+account if a name has more than one upload version, so run the reconciler.
+`b2router-reconcile` lists *all* upload versions, reports groups with more than
+one copy, and can delete everything except the newest:
 
 ```bash
 B2ROUTER_ACCOUNTS=/etc/b2router/accounts.yaml b2router-reconcile --pretty

@@ -55,6 +55,22 @@ def test_duplicate_file_across_accounts_fails_startup() -> None:
     assert "same.txt" in str(excinfo.value)
 
 
+def test_duplicate_file_in_same_account_fails_startup() -> None:
+    fake = FakeStorage("a")
+    fake.seed("same.txt", b"old")
+    fake.seed("same.txt", b"new")
+    pool = AccountPool()
+
+    with pytest.raises(PoolStartupError) as excinfo:
+        pool.load_accounts([(fake, None)])
+
+    message = str(excinfo.value)
+    assert "same.txt" in message
+    assert "2 upload versions" in message
+    assert "b2router-reconcile --apply" in message
+    assert pool.names() == []
+
+
 def test_routing_prefers_best_fit() -> None:
     tight = FakeStorage("tight")
     tight.seed("big.bin", b"x" * 900)

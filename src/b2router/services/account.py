@@ -80,6 +80,8 @@ class StorageBackend(Protocol):
 
     def list_files(self) -> list[FileVersion]: ...
 
+    def list_versions(self) -> list[FileVersion]: ...
+
     def upload_local_file(
         self,
         local_path: str,

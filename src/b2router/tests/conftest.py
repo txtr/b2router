@@ -39,6 +39,7 @@ class FakeStorage:
     delete_failures_remaining: int = 0
     upload_delay: float = 0.0
     files: dict[str, FileVersion] = field(default_factory=dict)
+    all_versions: list[FileVersion] = field(default_factory=list)
     data: dict[str, bytes] = field(default_factory=dict)
     deleted: list[str] = field(default_factory=list)
     uploads: list[str] = field(default_factory=list)
@@ -50,6 +51,9 @@ class FakeStorage:
 
     def list_files(self) -> list[FileVersion]:
         return list(self.files.values())
+
+    def list_versions(self) -> list[FileVersion]:
+        return list(self.all_versions)
 
     def upload_local_file(
         self,
@@ -73,6 +77,7 @@ class FakeStorage:
             action="upload",
         )
         self.files[file_name] = version
+        self.all_versions.append(version)
         self.data[file_id] = data
         self.uploads.append(file_id)
         if progress_listener is not None:
@@ -93,8 +98,19 @@ class FakeStorage:
             raise StorageError("b2_not_found", "Missing in fake.")
         del self.data[file_id]
         self.deleted.append(file_id)
+        self.all_versions = [
+            version for version in self.all_versions if version.file_id != file_id
+        ]
         if file_name in self.files and self.files[file_name].file_id == file_id:
-            del self.files[file_name]
+            remaining = [
+                version for version in self.all_versions if version.file_name == file_name
+            ]
+            if remaining:
+                # B2 reveals the newest surviving version after deleting the
+                # latest one, so the fake must not drop the name entirely.
+                self.files[file_name] = remaining[-1]
+            else:
+                del self.files[file_name]
 
     def get_file_info(self, file_name: str) -> FileVersion:
         if file_name not in self.files:
@@ -121,6 +137,7 @@ class FakeStorage:
             action="upload",
         )
         self.files[file_name] = version
+        self.all_versions.append(version)
         self.data[file_id] = data
         return version
 
