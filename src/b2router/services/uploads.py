@@ -370,76 +370,118 @@ class UploadManager:
             return
         metrics.refresh_jobs(self)
         old_entry = self._pool.get_file(job.file_name)
+        max_rate_limit_retries = len(self._pool._states)  # Try each account at most once
         try:
-            decision, reservation = self._pool.reserve(job.file_name, job.file_size)
-            job.account_name = decision.account_name
-            client = self._pool.require(decision.account_name)
-            listener = _ProgressListener(job)
-            remote_version = client.upload_local_file(
-                job.temp_path,
-                job.file_name,
-                job.content_type,
-                listener,
-                file_info={JOB_MARKER_KEY: job.id},
-            )
-            if remote_version.size != job.file_size:
-                committed = self._partial_size_mismatch(
-                    job,
-                    old_entry,
-                    remote_version,
-                    client,
-                    started,
-                )
-            else:
-                committed = self._complete_upsert(
-                    job, reservation, old_entry, remote_version, client, started
-                )
-        except (PoolError, StorageError) as exc:
-            if (
-                not committed
-                and isinstance(exc, StorageError)
-                and exc.retryable
-                and client is not None
-                and reservation is not None
-            ):
-                committed = self._recover_after_transport_error(
-                    job, reservation, old_entry, client, started
-                )
-            if not committed and remote_version is not None:
-                committed = self._partial_commit_failure(
-                    job,
-                    old_entry,
-                    remote_version,
-                    exc,
-                    started,
-                )
-            if not committed:
-                self._fail(
-                    job,
-                    getattr(exc, "code", "upload_failed"),
-                    str(exc),
-                    started,
-                    **getattr(exc, "details", {}),
-                )
-        except BaseException as exc:  # noqa: BLE001 - worker must never die silently
-            log_event(
-                "upload.crashed",
-                level=40,
-                job_id=job.id,
-                file_name=job.file_name,
-                error=type(exc).__name__,
-            )
-            if not committed:
-                if remote_version is not None:
-                    committed = self._partial_commit_failure(
-                        job,
-                        old_entry,
-                        remote_version,
-                        exc,
-                        started,
+            for attempt in range(max_rate_limit_retries):
+                try:
+                    if reservation is not None:
+                        self._pool.release(reservation.id)
+                        reservation = None
+                    decision, reservation = self._pool.reserve(job.file_name, job.file_size)
+                    job.account_name = decision.account_name
+                    client = self._pool.require(decision.account_name)
+                    listener = _ProgressListener(job)
+                    remote_version = client.upload_local_file(
+                        job.temp_path,
+                        job.file_name,
+                        job.content_type,
+                        listener,
+                        file_info={JOB_MARKER_KEY: job.id},
                     )
-                else:
-                    self._fail(job, "upload_failed", "The upload failed unexpectedly.", started)
+                    if remote_version.size != job.file_size:
+                        committed = self._partial_size_mismatch(
+                            job,
+                            old_entry,
+                            remote_version,
+                            client,
+                            started,
+                        )
+                    else:
+                        committed = self._complete_upsert(
+                            job, reservation, old_entry, remote_version, client, started
+                        )
+                    break  # Success - exit retry loop
+                except StorageError as exc:
+                    if exc.code == "b2_rate_limited" and attempt < max_rate_limit_retries - 1:
+                        # Rate limited on this account - mark it and retry on another
+                        if reservation is not None:
+                            self._pool.mark_rate_limited(reservation.account_name)
+                            log_event(
+                                "upload.rate_limited_retry",
+                                job_id=job.id,
+                                file_name=job.file_name,
+                                account=reservation.account_name,
+                                attempt=attempt + 1,
+                            )
+                        continue  # Loop will retry with a new reservation
+                    # Not rate limited, or out of retries - handle as normal error
+                    if (
+                        not committed
+                        and exc.retryable
+                        and client is not None
+                        and reservation is not None
+                    ):
+                        committed = self._recover_after_transport_error(
+                            job, reservation, old_entry, client, started
+                        )
+                    if not committed and remote_version is not None:
+                        committed = self._partial_commit_failure(
+                            job,
+                            old_entry,
+                            remote_version,
+                            exc,
+                            started,
+                        )
+                    if not committed:
+                        self._fail(
+                            job,
+                            exc.code,
+                            str(exc),
+                            started,
+                            **getattr(exc, "details", {}),
+                        )
+                    break
+                except PoolError as exc:
+                    # Pool errors (no space, etc.) are not retryable on another account
+                    if not committed and remote_version is not None:
+                        committed = self._partial_commit_failure(
+                            job,
+                            old_entry,
+                            remote_version,
+                            exc,
+                            started,
+                        )
+                    if not committed:
+                        self._fail(
+                            job,
+                            exc.code,
+                            str(exc),
+                            started,
+                            **exc.details,
+                        )
+                    break
+                except BaseException as exc:  # noqa: BLE001 - worker must never die silently
+                    log_event(
+                        "upload.crashed",
+                        level=40,
+                        job_id=job.id,
+                        file_name=job.file_name,
+                        error=type(exc).__name__,
+                    )
+                    if not committed:
+                        if remote_version is not None:
+                            committed = self._partial_commit_failure(
+                                job,
+                                old_entry,
+                                remote_version,
+                                exc,
+                                started,
+                            )
+                        else:
+                            self._fail(
+                                job, "upload_failed", "The upload failed unexpectedly.", started
+                            )
+                    break
         finally:
             if reservation is not None:
                 self._pool.release(reservation.id)

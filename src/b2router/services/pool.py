@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import threading
+import time
 import uuid
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
@@ -118,6 +119,7 @@ class AccountState:
     used_bytes: int = 0
     file_count: int = 0
     max_files: int = 1700
+    rate_limited_until: float = 0.0
 
     @property
     def remaining_bytes(self) -> int | None:
@@ -135,12 +137,19 @@ class AccountState:
             return 0.0
         return self.used_bytes / self.capacity_bytes
 
+    @property
+    def is_rate_limited(self) -> bool:
+        return time.monotonic() < self.rate_limited_until
+
     def with_file(self, file_size: int, file_slots: int = 1) -> AccountState:
         return replace(
             self,
             used_bytes=self.used_bytes + file_size,
             file_count=self.file_count + file_slots,
         )
+
+    def rate_limited(self, until: float) -> AccountState:
+        return replace(self, rate_limited_until=until)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -153,6 +162,7 @@ class AccountState:
             "max_files": self.max_files,
             "remaining_files": self.remaining_files,
             "utilization": round(self.utilization, 6),
+            "rate_limited_until": self.rate_limited_until,
         }
 
 
@@ -502,6 +512,8 @@ class AccountPool:
                     # the old version has been deleted.
                     continue
                 state = states[name]
+                if state.is_rate_limited:
+                    continue
                 remaining = state.remaining_bytes
                 free_slots = (
                     state.remaining_files - reserved_files.get(name, 0) - batch_files.get(name, 0)
@@ -696,6 +708,14 @@ class AccountPool:
     def release(self, reservation_id: str) -> None:
         with self._lock:
             if self._reservations.pop(reservation_id, None) is not None:
+                self._revision += 1
+
+    def mark_rate_limited(self, account_name: str, duration: float = 60.0) -> None:
+        """Mark an account as rate limited for the given duration (seconds)."""
+        with self._lock:
+            state = self._states.get(account_name)
+            if state is not None:
+                self._states[account_name] = state.rate_limited(time.monotonic() + duration)
                 self._revision += 1
 
     def reservations(self) -> list[Reservation]:
