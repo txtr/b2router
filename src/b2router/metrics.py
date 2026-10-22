@@ -50,10 +50,14 @@ B2_LATENCY = Histogram(
 )
 B2_ERRORS = Counter("b2router_b2_errors", "B2 API errors", ["operation", "code"])
 
+_KNOWN_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})
+
 
 def record_request(method: str, route: str, status: int, seconds: float) -> None:
-    REQUESTS.labels(method=method, route=route, status=str(status)).inc()
-    REQUEST_LATENCY.labels(method=method, route=route).observe(max(seconds, 0.0))
+    # Never let an arbitrary method token create unbounded label values.
+    safe_method = method if method in _KNOWN_METHODS else "OTHER"
+    REQUESTS.labels(method=safe_method, route=route, status=str(status)).inc()
+    REQUEST_LATENCY.labels(method=safe_method, route=route).observe(max(seconds, 0.0))
 
 
 def record_b2(operation: str, seconds: float) -> None:

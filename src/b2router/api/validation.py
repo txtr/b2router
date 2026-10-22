@@ -21,6 +21,7 @@ from werkzeug.datastructures import FileStorage
 from b2router.errors import Problem, bad_request, validation_problem
 
 CONTROL_CHARS = {chr(code) for code in range(32)} | {"\x7f"}
+MIN_SPOOL_FREE_BYTES = 1024 * 1024
 
 
 def json_body(request: Request) -> dict[str, Any]:
@@ -219,14 +220,28 @@ def spool_upload(
     temp_dir: str,
 ) -> SpooledUpload:
     """Stream a multipart part to a private temp file, enforcing the size cap."""
-    os.makedirs(temp_dir, exist_ok=True)
-    free = shutil.disk_usage(temp_dir).free
-    if free < settings_max_bytes:
+    try:
+        os.makedirs(temp_dir, mode=0o700, exist_ok=True)
+        with contextlib.suppress(OSError):
+            os.chmod(temp_dir, 0o700)
+        free = shutil.disk_usage(temp_dir).free
+    except OSError as exc:
+        raise Problem(
+            "service_unavailable",
+            "The upload staging area is unavailable.",
+        ) from exc
+    if free < MIN_SPOOL_FREE_BYTES:
         raise Problem(
             "service_unavailable",
             "The upload staging area is low on disk space.",
         )
-    descriptor, path = tempfile.mkstemp(prefix="b2router-up-", dir=temp_dir)
+    try:
+        descriptor, path = tempfile.mkstemp(prefix="b2router-up-", dir=temp_dir)
+    except OSError as exc:
+        raise Problem(
+            "service_unavailable",
+            "The upload could not be staged; check the staging area permissions and free space.",
+        ) from exc
     size = 0
     try:
         with os.fdopen(descriptor, "wb") as handle:
@@ -243,6 +258,13 @@ def spool_upload(
                 handle.write(chunk)
             handle.flush()
             os.fsync(handle.fileno())
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        raise Problem(
+            "service_unavailable",
+            "The upload could not be staged; the staging area may be full.",
+        ) from exc
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(path)

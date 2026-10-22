@@ -4,7 +4,12 @@
 .venv
 venv
 __pycache__
+**/__pycache__
+src/b2router/tests
 *.py[cod]
+build
+dist
+*.egg-info
 .pytest_cache
 .mypy_cache
 .ruff_cache

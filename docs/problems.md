@@ -70,11 +70,11 @@ mixed rejections fall back to `400 bad_request`.
 | `duplicate_filename` | 409 | `POST /api/files` cannot create an existing name. | Use `PUT /api/files/{name}` to replace it. |
 | `duplicate_in_request` | 409 | The same name appears twice in one upload or routing request. | De-duplicate the request. |
 | `job_active` | 409 | Another upload, upsert, delete, or cancel is using that name. | Poll the active job or retry after it finishes. |
-| `file_changed` | 409 | The file's `file_id` changed between read and write. | Refresh, then retry with the new `If-Match`. |
+| `file_changed` | 409 | The file's opaque `etag` changed between read and write. | Refresh, then retry with the new `If-Match`/`etag`. |
 | `state_changed` | 409 | A pool invariant changed while the operation was in flight. | Retry; the request is safe to repeat. |
 | `no_account_can_fit` | 409 | No account has enough bytes, file slots, or the right capacity. | Free space, raise capacity, or use a smaller file. |
-| `precondition_failed` | 412 | `If-Match` or another precondition did not match. | Re-read the resource and retry. |
-| `queue_full` | 429 | The bounded upload queue is saturated. | Retry later; inspect `/api/jobs?state=queued`. |
+| `precondition_failed` | 412 | `If-Match` (the opaque file `etag`) or another precondition did not match. | Re-read the resource and retry with its current `etag`. |
+| `queue_full` | 429 | The bounded upload queue is saturated; checked before parsing/spooling the multipart body. | Retry later; inspect `/api/jobs?state=queued`. |
 
 ### Job problems
 
@@ -85,20 +85,31 @@ mixed rejections fall back to `400 bad_request`.
 
 An upsert whose old-version delete fails normally rolls the new version back
 and finishes with `failed` plus `error.code = "old_version_retained"`; the
-original file is unchanged. A job finishes in the `partial` state only if the
-old version cannot be confirmed removed and the rollback also fails. That is not
-an HTTP problem: both versions may remain stored, and the pool keeps both sets
-of bytes accounted for.
-See `GET /api/jobs/{id}` for `error.details.rollback_failed`. Run
-`b2router-reconcile --apply` with the gateway stopped before restarting: startup
-lists all visible versions and refuses to build the cache when a file name has
-more than one upload version in the same account.
+original file is unchanged. A job finishes in the `partial` state when the
+router cannot prove the final B2 state:
+
+* `error.code = "upload_outcome_unknown"` means an upload timed out after B2 may
+  have accepted the bytes. Uploads carry a `b2router_job_id` marker in B2
+  `fileInfo`; recovery commits only an exact marker and size match after bounded
+  retries. If no match is visible, the job stays `partial` rather than guessing.
+* `error.code = "old_version_retained"` with rollback details means the old
+  version could not be confirmed removed and rollback also failed. Both versions
+  may remain stored, and the pool keeps both sets of bytes accounted for.
+
+These are job states, not HTTP problems: inspect `GET /api/jobs/{id}` and
+`error.details`. Run `b2router-reconcile --apply` with the gateway stopped
+before retrying or restarting. Startup lists all visible versions and refuses
+to build the cache when a file name has more than one upload version in the
+same account.
 
 ### Storage backend problems
 
 These are translated from `b2sdk` and never expose credentials or raw B2
-payloads. They are retried where safe; a `b2_timeout`/`b2_unavailable` during
-upload is reconciled by asking B2 whether the object landed.
+payloads. They are retried where safe. After a retryable `b2_timeout` or
+`b2_unavailable` during upload, recovery asks B2 for the current version and
+accepts it only when its `fileInfo` carries the exact `b2router_job_id` marker
+for that job and the size matches. Unresolved outcomes become a `partial` job
+with `upload_outcome_unknown`; they are never reported as successful.
 
 | `code` | Status | Meaning |
 | --- | --- | --- |
@@ -114,7 +125,7 @@ upload is reconciled by asking B2 whether the object landed.
 | `code` | Status | Meaning |
 | --- | --- | --- |
 | `not_ready` | 503 | Startup is incomplete; `/ready` is failing. |
-| `service_unavailable` | 503 | The process is shutting down or a dependency is unavailable. |
+| `service_unavailable` | 503 | The process is shutting down, a dependency is unavailable, or the upload staging area is low on space/cannot be written. |
 
 ## Idempotency and retries
 
@@ -122,7 +133,8 @@ upload is reconciled by asking B2 whether the object landed.
   returns `duplicate_filename`; retrying a `202` means polling its job instead.
 * `PUT /api/files/{name}` is idempotent for the same bytes. If the response is
   lost, retry the PUT; the final object is the same and older versions are
-  removed.
+  removed. If using `If-Match`, re-read the file first because the successful
+  replacement changed its opaque `etag`.
 * `DELETE /api/files/{name}` is idempotent from the client's point of view:
   deleting a missing name returns `file_not_found`, which can be treated as
   already deleted.

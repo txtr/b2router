@@ -62,7 +62,7 @@ at startup.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `B2ROUTER_HOST` | `127.0.0.1` | Bind address. Use `0.0.0.0` in a container. |
+| `B2ROUTER_HOST` | `127.0.0.1` | Bind address. Containers usually set `0.0.0.0`; keep the published port on loopback unless `B2ROUTER_API_TOKEN` is set. |
 | `B2ROUTER_PORT` | `8000` | Bind port. |
 | `B2ROUTER_ACCOUNTS` | `accounts.yaml` | Config path. |
 | `B2_CONNECT_TIMEOUT` | `30` | B2 connection timeout (seconds). |
@@ -169,9 +169,13 @@ Terminal states are `complete`, `partial`, `failed`, and `cancelled`. The
 result carries the winning `account_name`, `file_id`, and the new cache entry.
 For upserts, `complete` means the old version was removed. If the old version
 cannot be deleted, the router rolls the new version back and reports `failed`,
-so the same file name does not remain duplicated. `partial` is reserved for the
-rare case where the router cannot confirm the old version was removed and the
-rollback also fails; see [Reconciliation](#reconciliation).
+so the same file name does not remain duplicated. `partial` means the router
+could not prove the final B2 state: either the old version could not be
+confirmed removed and rollback also failed, or an upload timed out after B2 may
+have accepted it. The latter reports `error.code = "upload_outcome_unknown"`.
+Uploads carry a `b2router_job_id` marker in B2 `fileInfo`; recovery only commits
+an exact marker and size match. After bounded retries without a match, the job
+stays `partial` rather than guessing. See [Reconciliation](#reconciliation).
 
 ### Upsert
 
@@ -182,14 +186,16 @@ job fails, leaving the original file unchanged:
 
 ```bash
 curl -sS -X PUT http://127.0.0.1:8000/api/files/report.pdf \
-  -H 'If-Match: "previous-file-id"' \
+  -H 'If-Match: "previous-etag"' \
   -F 'file=@report-v2.pdf;type=application/pdf'
 ```
 
 `If-Match` is optional but strongly recommended when a UI or script read the
-old `file_id`. A mismatch is `412 precondition_failed` before any upload is
-spooled. `If-Match: *` requires the file to exist (use it to avoid accidental
-creates).
+old metadata. Use the opaque `etag` from the detail response (or the `ETag`
+response header); it is not the B2 `file_id`. A mismatch is `412
+precondition_failed` before any upload is spooled, and the worker rechecks the
+same ETag before replacing. `If-Match: *` requires the file to exist (use it to
+avoid accidental creates).
 
 ### Download and ranges
 
@@ -198,10 +204,13 @@ curl -sS -D - http://127.0.0.1:8000/api/download/report.pdf \
   -H 'Range: bytes=0-1023'
 ```
 
-`200` includes `ETag: "<file_id>"` and `Accept-Ranges: bytes`; `206` includes
+`200` includes `ETag: "<opaque-etag>"` and `Accept-Ranges: bytes`; `206` includes
 `Content-Range`; `304` is returned for a matching `If-None-Match`; `416` is a
-problem document. Downloads stream from B2 in 64 KiB chunks and never buffer
-the whole object.
+problem document. File detail and content return the same opaque ETag, and
+delete/upsert `If-Match` preconditions accept it, so clients never need to mix
+`file_id` and metadata generations. Downloads stream from B2 in 64 KiB chunks
+and never buffer the whole object; if B2 fails mid-stream the connection is
+aborted rather than returning a silently truncated `200`.
 
 ### Routing plans
 
@@ -228,8 +237,8 @@ with a stable account-name tiebreak; it accounts for in-flight reservations.
 | `POST` a name that exists | `409 duplicate_filename` |
 | Any upload/upsert/delete while a job or delete owns that name | `409 job_active` |
 | `DELETE` a missing name | `404 file_not_found` |
-| `If-Match` differs from the cached `file_id` | `412 precondition_failed` |
-| Queue is full | `429 queue_full` with `Retry-After` |
+| `If-Match` differs from the current file `etag` | `412 precondition_failed` |
+| Queue is full | `429 queue_full` with `Retry-After`, checked before the multipart body is parsed/spooled |
 | Same name twice in one batch | Per-file `409 duplicate_in_request`; `202` if another part was accepted, otherwise the batch problem |
 
 B2 is never mutated until a name is exclusively claimed. The claim is released
@@ -270,8 +279,10 @@ B2ROUTER_ACCOUNTS=/etc/b2router/accounts.yaml b2router-reconcile --apply --prett
 ```
 
 It takes the same `flock` as the server, so `--apply` refuses to run while the
-gateway is live. Run it only with the gateway stopped. Without `--apply` it is
-read-only.
+gateway is live. The `b2router-create-file` and `b2router-delete-file`
+maintenance commands also take the writer lock and exit with status `3` when
+the server is running. Run mutating tools only with the gateway stopped. Without `--apply`
+the reconciler is read-only.
 
 ## Security
 
@@ -289,7 +300,9 @@ read-only.
   default in containers for correlation.
 - Upload filenames are normalised, length-checked, and rejected if they contain
   NULs, backslashes, `.`/`..` segments, control characters, or a leading `/`.
-  The spool directory is mode `0700`, and every spool file is `0600`.
+  The spool directory is mode `0700`, and every spool file is `0600`. Spooling
+  refuses to start with less than 1 MiB free and converts disk write failures
+  into `503 service_unavailable` instead of leaking a server error.
 - Content-Disposition uses RFC 5987 encoding, never reflecting a raw header.
 - Errors never include B2 response bodies, keys, or stack traces. `5xx`
   responses include a `request_id` and a generic detail.
@@ -330,3 +343,6 @@ docker compose up --build
 The image runs as a non-root user, exposes `8000`, installs the package with its
 templates/static assets, and keeps spool/lock state in the `b2router-data`
 volume. Mount `accounts.yaml` read-only at `/config/accounts.yaml`.
+Compose publishes `127.0.0.1:8000:8000` by default. Exposing the port on a
+remote interface requires an explicit `B2ROUTER_API_TOKEN` and a deliberate
+port/network change; without the token the console and API are unauthenticated.

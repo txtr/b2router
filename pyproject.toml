@@ -27,6 +27,7 @@ b2router-reconcile = "b2router.utils.reconcile:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+exclude = ["b2router.tests", "b2router.tests.*"]
 
 [tool.setuptools.package-data]
 b2router = ["templates/**/*.html", "static/**/*"]

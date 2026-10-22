@@ -8,6 +8,7 @@ import os
 import sys
 
 from b2router.core.config_reader import AccountSpec, ConfigReader
+from b2router.lockfile import InstanceLock, LockError
 from b2router.services.account import AccountClient, AccountCredentials, StorageError
 from b2router.services.pool import Err
 from b2router.settings import Settings
@@ -51,6 +52,15 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     settings = Settings.from_env()
+    lock = InstanceLock(settings.lock_file)
+    try:
+        lock.acquire()
+    except (LockError, OSError) as exc:
+        print(
+            json.dumps({"error": f"Cannot mutate while the gateway is running: {exc}"}),
+            file=sys.stderr,
+        )
+        return 3
     client = AccountClient(
         AccountCredentials(
             name=spec.name,
@@ -78,6 +88,8 @@ def main(argv: list[str] | None = None) -> int:
     except StorageError as exc:
         print(json.dumps({"error": exc.message, "code": exc.code}), file=sys.stderr)
         return 1
+    finally:
+        lock.release()
 
 
 if __name__ == "__main__":
