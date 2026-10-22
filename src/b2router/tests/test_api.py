@@ -53,6 +53,30 @@ def test_ready_reports_draining(client, manager) -> None:
     assert payload["checks"]["accepting_mutations"] is False
 
 
+def test_ready_does_not_depend_on_metrics(
+    pool, manager, settings, tmp_path
+) -> None:
+    no_metrics = replace(
+        settings,
+        temp_dir=str(tmp_path / "no-metrics"),
+        metrics_enabled=False,
+    )
+    app = create_app(
+        no_metrics,
+        pool=pool,
+        manager=manager,
+        audit=AuditLog(),
+        configure_logs=False,
+    )
+    app.testing = True
+    client = app.test_client()
+
+    response = client.get("/ready")
+
+    assert response.status_code == 200
+    assert "metrics_enabled" not in response.get_json()["checks"]
+
+
 def test_metrics_endpoint(client) -> None:
     response = client.get("/metrics")
     assert response.status_code == 200
@@ -300,6 +324,25 @@ def test_bearer_token_auth(pool, manager, settings, tmp_path) -> None:
     assert unauthorized.status_code == 401
     assert unauthorized.headers["WWW-Authenticate"] == 'Bearer realm="b2router"'
     assert client.get("/api/files", headers={"Authorization": "Bearer secret"}).status_code == 200
+
+
+def test_failed_bearer_auth_consumes_mutation_limit(pool, manager, settings, tmp_path) -> None:
+    secured = replace(
+        settings,
+        temp_dir=str(tmp_path / "auth-limited"),
+        api_token="secret",
+        mutation_rate_per_minute=1,
+    )
+    app = create_app(secured, pool=pool, manager=manager, audit=AuditLog(), configure_logs=False)
+    app.testing = True
+    client = app.test_client()
+    headers = {"Authorization": "Bearer wrong"}
+
+    first = client.post("/api/routing-plans", json={"files": []}, headers=headers)
+    assert first.status_code == 401
+    second = client.post("/api/routing-plans", json={"files": []}, headers=headers)
+    assert second.status_code == 429
+    assert second.get_json()["code"] == "too_many_requests"
 
 
 def test_rate_limit_mutations(pool, manager, settings, tmp_path) -> None:

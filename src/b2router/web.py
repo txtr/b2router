@@ -147,17 +147,6 @@ def create_app(
             response.headers["Access-Control-Allow-Origin"] = origin
             return response
 
-        protected = request.path.startswith("/api/") or request.path == "/metrics"
-        if settings.api_token and protected and request.method != "OPTIONS":
-            supplied = request.headers.get("Authorization", "")
-            expected = f"Bearer {settings.api_token}"
-            if not hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8")):
-                raise Problem(
-                    "unauthorized",
-                    "A valid bearer token is required.",
-                    headers={"WWW-Authenticate": 'Bearer realm="b2router"'},
-                )
-
         mutating_api = request.method in {"POST", "PUT", "PATCH", "DELETE"} and (
             request.path.startswith("/api/")
         )
@@ -167,8 +156,9 @@ def create_app(
             and not request.path.startswith("/ui/login")
         )
         if mutating_api or mutating_ui:
-            # Rate limit by network identity, never by the self-declared
-            # X-Client-Name header (which would be trivial to rotate).
+            # Limit before authentication so failed bearer guesses cannot
+            # bypass the mutation budget. Key by network identity, never by the
+            # self-declared X-Client-Name header.
             allowed, retry_after = limiter.allow(_client_address(settings))
             if not allowed:
                 raise Problem(
@@ -176,6 +166,17 @@ def create_app(
                     "Too many mutations; slow down and retry.",
                     headers={"Retry-After": str(max(1, math.ceil(retry_after)))},
                     extensions={"retry_after_seconds": round(retry_after, 3)},
+                )
+
+        protected = request.path.startswith("/api/") or request.path == "/metrics"
+        if settings.api_token and protected and request.method != "OPTIONS":
+            supplied = request.headers.get("Authorization", "")
+            expected = f"Bearer {settings.api_token}"
+            if not hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8")):
+                raise Problem(
+                    "unauthorized",
+                    "A valid bearer token is required.",
+                    headers={"WWW-Authenticate": 'Bearer realm="b2router"'},
                 )
         return None
 

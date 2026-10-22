@@ -47,6 +47,7 @@ FILE_SORTS = {"name", "size", "uploaded"}
 ORDERS = {"asc", "desc"}
 AUDIT_ACTIONS = {"upload", "upsert", "delete"}
 AUDIT_RESULTS = {"success", "partial", "failed"}
+EMPTY_JOB_FRAGMENT = '<div class="job-missing"></div>'
 
 
 def _runtime() -> Runtime:
@@ -414,7 +415,7 @@ def fragment_job(job_id: str) -> Any:
     rt = _runtime()
     job = rt.manager.get(job_id)
     if job is None:
-        return Response(status=200, response=f'<div id="job-{job_id}"></div>')
+        return Response(status=200, response=EMPTY_JOB_FRAGMENT)
     payload = job.snapshot()
     response = Response(render_template("ui/fragments/job_card.html", job=payload))
     if payload["state"] in {"complete", "partial", "failed", "cancelled"}:
@@ -654,7 +655,7 @@ def cancel_job(job_id: str) -> Any:
         alert = {"level": "danger", "icon": "bi-exclamation-octagon", "message": exc.message}
     job = rt.manager.get(job_id)
     if job is None:
-        return Response(status=200, response=f'<div id="job-{job_id}"></div>')
+        return Response(status=200, response=EMPTY_JOB_FRAGMENT)
     response = Response(
         render_template("ui/fragments/job_card.html", job=job.snapshot(), alert=alert)
     )
@@ -667,7 +668,7 @@ def dismiss_job(job_id: str) -> Any:
     rt = _runtime()
     with contextlib.suppress(UploadRejected):
         rt.manager.dismiss(job_id)
-    response = Response(status=200, response=f'<div id="job-{job_id}"></div>')
+    response = Response(status=200, response=EMPTY_JOB_FRAGMENT)
     response.headers["HX-Trigger"] = "jobs-changed"
     return response
 

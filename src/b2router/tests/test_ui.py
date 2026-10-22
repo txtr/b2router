@@ -218,13 +218,19 @@ def test_token_login_and_csrf(settings, pool: AccountPool, manager: UploadManage
 
 def test_unknown_job_fragments(client) -> None:
     csrf = _csrf(client)
+    injection = '%22%3E%3Cimg%20src%3Dx%3E'
+    response = client.get(f"/ui/fragments/job/{injection}")
+    assert response.status_code == 200
+    assert b"<img" not in response.data
+    assert response.data == b'<div class="job-missing"></div>'
+
     response = client.post("/ui/jobs/job_missing/cancel", data={"_csrf": csrf})
     assert response.status_code == 200
-    assert b'id="job-job_missing"' in response.data
+    assert response.data == b'<div class="job-missing"></div>'
 
-    response = client.get("/ui/fragments/job/job_missing")
+    response = client.post("/ui/jobs/job_missing/dismiss", data={"_csrf": csrf})
     assert response.status_code == 200
-    assert response.data == b'<div id="job-job_missing"></div>'
+    assert response.data == b'<div class="job-missing"></div>'
 
 
 def test_audit_filter_fragment(client) -> None:

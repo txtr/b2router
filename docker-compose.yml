@@ -4,7 +4,9 @@ services:
     image: b2router:dev
     init: true
     ports:
-      - "8000:8000"
+      # Loopback-only by default. Remote exposure requires an explicit
+      # B2ROUTER_API_TOKEN and a deliberate port/network change.
+      - "127.0.0.1:8000:8000"
     volumes:
       - ./accounts.yaml:/config/accounts.yaml:ro
       - b2router-data:/data
