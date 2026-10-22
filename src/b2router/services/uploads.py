@@ -12,6 +12,7 @@ accounting both prefer predictable throughput over unbounded parallelism.
 
 from __future__ import annotations
 
+import builtins
 import contextlib
 import logging
 import os
@@ -929,7 +930,7 @@ class UploadManager:
         limit: int = 100,
         offset: int = 0,
         newest_first: bool = False,
-    ) -> tuple[list[UploadJob], int]:
+    ) -> tuple[builtins.list[UploadJob], int]:
         with self._lock:
             self._prune()
             jobs = [
@@ -947,6 +948,31 @@ class UploadManager:
     def revision(self) -> int:
         with self._seq_lock:
             return self._last_seq
+
+    def jobs_snapshot(
+        self,
+        *,
+        states: set[JobState] | None = None,
+        file_name: str | None = None,
+        updated_since: int = 0,
+        limit: int = 100,
+        offset: int = 0,
+        newest_first: bool = False,
+    ) -> tuple[builtins.list[UploadJob], int, int]:
+        """Return jobs, total, and revision from a single consistent read."""
+        with self._lock:
+            self._prune()
+            jobs: list[UploadJob] = [
+                job
+                for job in self._jobs.values()
+                if (states is None or job.state in states)
+                and (file_name is None or job.file_name == file_name)
+                and job.seq > updated_since
+            ]
+            total = len(jobs)
+            rev = self._last_seq
+        jobs.sort(key=lambda job: job.seq, reverse=newest_first)
+        return jobs[offset : offset + limit], total, rev
 
     def queued_count(self) -> int:
         with self._lock:

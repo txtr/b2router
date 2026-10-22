@@ -457,13 +457,13 @@ def list_jobs() -> Response:
     updated_since = int_arg(request, "updated_since", default=0, minimum=0)
     limit = int_arg(request, "limit", default=100, minimum=1, maximum=500)
     offset = int_arg(request, "offset", default=0, minimum=0)
-    revision = rt.manager.revision
-    jobs, total = rt.manager.list(
+    jobs, total, revision = rt.manager.jobs_snapshot(
         states=states,
         file_name=file_name,
         updated_since=updated_since,
         limit=limit,
         offset=offset,
+        newest_first=True,
     )
     etag = make_etag(
         "jobs",
