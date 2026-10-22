@@ -11,7 +11,7 @@ from pathlib import Path
 
 import yaml  # type: ignore[import-untyped]
 
-from b2router.services.pool import Err, Ok
+from b2router.utils.result import Err, Ok, Result
 
 
 @dataclass(frozen=True)
@@ -43,7 +43,7 @@ class ConfigReader:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
 
-    def read(self) -> Ok[Config, ConfigError] | Err[Config, ConfigError]:
+    def read(self) -> Result[Config, ConfigError]:
         if not self.path.exists():
             return Err(ConfigError("file_not_found", f"Config file not found: {self.path}"))
         try:

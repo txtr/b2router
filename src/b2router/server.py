@@ -17,9 +17,10 @@ from b2router.lockfile import InstanceLock, LockError
 from b2router.logging_setup import configure_logging, log_event
 from b2router.services.account import AccountClient, AccountCredentials
 from b2router.services.audit import AuditLog
-from b2router.services.pool import AccountPool, Err, PoolStartupError
+from b2router.services.pool import AccountPool, PoolStartupError
 from b2router.services.uploads import UploadManager, cleanup_temp_dir
 from b2router.settings import Settings, SettingsError
+from b2router.utils.result import Err
 from b2router.web import create_app
 
 

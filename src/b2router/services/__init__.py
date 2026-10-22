@@ -12,9 +12,7 @@ from b2router.services.audit import AuditEntry, AuditLog
 from b2router.services.pool import (
     AccountPool,
     AccountState,
-    Err,
     FileEntry,
-    Ok,
     PoolError,
     PoolStartupError,
     Reservation,

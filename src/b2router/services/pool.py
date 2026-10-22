@@ -20,25 +20,11 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, Generic, TypeVar
+from typing import Any, Literal
 
 from b2router.services.account import FileVersion, StorageBackend, StorageError
-
-T = TypeVar("T")
-E = TypeVar("E")
-
-
-# ---------------------------------------------------------------------------
-# Result types (kept for the config reader and CLI helpers)
-# ---------------------------------------------------------------------------
-@dataclass(frozen=True)
-class Ok(Generic[T, E]):
-    value: T
-
-
-@dataclass(frozen=True)
-class Err(Generic[T, E]):
-    error: E
+from b2router.types import AccountName, FileId, FileName, ReservationId
+from b2router.utils.result import Err, Ok, Result
 
 
 class PoolError(Exception):
@@ -76,13 +62,13 @@ def make_file_etag(file_id: str, upload_timestamp: int) -> str:
 
 @dataclass(frozen=True)
 class FileEntry:
-    file_name: str
-    file_id: str
+    file_name: FileName
+    file_id: FileId
     size: int
     content_type: str
     upload_timestamp: int
-    action: str
-    account_name: str
+    action: Literal["upload", "hide"]
+    account_name: AccountName
 
     @property
     def accounts(self) -> tuple[str, ...]:
@@ -114,7 +100,7 @@ class FileEntry:
 
 @dataclass(frozen=True)
 class AccountState:
-    name: str
+    name: AccountName
     capacity_bytes: int | None
     used_bytes: int = 0
     file_count: int = 0
@@ -171,9 +157,9 @@ class AccountState:
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class Reservation:
-    id: str
-    account_name: str
-    file_name: str
+    id: ReservationId
+    account_name: AccountName
+    file_name: FileName
     file_size: int
     file_slots: int = 1
 
@@ -189,28 +175,28 @@ class RoutingFailureReason(StrEnum):
 
 @dataclass(frozen=True)
 class RoutingDecision:
-    file_name: str
+    file_name: FileName
     file_size: int
-    account_name: str
+    account_name: AccountName
     remaining_bytes: int | None
     remaining_files: int
-    source_account: str | None = None
+    source_account: AccountName | None = None
 
 
 @dataclass(frozen=True)
 class RoutingFailure:
-    file_name: str
+    file_name: FileName
     reason: RoutingFailureReason
     message: str
-    source_account: str | None = None
+    source_account: AccountName | None = None
 
 
-RoutingResult = Ok[RoutingDecision, RoutingFailure] | Err[RoutingDecision, RoutingFailure]
+RoutingResult = Result[RoutingDecision, RoutingFailure]
 
 
 @dataclass(frozen=True)
 class RoutingJob:
-    file_name: str
+    file_name: FileName
     file_size: int
     decision: RoutingResult
 
@@ -348,13 +334,13 @@ class AccountPool:
                         accounts=[existing.account_name, client.name],
                     )
                 staged[version.file_name] = FileEntry(
-                    file_name=version.file_name,
-                    file_id=version.file_id,
+                    file_name=FileName(version.file_name),
+                    file_id=FileId(version.file_id),
                     size=version.size,
                     content_type=version.content_type,
                     upload_timestamp=version.upload_timestamp,
                     action=version.action,
-                    account_name=client.name,
+                    account_name=AccountName(client.name),
                 )
 
             # B2 retains hidden and superseded upload versions even though the
@@ -364,7 +350,7 @@ class AccountPool:
             accounted_versions = [version for version in all_versions if version.action == "upload"]
             used = sum(version.size for version in accounted_versions)
             state = AccountState(
-                name=client.name,
+                name=AccountName(client.name),
                 capacity_bytes=capacity_bytes,
                 used_bytes=used,
                 file_count=len(accounted_versions),
@@ -483,14 +469,15 @@ class AccountPool:
         jobs: list[RoutingJob] = []
 
         for file_name, file_size in file_descriptors:
-            if file_name in seen:
+            fn = FileName(file_name)
+            if fn in seen:
                 jobs.append(
                     RoutingJob(
-                        file_name,
+                        fn,
                         file_size,
                         Err(
                             RoutingFailure(
-                                file_name,
+                                fn,
                                 RoutingFailureReason.DUPLICATE_IN_BATCH,
                                 "The same file name appears more than once in this request.",
                             )
@@ -498,12 +485,12 @@ class AccountPool:
                     )
                 )
                 continue
-            seen.add(file_name)
+            seen.add(fn)
 
             old_entry = file_cache.get(file_name)
             source_account = old_entry.account_name if old_entry is not None else None
             replacement = old_entry is not None
-            best_name: str | None = None
+            best_name: AccountName | None = None
             best_remaining: int | None = None
             for name in sorted(states):
                 if name == source_account:
@@ -530,7 +517,7 @@ class AccountPool:
                     rem_after = effective - file_size
                 if best_remaining is None or (rem_after is not None and rem_after < best_remaining):
                     best_remaining = rem_after
-                    best_name = name
+                    best_name = AccountName(name)
 
             if best_name is None:
                 if replacement:
@@ -545,11 +532,11 @@ class AccountPool:
                     message = "No account has enough free bytes and file slots."
                 jobs.append(
                     RoutingJob(
-                        file_name,
+                        fn,
                         file_size,
                         Err(
                             RoutingFailure(
-                                file_name,
+                                fn,
                                 reason,
                                 message,
                                 source_account=source_account,
@@ -569,11 +556,11 @@ class AccountPool:
             final_remaining = None if effective is None else effective - file_size
             jobs.append(
                 RoutingJob(
-                    file_name,
+                    fn,
                     file_size,
                     Ok(
                         RoutingDecision(
-                            file_name=file_name,
+                            file_name=fn,
                             file_size=file_size,
                             account_name=best_name,
                             remaining_bytes=final_remaining,
@@ -660,9 +647,9 @@ class AccountPool:
                 account=account_name,
             )
         reservation = Reservation(
-            id=uuid.uuid4().hex,
-            account_name=account_name,
-            file_name=file_name,
+            id=ReservationId(uuid.uuid4().hex),
+            account_name=AccountName(account_name),
+            file_name=FileName(file_name),
             file_size=file_size,
         )
         self._reservations[reservation.id] = reservation
@@ -752,8 +739,8 @@ class AccountPool:
                 )
             self._states[reservation.account_name] = state.with_file(version.size)
             entry = FileEntry(
-                file_name=version.file_name,
-                file_id=version.file_id,
+                file_name=FileName(version.file_name),
+                file_id=FileId(version.file_id),
                 size=version.size,
                 content_type=version.content_type,
                 upload_timestamp=version.upload_timestamp,
@@ -834,8 +821,8 @@ class AccountPool:
                 )
 
             entry = FileEntry(
-                file_name=version.file_name,
-                file_id=version.file_id,
+                file_name=FileName(version.file_name),
+                file_id=FileId(version.file_id),
                 size=version.size,
                 content_type=version.content_type,
                 upload_timestamp=version.upload_timestamp,

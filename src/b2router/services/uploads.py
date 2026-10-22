@@ -25,9 +25,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
-
-from b2sdk.v2 import AbstractProgressListener
+from typing import Any, Literal
 
 from b2router import metrics
 from b2router.logging_setup import client_label_var, job_id_var, log_event, request_id_var
@@ -40,6 +38,7 @@ from b2router.services.pool import (
     Reservation,
 )
 from b2router.settings import Settings
+from b2router.types import AccountName, FileName, JobId, RequestId
 
 
 class JobState(StrEnum):
@@ -75,15 +74,15 @@ def _now() -> str:
 
 @dataclass
 class UploadJob:
-    id: str
-    operation: str
-    file_name: str
+    id: JobId
+    file_name: FileName
     file_size: int
     content_type: str
     temp_path: str
-    request_id: str | None
+    request_id: RequestId | None
     client: str | None
-    account_name: str | None = None
+    operation: Literal["upsert"] = "upsert"
+    account_name: AccountName | None = None
     state: JobState = JobState.QUEUED
     progress: float = 0.0
     bytes_sent: int = 0
@@ -208,10 +207,12 @@ class UploadJob:
             return True
 
 
-class _ProgressListener(AbstractProgressListener):  # type: ignore[misc]
+class _ProgressListener:
+    """Progress listener implementing the ProgressListener protocol."""
+
     def __init__(self, job: UploadJob) -> None:
-        super().__init__()
         self._job = job
+        self._closed = False
 
     def set_total_bytes(self, total_byte_count: int) -> None:
         self._job.update_progress(0, total_byte_count)
@@ -221,7 +222,7 @@ class _ProgressListener(AbstractProgressListener):  # type: ignore[misc]
 
     def close(self) -> None:
         if not self._closed:
-            super().close()
+            self._closed = True
 
     def change_description(self, new_description: str) -> bool:
         return True
@@ -315,13 +316,12 @@ class UploadManager:
                     queue_max=self._settings.queue_max,
                 )
             job = UploadJob(
-                id=f"job_{uuid.uuid4().hex}",
-                operation="upsert",
-                file_name=file_name,
+                id=JobId(f"job_{uuid.uuid4().hex}"),
+                file_name=FileName(file_name),
                 file_size=file_size,
                 content_type=content_type,
                 temp_path=temp_path,
-                request_id=request_id,
+                request_id=RequestId(request_id) if request_id else None,
                 client=client,
                 seq=self._next_seq(),
                 seq_source=self._next_seq,

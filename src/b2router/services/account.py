@@ -13,7 +13,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import requests
 from b2sdk._internal.raw_api import AbstractRawApi
@@ -52,7 +52,7 @@ class FileVersion:
     size: int
     content_type: str
     upload_timestamp: int
-    action: str
+    action: Literal["upload", "hide"]
     file_info: dict[str, Any] = field(default_factory=dict)
 
 
@@ -76,6 +76,21 @@ class DownloadHandle(Protocol):
     def close(self) -> None: ...
 
 
+class ProgressListener(Protocol):
+    """Protocol for upload progress callbacks.
+
+    Decouples the gateway from the b2sdk AbstractProgressListener class.
+    """
+
+    def set_total_bytes(self, total_byte_count: int) -> None: ...
+
+    def bytes_completed(self, byte_count: int) -> None: ...
+
+    def close(self) -> None: ...
+
+    def change_description(self, new_description: str) -> bool: ...
+
+
 class StorageBackend(Protocol):
     name: str
 
@@ -88,7 +103,7 @@ class StorageBackend(Protocol):
         local_path: str,
         file_name: str,
         content_type: str,
-        progress_listener: AbstractProgressListener | None = None,
+        progress_listener: ProgressListener | None = None,
         file_info: dict[str, str] | None = None,
     ) -> FileVersion: ...
 

@@ -18,8 +18,8 @@ from pathlib import Path
 from b2router.core.config_reader import AccountSpec, ConfigReader
 from b2router.lockfile import InstanceLock, LockError
 from b2router.services.account import AccountClient, AccountCredentials, StorageError
-from b2router.services.pool import Err
 from b2router.settings import Settings
+from b2router.utils.result import Err
 
 
 def _find_account(specs: list[AccountSpec], needle: str) -> AccountSpec | None:
