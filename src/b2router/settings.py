@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
+DEFAULT_MAX_UPLOAD_BYTES = 10 * 1024 * 1024 * 1024
+
 
 class SettingsError(Exception):
     """Raised when one or more environment values are invalid."""
@@ -79,7 +81,7 @@ class Settings:
     connect_timeout: float = 30.0
     read_timeout: float = 120.0
 
-    max_upload_bytes: int = 100 * 1024 * 1024
+    max_upload_bytes: int = DEFAULT_MAX_UPLOAD_BYTES
     max_files_per_request: int = 20
     max_filename_bytes: int = 1000
 
@@ -134,7 +136,7 @@ class Settings:
                 get("B2_READ_TIMEOUT", "120"), name="B2_READ_TIMEOUT", issues=issues, minimum=1
             ),
             max_upload_bytes=_int(
-                get("B2ROUTER_MAX_UPLOAD_BYTES", str(100 * 1024 * 1024)),
+                get("B2ROUTER_MAX_UPLOAD_BYTES", str(DEFAULT_MAX_UPLOAD_BYTES)),
                 name="B2ROUTER_MAX_UPLOAD_BYTES",
                 issues=issues,
                 minimum=1,

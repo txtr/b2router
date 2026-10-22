@@ -67,7 +67,7 @@ at startup.
 | `B2ROUTER_ACCOUNTS` | `accounts.yaml` | Config path. |
 | `B2_CONNECT_TIMEOUT` | `30` | B2 connection timeout (seconds). |
 | `B2_READ_TIMEOUT` | `120` | B2 read timeout (seconds). |
-| `B2ROUTER_MAX_UPLOAD_BYTES` | `104857600` | Per-file size limit (100 MiB). |
+| `B2ROUTER_MAX_UPLOAD_BYTES` | `10737418240` | Per-file size limit (10 GiB). |
 | `B2ROUTER_MAX_FILES_PER_REQUEST` | `20` | Multipart upload batch limit. |
 | `B2ROUTER_MAX_FILENAME_BYTES` | `1000` | UTF-8 filename limit. |
 | `B2ROUTER_UPLOAD_WORKERS` | `2` | Concurrent B2 transfers. |

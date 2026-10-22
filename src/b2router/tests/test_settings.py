@@ -11,7 +11,7 @@ def test_defaults() -> None:
     settings = Settings.from_env({})
     assert settings.host == "127.0.0.1"
     assert settings.port == 8000
-    assert settings.max_upload_bytes == 100 * 1024 * 1024
+    assert settings.max_upload_bytes == 10 * 1024 * 1024 * 1024
     assert settings.temp_dir.endswith("b2router")
     assert settings.lock_file == f"{settings.temp_dir}/instance.lock"
     assert settings.cors_origins == ()
