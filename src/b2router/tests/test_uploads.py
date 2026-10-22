@@ -5,13 +5,14 @@ from __future__ import annotations
 import threading
 import time
 from concurrent.futures import Future
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from b2router.runtime import Runtime
 from b2router.services.audit import AuditLog
-from b2router.services.pool import AccountPool
+from b2router.services.pool import AccountPool, PoolError
 from b2router.services.uploads import (
     JobState,
     UploadManager,
@@ -63,6 +64,80 @@ def test_upload_job_succeeds(
     assert pool.get_file("hello.txt") is not None
     assert accounts[finished.account_name].data[finished.result["file_id"]] == b"hello"
     assert not Path(job.temp_path).exists()
+
+
+def test_remote_upload_with_commit_failure_becomes_partial(
+    manager: UploadManager,
+    pool: AccountPool,
+    accounts: dict[str, FakeStorage],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_commit(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise PoolError("cache_error", "Simulated local cache failure.")
+
+    monkeypatch.setattr(pool, "commit_upload", fail_commit)
+    job = manager.submit(
+        file_name="commit-fail.bin",
+        temp_path=_spool(tmp_path, b"payload"),
+        file_size=7,
+        content_type="text/plain",
+        request_id="req_commit_fail",
+        client="test",
+    )
+
+    finished = _wait_state(manager, job.id)
+
+    assert finished.state is JobState.PARTIAL
+    assert finished.error is not None
+    assert finished.error["code"] == "cache_error"
+    assert finished.result is not None
+    account = accounts[finished.account_name]
+    assert account.data[finished.result["file_id"]] == b"payload"
+    assert pool.get_file("commit-fail.bin") is None
+    entries, _ = manager.audit.list(limit=10)
+    assert entries[0].result == "partial"
+    assert entries[0].details["job_id"] == job.id
+
+
+def test_size_mismatch_that_cannot_be_cleaned_up_becomes_partial(
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeStorage("a")
+    pool = AccountPool()
+    pool.add_account(fake, None)
+    manager = UploadManager(pool, AuditLog(), settings)
+    original = fake.upload_local_file
+
+    def wrong_size(*args, **kwargs):  # noqa: ANN002, ANN003
+        version = original(*args, **kwargs)
+        return replace(version, size=version.size + 1)
+
+    monkeypatch.setattr(fake, "upload_local_file", wrong_size)
+    fake.fail_delete = True
+    try:
+        job = manager.submit(
+            file_name="wrong-size.bin",
+            temp_path=_spool(tmp_path, b"hello"),
+            file_size=5,
+            content_type="text/plain",
+            request_id=None,
+            client=None,
+        )
+
+        finished = _wait_state(manager, job.id)
+
+        assert finished.state is JobState.PARTIAL
+        assert finished.error is not None
+        assert finished.error["code"] == "upload_cleanup_failed"
+        assert finished.error["details"]["expected"] == 5
+        assert finished.error["details"]["actual"] == 6
+        assert fake.data[finished.result["file_id"]] == b"hello"
+        assert pool.get_file("wrong-size.bin") is None
+    finally:
+        manager.shutdown()
 
 
 def test_second_job_for_same_name_is_rejected(
@@ -531,8 +606,6 @@ class NeverExecutor:
 
 
 def test_cancel_queued_job(pool: AccountPool, settings: Settings, tmp_path: Path) -> None:
-    from dataclasses import replace
-
     settings = replace(settings, upload_workers=1, queue_max=5)
     manager = UploadManager(pool, AuditLog(), settings, executor=NeverExecutor())  # type: ignore[arg-type]
     path = _spool(tmp_path, b"data")
@@ -552,6 +625,26 @@ def test_cancel_queued_job(pool: AccountPool, settings: Settings, tmp_path: Path
     assert manager.active_for_name("queued.bin") is None
     with pytest.raises(UploadRejected):
         manager.cancel(job.id)
+
+
+def test_shutdown_cancels_queued_jobs(pool: AccountPool, settings: Settings, tmp_path: Path) -> None:
+    settings = replace(settings, upload_workers=1, queue_max=5)
+    manager = UploadManager(pool, AuditLog(), settings, executor=NeverExecutor())  # type: ignore[arg-type]
+    path = _spool(tmp_path, b"queued")
+    job = manager.submit(
+        file_name="shutdown-queued.bin",
+        temp_path=path,
+        file_size=6,
+        content_type="text/plain",
+        request_id=None,
+        client=None,
+    )
+
+    manager.shutdown()
+
+    assert job.state is JobState.CANCELLED
+    assert not Path(path).exists()
+    assert manager.get(job.id) is not None
 
 
 def test_shutdown_waits_for_running_upload(

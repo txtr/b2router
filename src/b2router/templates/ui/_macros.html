@@ -58,7 +58,8 @@
 {%- endmacro %}
 
 {% macro result_badge(result) -%}
-  <span class="chip {{ 'success' if result == 'success' else ('warn' if result == 'partial' else 'danger') }}">{{ result|capitalize }}</span>
+  {%- set classes = {'success': 'success', 'partial': 'warn', 'failed': 'danger', 'cancelled': 'muted'} -%}
+  <span class="chip {{ classes.get(result, 'muted') }}">{{ result|capitalize }}</span>
 {%- endmacro %}
 
 {% macro pagination(view, endpoint) -%}

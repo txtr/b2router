@@ -61,6 +61,7 @@ mixed rejections fall back to `400 bad_request`.
 | `range_not_satisfiable` | 416 | The requested byte range is outside the object. | Request a valid range; inspect `Content-Range` on `206`. |
 | `too_many_requests` | 429 | The per-client mutation budget was exhausted. | Wait for `Retry-After` seconds. |
 | `internal_error` | 500 | An unhandled error occurred. The `request_id` is in the logs. | Report with the `request_id`. |
+| `insufficient_storage` | 507 | The staging volume cannot hold the declared multipart body. | Free space or raise the volume size; no bytes were accepted. |
 
 ### File and routing conflicts
 
@@ -100,6 +101,10 @@ state:
   version could not be confirmed removed and rollback also failed. The old copy
   in the source account and the new copy in the destination may both remain
   stored, and the pool keeps both sets of bytes accounted for.
+* `error.code = "upload_cleanup_failed"` means B2 stored the wrong number of
+  bytes and the invalid new version could not be deleted.
+* `error.code = "commit_failed"` (or the underlying pool/B2 code) means bytes
+  reached B2 but the local cache commit failed, so the cache may be stale.
 
 These are job states, not HTTP problems: inspect `GET /api/jobs/{id}` and
 `error.details`. Run `b2router-reconcile --apply` with the gateway stopped

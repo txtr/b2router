@@ -14,12 +14,12 @@ import re
 import secrets
 import time
 import uuid
-from typing import Any
 
 from flask import Flask, Response, g, request
 
 from b2router import metrics
 from b2router.api.routes import bp
+from b2router.api.validation import ensure_upload_space
 from b2router.errors import Problem, register_error_handlers
 from b2router.logging_setup import (
     client_label_var,
@@ -43,7 +43,7 @@ REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 CLIENT_RE = re.compile(r"^[A-Za-z0-9._ @-]{1,64}$")
 
 _CORS_HEADERS = {
-    "Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, DELETE, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, HEAD, POST, DELETE, OPTIONS",
     "Access-Control-Allow-Headers": (
         "Authorization, Content-Type, If-Match, If-None-Match, "
         "Idempotency-Key, X-Client-Name, X-Request-ID"
@@ -91,9 +91,20 @@ def create_app(
     if configure_logs:
         configure_logging(settings.log_level, settings.log_format)
 
-    pool = pool or AccountPool()
-    audit = audit or AuditLog(maxlen=max(settings.job_history_max, 1000))
-    manager = manager or UploadManager(pool, audit, settings)
+    if pool is None:
+        pool = manager.pool if manager is not None else AccountPool()
+    if audit is None:
+        audit = (
+            manager.audit
+            if manager is not None
+            else AuditLog(maxlen=max(settings.job_history_max, 1000))
+        )
+    if manager is None:
+        manager = UploadManager(pool, audit, settings)
+    elif manager.pool is not pool or manager.audit is not audit:
+        raise ValueError(
+            "create_app received a manager whose pool/audit differs from the runtime dependencies"
+        )
     runtime = Runtime(settings=settings, pool=pool, manager=manager, audit=audit)
 
     app = Flask(
@@ -137,6 +148,7 @@ def create_app(
 
         client = _client_label(settings)
         g.client_label = client
+        g.client_address = _client_address(settings)
         client_label_var.set(client)
         g.request_started = time.monotonic()
 
@@ -147,11 +159,9 @@ def create_app(
             response.headers["Access-Control-Allow-Origin"] = origin
             return response
 
-        mutating_api = request.method in {"POST", "PUT", "PATCH", "DELETE"} and (
-            request.path.startswith("/api/")
-        )
+        mutating_api = request.method in {"POST", "DELETE"} and request.path.startswith("/api/")
         mutating_ui = (
-            request.method in {"POST", "PUT", "PATCH", "DELETE"}
+            request.method in {"POST", "DELETE"}
             and request.path.startswith("/ui/")
             and not request.path.startswith("/ui/login")
         )
@@ -179,18 +189,18 @@ def create_app(
                     headers={"WWW-Authenticate": 'Bearer realm="b2router"'},
                 )
 
-        upload_request = request.method in {"POST", "PUT"} and (
-            request.path == "/api/files" or request.path.startswith("/api/files/")
-        )
-        if upload_request and manager.queued_count() >= settings.queue_max:
-            # Reject before Flask parses/spools the multipart body. This keeps a
-            # saturated queue from consuming the full aggregate body allowance.
-            raise Problem(
-                "queue_full",
-                "The upload queue is full; retry once active uploads finish.",
-                headers={"Retry-After": "5"},
-                extensions={"queue_max": settings.queue_max},
-            )
+        upload_request = request.method == "POST" and request.path == "/api/files"
+        if upload_request:
+            if manager.queued_count() >= settings.queue_max:
+                # Reject before Flask parses/spools the multipart body. This keeps a
+                # saturated queue from consuming the full aggregate body allowance.
+                raise Problem(
+                    "queue_full",
+                    "The upload queue is full; retry once active uploads finish.",
+                    headers={"Retry-After": "5"},
+                    extensions={"queue_max": settings.queue_max},
+                )
+            ensure_upload_space(settings.temp_dir, request.content_length)
         return None
 
     @app.after_request
@@ -246,27 +256,3 @@ def create_app(
         job_id_var.set(None)
 
     return app
-
-
-def shutdown_app(app: Flask) -> None:
-    runtime: Any = app.extensions.get("b2router")
-    if runtime is not None:
-        runtime.shutdown()
-
-
-def run_server(
-    settings: Settings | None = None,
-    *,
-    pool: AccountPool | None = None,
-    manager: UploadManager | None = None,
-) -> None:
-    """Run the development server (threaded; single process by design)."""
-    settings = settings or Settings.from_env()
-    app = create_app(settings, pool=pool, manager=manager)
-    app.run(
-        host=settings.host,
-        port=settings.port,
-        threaded=True,
-        use_reloader=False,
-        debug=False,
-    )

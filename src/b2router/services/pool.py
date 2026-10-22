@@ -81,7 +81,12 @@ class FileEntry:
     content_type: str
     upload_timestamp: int
     action: str
-    accounts: tuple[str, ...]
+    account_name: str
+
+    @property
+    def accounts(self) -> tuple[str, ...]:
+        """Compatibility view for callers that expect the API shape."""
+        return (self.account_name,)
 
     @property
     def uploaded_at(self) -> str:
@@ -101,12 +106,9 @@ class FileEntry:
             "upload_timestamp": self.upload_timestamp,
             "uploaded_at": self.uploaded_at,
             "action": self.action,
-            "accounts": list(self.accounts),
-            "account_count": len(self.accounts),
+            "accounts": [self.account_name],
+            "account_count": 1,
         }
-
-
-FileEntryLike = FileEntry
 
 
 @dataclass(frozen=True)
@@ -133,21 +135,12 @@ class AccountState:
             return 0.0
         return self.used_bytes / self.capacity_bytes
 
-    def can_fit(self, file_size: int) -> bool:
-        if self.remaining_files <= 0:
-            return False
-        remaining = self.remaining_bytes
-        return remaining is None or remaining >= file_size
-
     def with_file(self, file_size: int, file_slots: int = 1) -> AccountState:
         return replace(
             self,
             used_bytes=self.used_bytes + file_size,
             file_count=self.file_count + file_slots,
         )
-
-    def with_max_files(self, max_files: int) -> AccountState:
-        return replace(self, max_files=max_files)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -340,9 +333,9 @@ class AccountPool:
                     raise PoolError(
                         "duplicate_filename",
                         f"File {version.file_name!r} exists in both "
-                        f"{existing.accounts[0]!r} and {client.name!r}.",
+                        f"{existing.account_name!r} and {client.name!r}.",
                         file_name=version.file_name,
-                        accounts=list(existing.accounts) + [client.name],
+                        accounts=[existing.account_name, client.name],
                     )
                 staged[version.file_name] = FileEntry(
                     file_name=version.file_name,
@@ -351,15 +344,20 @@ class AccountPool:
                     content_type=version.content_type,
                     upload_timestamp=version.upload_timestamp,
                     action=version.action,
-                    accounts=(client.name,),
+                    account_name=client.name,
                 )
 
-            used = sum(version.size for version in versions)
+            # B2 retains hidden and superseded upload versions even though the
+            # latest-only listing does not show them. The local budget is about
+            # stored B2 objects, so count every upload version, not only visible
+            # names. Hide markers do not occupy object data.
+            accounted_versions = [version for version in all_versions if version.action == "upload"]
+            used = sum(version.size for version in accounted_versions)
             state = AccountState(
                 name=client.name,
                 capacity_bytes=capacity_bytes,
                 used_bytes=used,
-                file_count=len(versions),
+                file_count=len(accounted_versions),
                 max_files=max_files or self._default_max_files,
             )
             self._accounts[client.name] = client
@@ -379,15 +377,6 @@ class AccountPool:
         if issues:
             raise PoolStartupError(issues)
 
-    def set_max_files_per_account(self, max_files: int) -> None:
-        if max_files <= 0:
-            raise PoolError("invalid_max_files", "max_files must be positive")
-        with self._lock:
-            self._default_max_files = max_files
-            for name, state in self._states.items():
-                self._states[name] = state.with_max_files(max_files)
-            self._revision += 1
-
     # -- read access ---------------------------------------------------
     @property
     def revision(self) -> int:
@@ -397,10 +386,6 @@ class AccountPool:
     def names(self) -> list[str]:
         with self._lock:
             return sorted(self._accounts)
-
-    def accounts(self) -> list[StorageBackend]:
-        with self._lock:
-            return [self._accounts[name] for name in sorted(self._accounts)]
 
     def get(self, name: str) -> StorageBackend | None:
         with self._lock:
@@ -424,11 +409,6 @@ class AccountPool:
         with self._lock:
             return self._file_cache.get(file_name)
 
-    def get_file_accounts(self, file_name: str) -> list[str]:
-        with self._lock:
-            entry = self._file_cache.get(file_name)
-            return list(entry.accounts) if entry else []
-
     def list_files(self) -> list[FileEntry]:
         with self._lock:
             return [self._file_cache[name] for name in sorted(self._file_cache)]
@@ -437,14 +417,6 @@ class AccountPool:
         """Return files and the matching revision from one consistent read."""
         with self._lock:
             return [self._file_cache[name] for name in sorted(self._file_cache)], self._revision
-
-    def list_files_for_account(self, account_name: str) -> list[FileEntry]:
-        with self._lock:
-            return [
-                entry
-                for name, entry in sorted(self._file_cache.items())
-                if account_name in entry.accounts
-            ]
 
     def get_account_state(self, name: str) -> AccountState | None:
         with self._lock:
@@ -486,10 +458,6 @@ class AccountPool:
                 "revision": self._revision,
             }
 
-    # Backwards-compatible alias used by earlier tooling.
-    def file_cache_stats(self) -> dict[str, Any]:
-        return self.stats()
-
     # -- routing -------------------------------------------------------
     @staticmethod
     def _plan(
@@ -523,7 +491,7 @@ class AccountPool:
             seen.add(file_name)
 
             old_entry = file_cache.get(file_name)
-            source_account = old_entry.accounts[0] if old_entry is not None else None
+            source_account = old_entry.account_name if old_entry is not None else None
             replacement = old_entry is not None
             best_name: str | None = None
             best_remaining: int | None = None
@@ -611,30 +579,33 @@ class AccountPool:
 
         return jobs
 
+    def _routing_inputs_locked(
+        self,
+    ) -> tuple[
+        dict[str, AccountState],
+        dict[str, FileEntry],
+        dict[str, int],
+        dict[str, int],
+        int,
+    ]:
+        states = dict(self._states)
+        cache = dict(self._file_cache)
+        reserved_bytes: dict[str, int] = {}
+        reserved_files: dict[str, int] = {}
+        for reservation in self._reservations.values():
+            reserved_bytes[reservation.account_name] = (
+                reserved_bytes.get(reservation.account_name, 0) + reservation.file_size
+            )
+            reserved_files[reservation.account_name] = (
+                reserved_files.get(reservation.account_name, 0) + reservation.file_slots
+            )
+        return states, cache, reserved_bytes, reserved_files, self._revision
+
     def plan(self, file_descriptors: list[tuple[str, int]]) -> RoutingPlan:
         with self._lock:
-            states = dict(self._states)
-            cache = dict(self._file_cache)
-            reserved_bytes: dict[str, int] = {}
-            reserved_files: dict[str, int] = {}
-            for reservation in self._reservations.values():
-                reserved_bytes[reservation.account_name] = (
-                    reserved_bytes.get(reservation.account_name, 0) + reservation.file_size
-                )
-                reserved_files[reservation.account_name] = (
-                    reserved_files.get(reservation.account_name, 0) + reservation.file_slots
-                )
-            revision = self._revision
-        return RoutingPlan(
-            self._plan(
-                file_descriptors,
-                states,
-                cache,
-                reserved_bytes,
-                reserved_files,
-            ),
-            revision,
-        )
+            states, cache, reserved_bytes, reserved_files, revision = self._routing_inputs_locked()
+            jobs = self._plan(file_descriptors, states, cache, reserved_bytes, reserved_files)
+        return RoutingPlan(jobs, revision)
 
     def route_one(self, file_name: str, file_size: int) -> RoutingDecision:
         plan = self.plan([(file_name, file_size)])
@@ -646,6 +617,73 @@ class AccountPool:
         return job.decision.value
 
     # -- reservations --------------------------------------------------
+    def _create_reservation_locked(
+        self,
+        account_name: str,
+        file_name: str,
+        file_size: int,
+    ) -> Reservation:
+        state = self._states.get(account_name)
+        if state is None:
+            raise PoolError("account_not_found", f"Account {account_name!r} is not in the pool.")
+        reserved_bytes = sum(
+            r.file_size for r in self._reservations.values() if r.account_name == account_name
+        )
+        reserved_files = sum(
+            r.file_slots for r in self._reservations.values() if r.account_name == account_name
+        )
+        remaining = state.remaining_bytes
+        effective = None if remaining is None else remaining - reserved_bytes
+        if effective is not None and effective < file_size:
+            raise PoolError(
+                "no_account_can_fit",
+                f"Account {account_name!r} no longer has room for this file.",
+                account=account_name,
+            )
+        free_slots = state.remaining_files - reserved_files
+        if free_slots <= 0:
+            raise PoolError(
+                "no_account_can_fit",
+                f"Account {account_name!r} has no file slots left.",
+                account=account_name,
+            )
+        reservation = Reservation(
+            id=uuid.uuid4().hex,
+            account_name=account_name,
+            file_name=file_name,
+            file_size=file_size,
+        )
+        self._reservations[reservation.id] = reservation
+        self._revision += 1
+        return reservation
+
+    def reserve(self, file_name: str, file_size: int) -> tuple[RoutingDecision, Reservation]:
+        """Route and reserve atomically.
+
+        ``route_one`` followed by ``try_reserve`` can lose the selected account
+        to another upload between the two calls. This method closes that race by
+        keeping the pool lock across planning and reservation.
+        """
+        with self._lock:
+            states, cache, reserved_bytes, reserved_files, _ = self._routing_inputs_locked()
+            jobs = self._plan(
+                [(file_name, file_size)], states, cache, reserved_bytes, reserved_files
+            )
+            job = jobs[0]
+            if isinstance(job.decision, Err):
+                raise PoolError(
+                    job.decision.error.reason.value,
+                    job.decision.error.message,
+                    file_name=file_name,
+                )
+            decision = job.decision.value
+            reservation = self._create_reservation_locked(
+                decision.account_name,
+                file_name,
+                file_size,
+            )
+            return decision, reservation
+
     def try_reserve(
         self,
         account_name: str,
@@ -653,41 +691,7 @@ class AccountPool:
         file_size: int,
     ) -> Reservation:
         with self._lock:
-            state = self._states.get(account_name)
-            if state is None:
-                raise PoolError(
-                    "account_not_found", f"Account {account_name!r} is not in the pool."
-                )
-            reserved_bytes = sum(
-                r.file_size for r in self._reservations.values() if r.account_name == account_name
-            )
-            reserved_files = sum(
-                r.file_slots for r in self._reservations.values() if r.account_name == account_name
-            )
-            remaining = state.remaining_bytes
-            effective = None if remaining is None else remaining - reserved_bytes
-            if effective is not None and effective < file_size:
-                raise PoolError(
-                    "no_account_can_fit",
-                    f"Account {account_name!r} no longer has room for this file.",
-                    account=account_name,
-                )
-            free_slots = state.remaining_files - reserved_files
-            if free_slots <= 0:
-                raise PoolError(
-                    "no_account_can_fit",
-                    f"Account {account_name!r} has no file slots left.",
-                    account=account_name,
-                )
-            reservation = Reservation(
-                id=uuid.uuid4().hex,
-                account_name=account_name,
-                file_name=file_name,
-                file_size=file_size,
-            )
-            self._reservations[reservation.id] = reservation
-            self._revision += 1
-            return reservation
+            return self._create_reservation_locked(account_name, file_name, file_size)
 
     def release(self, reservation_id: str) -> None:
         with self._lock:
@@ -734,7 +738,7 @@ class AccountPool:
                 content_type=version.content_type,
                 upload_timestamp=version.upload_timestamp,
                 action=version.action,
-                accounts=(reservation.account_name,),
+                account_name=reservation.account_name,
             )
             self._file_cache[version.file_name] = entry
             del self._reservations[reservation.id]
@@ -773,7 +777,7 @@ class AccountPool:
                 )
 
             new_account = reservation.account_name
-            old_account = old_entry.accounts[0]
+            old_account = old_entry.account_name
             if old_account == new_account:
                 raise PoolError(
                     "state_changed",
@@ -816,7 +820,7 @@ class AccountPool:
                 content_type=version.content_type,
                 upload_timestamp=version.upload_timestamp,
                 action=version.action,
-                accounts=(new_account,),
+                account_name=new_account,
             )
             self._file_cache[version.file_name] = entry
             del self._reservations[reservation.id]
@@ -836,7 +840,7 @@ class AccountPool:
                     expected_file_id=expected_file_id,
                     actual_file_id=entry.file_id,
                 )
-            account = entry.accounts[0]
+            account = entry.account_name
             state = self._states[account]
             self._states[account] = replace(
                 state,

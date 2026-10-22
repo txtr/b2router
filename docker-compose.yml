@@ -17,13 +17,18 @@ services:
       B2ROUTER_TEMP_DIR: /data/tmp
       B2ROUTER_LOCK_FILE: /data/instance.lock
       B2ROUTER_LOG_FORMAT: json
+      # Werkzeug's multipart spool must use the persistent volume too.
+      TMPDIR: /data/tmp
       # Shared token: set in .env or remove for same-origin-only use.
       B2ROUTER_API_TOKEN: ${B2ROUTER_API_TOKEN:-}
       # Set a stable key to keep UI sessions across container restarts.
       B2ROUTER_SECRET_KEY: ${B2ROUTER_SECRET_KEY:-}
       B2ROUTER_COOKIE_SECURE: ${B2ROUTER_COOKIE_SECURE:-0}
     restart: unless-stopped
-    stop_grace_period: 15s
+    # The server drains accepted uploads before releasing the writer lock. A
+    # 10 GiB upload can take a long time, so do not let Docker SIGKILL the
+    # process mid-transfer (which can leave an orphaned B2 version).
+    stop_grace_period: 1h
     healthcheck:
       test:
         - CMD

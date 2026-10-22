@@ -32,7 +32,8 @@ python -m venv .venv
 . .venv/bin/activate
 pip install -e '.[dev]'
 
-cp accounts.example.yaml accounts.yaml   # edit securely
+cp accounts.example.yaml accounts.yaml
+chmod 600 accounts.yaml                  # contains live B2 application keys
 b2router
 # -> http://127.0.0.1:8000/ui/
 ```
@@ -289,9 +290,11 @@ B2ROUTER_ACCOUNTS=/etc/b2router/accounts.yaml b2router-reconcile --apply --prett
 ```
 
 It takes the same `flock` as the server, so `--apply` refuses to run while the
-gateway is live. The `b2router-create-file` and `b2router-delete-file`
-maintenance commands also take the writer lock and exit with status `3` when
-the server is running. Run mutating tools only with the gateway stopped. Without `--apply`
+gateway is live. `--apply` also deletes nothing if any account could not be
+listed, because an unreadable account may hold the real keeper or additional
+versions. The `b2router-create-file` and `b2router-delete-file` maintenance
+commands also take the writer lock and exit with status `3` when the server is
+running. Run mutating tools only with the gateway stopped. Without `--apply`
 the reconciler is read-only.
 
 ## Security
@@ -310,9 +313,13 @@ the reconciler is read-only.
   default in containers for correlation.
 - Upsert filenames are normalised, length-checked, and rejected if they contain
   NULs, backslashes, `.`/`..` segments, control characters, or a leading `/`.
-  The spool directory is mode `0700`, and every spool file is `0600`. Spooling
-  refuses to start with less than 1 MiB free and converts disk write failures
-  into `503 service_unavailable` instead of leaking a server error.
+  The spool directory is mode `0700`, and every spool file is `0600`. Uploads
+  are rejected with `507 insufficient_storage` before multipart parsing when the
+  declared body would consume the staging volume. Spooling also refuses to
+  start with less than 1 MiB free and converts disk write failures into `503
+  service_unavailable` instead of leaking a server error. Container deployments
+  set both `B2ROUTER_TEMP_DIR` and `TMPDIR` to the persistent `/data/tmp` volume
+  so Werkzeug's multipart spool never writes to the image layer.
 - Content-Disposition uses RFC 5987 encoding, never reflecting a raw header.
 - Errors never include B2 response bodies, keys, or stack traces. `5xx`
   responses include a `request_id` and a generic detail.
@@ -352,7 +359,9 @@ docker compose up --build
 
 The image runs as a non-root user, exposes `8000`, installs the package with its
 templates/static assets, and keeps spool/lock state in the `b2router-data`
-volume. Mount `accounts.yaml` read-only at `/config/accounts.yaml`.
+volume. Mount `accounts.yaml` read-only at `/config/accounts.yaml`; keep the
+host file mode at `0600`. Compose allows up to an hour for graceful shutdown so
+accepted uploads can drain before Docker sends `SIGKILL`.
 Compose publishes `127.0.0.1:8000:8000` by default. Exposing the port on a
 remote interface requires an explicit `B2ROUTER_API_TOKEN` and a deliberate
 port/network change; without the token the console and API are unauthenticated.

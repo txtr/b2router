@@ -6,6 +6,7 @@ import io
 import re
 import time
 from dataclasses import replace
+from pathlib import Path
 
 from b2router.services.pool import AccountPool
 from b2router.services.uploads import UploadManager
@@ -259,6 +260,14 @@ def test_htmx_problem_keeps_status_and_targets_flash(client) -> None:
     assert response.headers["HX-Retarget"] == "#flash"
     assert response.headers["HX-Reswap"] == "innerHTML"
     assert b"file_not_found" in response.data
+
+
+def test_error_flash_does_not_interpolate_html() -> None:
+    source = (Path(__file__).parents[1] / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert "flash.innerHTML" not in source
+    assert "textContent = message" in source
+    assert "flash.replaceChildren(alert)" in source
 
 
 def test_ui_queue_full_is_checked_before_csrf_and_body_parsing(

@@ -183,7 +183,7 @@ _RETRYABLE = (
 )
 
 
-def _translate(exc: BaseException) -> StorageError:
+def _translate(exc: Exception) -> StorageError:
     if isinstance(exc, StorageError):
         return exc
     if isinstance(exc, (b2exc.FileNotPresent, b2exc.FileAlreadyHidden)):
@@ -260,7 +260,7 @@ class AccountClient:
                 self._api = api
                 self._bucket = buckets[0]
                 self._bucket_name = buckets[0].name
-            except BaseException as exc:
+            except Exception as exc:
                 raise _translate(exc) from exc
 
     @property
@@ -299,7 +299,7 @@ class AccountClient:
             files = [self._to_version(version) for version, _ in self.bucket.ls(latest_only=True)]
             self._observe("list_files", started, "ok")
             return files
-        except BaseException as exc:
+        except Exception as exc:
             error = _translate(exc)
             self._observe("list_files", started, "error", error.code)
             raise error from exc
@@ -319,7 +319,7 @@ class AccountClient:
             ]
             self._observe("list_versions", started, "ok")
             return versions
-        except BaseException as exc:
+        except Exception as exc:
             error = _translate(exc)
             self._observe("list_versions", started, "error", error.code)
             raise error from exc
@@ -350,7 +350,7 @@ class AccountClient:
                 action=info.action or "upload",
                 file_info=dict(getattr(info, "file_info", None) or {}),
             )
-        except BaseException as exc:
+        except Exception as exc:
             error = _translate(exc)
             self._observe("get_file_info", started, "error", error.code)
             raise error from exc
@@ -382,7 +382,7 @@ class AccountClient:
                 action=version.action or "upload",
                 file_info=dict(getattr(version, "file_info", None) or {}),
             )
-        except BaseException as exc:
+        except Exception as exc:
             error = _translate(exc)
             self._observe("upload", started, "error", error.code)
             raise error from exc
@@ -392,7 +392,7 @@ class AccountClient:
         try:
             self.bucket.delete_file_version(file_id, file_name)
             self._observe("delete", started, "ok")
-        except BaseException as exc:
+        except Exception as exc:
             error = _translate(exc)
             self._observe("delete", started, "error", error.code)
             raise error from exc
@@ -405,7 +405,7 @@ class AccountClient:
             downloaded = self.bucket.download_file_by_id(file_id, range_=range_)
             self._observe("download", started, "ok")
             return _ResponseHandle(downloaded)
-        except BaseException as exc:
+        except Exception as exc:
             error = _translate(exc)
             self._observe("download", started, "error", error.code)
             raise error from exc

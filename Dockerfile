@@ -2,6 +2,8 @@
 
 FROM python:3.11-slim AS runtime
 
+# Werkzeug spools multipart bodies before the route runs; keep that spool on the
+# same writable volume as B2ROUTER_TEMP_DIR instead of the image layer.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -10,7 +12,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     B2ROUTER_ACCOUNTS=/config/accounts.yaml \
     B2ROUTER_TEMP_DIR=/data/tmp \
     B2ROUTER_LOCK_FILE=/data/instance.lock \
-    B2ROUTER_LOG_FORMAT=json
+    B2ROUTER_LOG_FORMAT=json \
+    TMPDIR=/data/tmp
 
 WORKDIR /app
 

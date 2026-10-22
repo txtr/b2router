@@ -17,7 +17,7 @@ from b2router.api.validation import (
     parse_range,
     safe_content_type,
 )
-from b2router.errors import Problem
+from b2router.errors import Problem, storage_error_status
 from b2router.logging_setup import log_event
 from b2router.runtime import Runtime
 from b2router.services.account import StorageError
@@ -51,7 +51,7 @@ def content_response(rt: Runtime, file_name: str, request: Request) -> Response:
     if etag_matches(request.headers.get("If-None-Match"), entry.etag):
         return not_modified(entry.etag)
 
-    account = rt.pool.get(entry.accounts[0])
+    account = rt.pool.get(entry.account_name)
     if account is None:
         raise Problem("file_not_found", "The owning account is no longer in the pool.", status=404)
 
@@ -77,7 +77,7 @@ def content_response(rt: Runtime, file_name: str, request: Request) -> Response:
             range_=(start, end) if byte_range is not None else None,
         )
     except StorageError as exc:
-        raise Problem(exc.code, exc.message, status=502) from exc
+        raise Problem(exc.code, exc.message, status=storage_error_status(exc.code)) from exc
 
     def generate() -> Any:
         try:

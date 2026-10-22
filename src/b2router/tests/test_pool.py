@@ -43,6 +43,37 @@ def test_add_account_builds_cache_and_stats() -> None:
     assert pool.stats()["free_bytes"] == 850
 
 
+def test_hidden_versions_count_toward_capacity() -> None:
+    fake = FakeStorage("a")
+    fake.seed("visible.txt", b"1234")
+    fake.all_versions.append(_version(".hidden", 6, account="a", suffix="hidden"))
+    pool = AccountPool(max_files_per_account=2)
+
+    state = pool.add_account(fake, capacity_bytes=20)
+
+    assert state.used_bytes == 10
+    assert state.file_count == 2
+    assert pool.stats()["used_bytes"] == 10
+    assert pool.get_file(".hidden") is None
+
+
+def test_reserve_routes_and_reserves_atomically() -> None:
+    fake = FakeStorage("a")
+    pool = AccountPool()
+    pool.add_account(fake, capacity_bytes=5)
+
+    decision, first = pool.reserve("one.bin", 4)
+    assert decision.account_name == "a"
+    with pytest.raises(PoolError) as excinfo:
+        pool.reserve("two.bin", 2)
+    assert excinfo.value.code == "no_account_can_fit"
+
+    pool.release(first.id)
+    second_decision, second = pool.reserve("two.bin", 2)
+    assert second_decision.account_name == "a"
+    pool.release(second.id)
+
+
 def test_duplicate_file_across_accounts_fails_startup() -> None:
     first = FakeStorage("a")
     first.seed("same.txt", b"1")

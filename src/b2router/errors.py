@@ -122,11 +122,15 @@ def _json(value: Any) -> str:
     return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
 
 
-def current_request_id() -> str:
-    try:
-        return request_id_var.get() or "-"
-    except LookupError:  # pragma: no cover - outside app context
-        return "-"
+def storage_error_status(code: str) -> int:
+    """Map a storage failure code onto its documented HTTP status."""
+    return {
+        "b2_unauthorized": 502,
+        "b2_rate_limited": 503,
+        "b2_unavailable": 503,
+        "b2_timeout": 504,
+        "range_not_satisfiable": 416,
+    }.get(code, 502)
 
 
 def problem_response(problem: Problem) -> Response:

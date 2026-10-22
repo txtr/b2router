@@ -29,7 +29,6 @@ from b2router.api.validation import (
     int_arg,
     json_body,
     make_etag,
-    parse_etag,
     spool_upload,
     str_arg,
     validate_file_name,
@@ -382,7 +381,7 @@ def delete_file(file_name: str) -> Response:
     delete_file_entry(
         rt,
         file_name,
-        expected_etag=parse_etag(request.headers.get("If-Match")),
+        if_match_header=request.headers.get("If-Match"),
         request_id=request_id_var.get(),
         client=getattr(g, "client_label", None),
     )

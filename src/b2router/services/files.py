@@ -7,9 +7,11 @@ audit entry, and metrics are identical no matter which surface invoked them.
 from __future__ import annotations
 
 import time
+from typing import Any
 
 from b2router import metrics
-from b2router.errors import Problem
+from b2router.api.validation import if_match
+from b2router.errors import Problem, storage_error_status
 from b2router.logging_setup import log_event, request_id_var
 from b2router.runtime import Runtime
 from b2router.services.account import StorageError
@@ -17,11 +19,18 @@ from b2router.services.pool import FileEntry
 from b2router.services.uploads import UploadRejected
 
 
+def _append_audit(rt: Runtime, **fields: Any) -> None:
+    try:
+        rt.audit.append("delete", **fields)
+    except Exception:  # pragma: no cover - audit must never break a mutation
+        log_event("file.audit_failed", level=40, file_name=fields.get("file_name"))
+
+
 def delete_file(
     rt: Runtime,
     file_name: str,
     *,
-    expected_etag: str | None = None,
+    if_match_header: str | None = None,
     request_id: str | None = None,
     client: str | None = None,
 ) -> FileEntry:
@@ -41,18 +50,18 @@ def delete_file(
         if entry is None:
             raise Problem("file_not_found", f"File {file_name!r} is not in the pool.", status=404)
 
-        if expected_etag is not None and expected_etag != "*" and expected_etag != entry.etag:
+        if not if_match(if_match_header, entry.etag):
             raise Problem(
                 "precondition_failed",
                 "The file changed since it was read; refresh and retry.",
                 status=412,
                 extensions={
-                    "expected_etag": expected_etag,
+                    "if_match": if_match_header,
                     "actual_etag": entry.etag,
                 },
             )
 
-        account = rt.pool.get(entry.accounts[0])
+        account = rt.pool.get(entry.account_name)
         if account is None:
             raise Problem(
                 "account_not_found",
@@ -66,11 +75,11 @@ def delete_file(
         except StorageError as exc:
             if exc.code != "b2_not_found":
                 metrics.DELETES.labels(result="failed").inc()
-                rt.audit.append(
-                    "delete",
+                _append_audit(
+                    rt,
                     result="failed",
                     file_name=file_name,
-                    account_name=entry.accounts[0],
+                    account_name=entry.account_name,
                     file_size=entry.size,
                     error_code=exc.code,
                     request_id=rid,
@@ -78,22 +87,20 @@ def delete_file(
                     duration_ms=(time.monotonic() - started) * 1000,
                     details={"file_id": entry.file_id},
                 )
-                status = {
-                    "b2_unauthorized": 502,
-                    "b2_rate_limited": 503,
-                    "b2_unavailable": 503,
-                    "b2_timeout": 504,
-                }.get(exc.code, 502)
-                raise Problem(exc.code, exc.message, status=status) from exc
+                raise Problem(
+                    exc.code,
+                    exc.message,
+                    status=storage_error_status(exc.code),
+                ) from exc
 
         deleted = rt.pool.commit_delete(file_name, expected_file_id=entry.file_id)
         metrics.DELETES.labels(result="success").inc()
         metrics.refresh_pool(rt.pool)
-        rt.audit.append(
-            "delete",
+        _append_audit(
+            rt,
             result="success",
             file_name=file_name,
-            account_name=deleted.accounts[0],
+            account_name=deleted.account_name,
             file_size=deleted.size,
             request_id=rid,
             client=client,
@@ -103,7 +110,7 @@ def delete_file(
         log_event(
             "file.deleted",
             file_name=file_name,
-            account=deleted.accounts[0],
+            account=deleted.account_name,
             size=deleted.size,
         )
         return deleted

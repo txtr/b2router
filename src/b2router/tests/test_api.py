@@ -9,6 +9,7 @@ import pytest
 
 from b2router.services.account import StorageError
 from b2router.services.audit import AuditLog
+from b2router.services.pool import AccountPool
 from b2router.tests.conftest import wait_for_job
 from b2router.web import create_app
 
@@ -53,6 +54,21 @@ def test_ready_reports_draining(client, manager) -> None:
     assert payload["checks"]["accepting_mutations"] is False
 
 
+def test_create_app_does_not_replace_an_empty_pool(settings, tmp_path) -> None:
+    empty = AccountPool()
+    app = create_app(
+        replace(settings, temp_dir=str(tmp_path / "empty-tmp")),
+        pool=empty,
+        audit=AuditLog(),
+        configure_logs=False,
+    )
+    app.testing = True
+
+    assert app.extensions["b2router"].pool is empty
+    assert not empty
+    assert app.test_client().get("/ready").status_code == 503
+
+
 def test_ready_does_not_depend_on_metrics(
     pool, manager, settings, tmp_path
 ) -> None:
@@ -65,7 +81,7 @@ def test_ready_does_not_depend_on_metrics(
         no_metrics,
         pool=pool,
         manager=manager,
-        audit=AuditLog(),
+        audit=manager.audit,
         configure_logs=False,
     )
     app.testing = True
@@ -204,6 +220,12 @@ def test_delete_file_and_preconditions(client) -> None:
     wrong = client.delete("/api/files/remove.txt", headers={"If-Match": '"nope"'})
     assert wrong.status_code == 412
 
+    # If-Match requires strong comparison; a weak validator must not match.
+    weak = client.delete(
+        "/api/files/remove.txt", headers={"If-Match": f'W/"{detail["etag"]}"'}
+    )
+    assert weak.status_code == 412
+
     deleted = client.delete(
         "/api/files/remove.txt", headers={"If-Match": f'"{detail["etag"]}"'}
     )
@@ -303,7 +325,7 @@ def test_audit_records_mutations(client) -> None:
 
 def test_bearer_token_auth(pool, manager, settings, tmp_path) -> None:
     secured = replace(settings, api_token="secret", temp_dir=str(tmp_path / "secured"))
-    app = create_app(secured, pool=pool, manager=manager, audit=AuditLog(), configure_logs=False)
+    app = create_app(secured, pool=pool, manager=manager, audit=manager.audit, configure_logs=False)
     app.testing = True
     client = app.test_client()
 
@@ -321,7 +343,7 @@ def test_failed_bearer_auth_consumes_mutation_limit(pool, manager, settings, tmp
         api_token="secret",
         mutation_rate_per_minute=1,
     )
-    app = create_app(secured, pool=pool, manager=manager, audit=AuditLog(), configure_logs=False)
+    app = create_app(secured, pool=pool, manager=manager, audit=manager.audit, configure_logs=False)
     app.testing = True
     client = app.test_client()
     headers = {"Authorization": "Bearer wrong"}
@@ -339,7 +361,7 @@ def test_rate_limit_mutations(pool, manager, settings, tmp_path) -> None:
         temp_dir=str(tmp_path / "limited"),
         mutation_rate_per_minute=1,
     )
-    app = create_app(limited, pool=pool, manager=manager, audit=AuditLog(), configure_logs=False)
+    app = create_app(limited, pool=pool, manager=manager, audit=manager.audit, configure_logs=False)
     app.testing = True
     client = app.test_client()
 
@@ -357,7 +379,7 @@ def test_cors_preflight_and_response_headers(pool, manager, settings, tmp_path) 
         temp_dir=str(tmp_path / "cors"),
         cors_origins=("http://example.test",),
     )
-    app = create_app(cors, pool=pool, manager=manager, audit=AuditLog(), configure_logs=False)
+    app = create_app(cors, pool=pool, manager=manager, audit=manager.audit, configure_logs=False)
     client = app.test_client()
 
     preflight = client.options(
@@ -376,7 +398,7 @@ def test_cors_preflight_and_response_headers(pool, manager, settings, tmp_path) 
 
 def test_payload_too_large(pool, manager, settings, tmp_path) -> None:
     tiny = replace(settings, temp_dir=str(tmp_path / "tiny"), max_upload_bytes=10)
-    app = create_app(tiny, pool=pool, manager=manager, audit=AuditLog(), configure_logs=False)
+    app = create_app(tiny, pool=pool, manager=manager, audit=manager.audit, configure_logs=False)
     client = app.test_client()
 
     response = client.post(
