@@ -1,0 +1,71 @@
+<div id="files-panel" class="glass"
+     hx-get="{{ url_for('ui.fragments_files', q=view.q, account=view.account, sort=view.sort, order=view.order, limit=view.limit, page=view.page) }}"
+     hx-trigger="jobs-changed from:body"
+     hx-swap="outerHTML">
+  <div class="panel-head">
+    <div>
+      <h2 class="panel-title"><i class="bi bi-folder2-open"></i> File cache</h2>
+      <div class="text-secondary small mt-1">{{ view.total }} file{{ '' if view.total == 1 else 's' }} · newest cached view</div>
+    </div>
+    <a class="btn btn-accent btn-sm" href="{{ url_for('ui.uploads') }}"><i class="bi bi-plus-lg"></i> Upload</a>
+  </div>
+
+  <div class="panel-body pb-2">
+    {% if alert %}
+      <div class="alert alert-{{ alert.level }} d-flex gap-2 align-items-start" role="alert">
+        <i class="bi {{ alert.icon }} mt-1"></i><div>{{ alert.message }}</div>
+      </div>
+    {% endif %}
+
+    <form class="row g-2 align-items-center mb-3"
+          hx-get="{{ url_for('ui.fragments_files') }}"
+          hx-target="#files-panel" hx-swap="outerHTML"
+          hx-trigger="submit"
+          hx-indicator="#files-spinner">
+      <div class="col-12 col-lg-5">
+        <div class="input-group input-group-sm">
+          <span class="input-group-text"><i class="bi bi-search"></i></span>
+          <input class="form-control" type="search" name="q" value="{{ view.q }}" placeholder="Search file names…  (press /)"
+                 data-quick-search
+                 hx-get="{{ url_for('ui.fragments_files') }}"
+                 hx-target="#files-panel" hx-swap="outerHTML"
+                 hx-trigger="keyup changed delay:350ms, search"
+                 hx-include="closest form">
+        </div>
+      </div>
+      <div class="col-6 col-lg-2">
+        <select class="form-select form-select-sm" name="account" aria-label="Account filter"
+                hx-get="{{ url_for('ui.fragments_files') }}" hx-target="#files-panel" hx-swap="outerHTML"
+                hx-trigger="change" hx-include="closest form">
+          <option value="">All accounts</option>
+          {% for account in account_names %}
+            <option value="{{ account }}" {{ 'selected' if view.account == account }}>{{ account }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="col-6 col-lg-2">
+        <select class="form-select form-select-sm" name="sort" aria-label="Sort"
+                hx-get="{{ url_for('ui.fragments_files') }}" hx-target="#files-panel" hx-swap="outerHTML"
+                hx-trigger="change" hx-include="closest form">
+          <option value="name" {{ 'selected' if view.sort == 'name' }}>Name</option>
+          <option value="size" {{ 'selected' if view.sort == 'size' }}>Size</option>
+          <option value="uploaded" {{ 'selected' if view.sort == 'uploaded' }}>Uploaded</option>
+        </select>
+      </div>
+      <div class="col-6 col-lg-1">
+        <select class="form-select form-select-sm" name="order" aria-label="Order"
+                hx-get="{{ url_for('ui.fragments_files') }}" hx-target="#files-panel" hx-swap="outerHTML"
+                hx-trigger="change" hx-include="closest form">
+          <option value="asc" {{ 'selected' if view.order == 'asc' }}>Asc</option>
+          <option value="desc" {{ 'selected' if view.order == 'desc' }}>Desc</option>
+        </select>
+      </div>
+      <div class="col-6 col-lg-2 d-flex justify-content-lg-end gap-1">
+        <span id="files-spinner" class="htmx-indicator chip accent"><i class="bi bi-arrow-repeat"></i> Loading</span>
+        <a class="btn btn-ghost btn-sm" href="{{ url_for('ui.files') }}" title="Reset filters"><i class="bi bi-x-lg"></i></a>
+      </div>
+    </form>
+
+    {% include "ui/fragments/files_table.html" %}
+  </div>
+</div>

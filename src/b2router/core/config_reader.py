@@ -1,79 +1,148 @@
+"""Strict, side-effect-free parsing of ``accounts.yaml``.
+
+The reader validates the whole document before the server touches B2. Errors
+are structured and never echo application keys.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
-import yaml
+import yaml  # type: ignore[import-untyped]
 
-
-@dataclass
-class AccountConfig:
-    """Configuration for a single B2 account."""
-
-    account_id: str
-    account_key: str
-    capacity_in_mb: int | None = None
-
-    @property
-    def capacity_bytes(self) -> int | None:
-        if self.capacity_in_mb is None:
-            return None
-        return self.capacity_in_mb * 1024 * 1024
-
-    @property
-    def name(self) -> str:
-        """Generate a display name from account_id (first 8 chars)."""
-        return f"account-{self.account_id[:8]}"
+from b2router.services.pool import Err, Ok
 
 
-@dataclass
+@dataclass(frozen=True)
+class ConfigError:
+    kind: str
+    message: str
+
+
+@dataclass(frozen=True)
+class AccountSpec:
+    name: str
+    application_key_id: str
+    application_key: str
+    capacity_bytes: int | None = None
+
+
+@dataclass(frozen=True)
 class Config:
-    """Parsed configuration from accounts.yaml."""
-
     max_files_per_account: int
-    accounts: list[AccountConfig]
+    accounts: list[AccountSpec]
+
+
+def account_name(application_key_id: str) -> str:
+    """Deterministic, human-friendly account name."""
+    return f"account-{application_key_id[:8]}"
 
 
 class ConfigReader:
-    """Reads and parses account configuration from YAML file."""
-
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
 
-    def read(self) -> Config:
-        """Read and parse the YAML file, returning Config."""
-        assert self.path.exists(), f"Config file not found: {self.path}"
+    def read(self) -> Ok[Config, ConfigError] | Err[Config, ConfigError]:
+        if not self.path.exists():
+            return Err(ConfigError("file_not_found", f"Config file not found: {self.path}"))
+        try:
+            raw = self.path.read_text(encoding="utf-8")
+        except OSError as exc:
+            return Err(ConfigError("read_error", f"Could not read {self.path}: {exc}"))
 
-        with self.path.open("r") as f:
-            data = yaml.safe_load(f)
+        try:
+            data = yaml.safe_load(raw)
+        except yaml.YAMLError as exc:
+            return Err(ConfigError("invalid_yaml", f"Invalid YAML: {exc}"))
 
-        assert data, "YAML file is empty"
+        if data is None:
+            return Err(ConfigError("empty_yaml", "The configuration file is empty."))
+        if not isinstance(data, dict):
+            return Err(ConfigError("invalid_yaml", "The configuration root must be a mapping."))
 
-        # Read global max_files_per_account (default 1700)
         max_files = data.get("max_files_per_account", 1700)
-        assert isinstance(max_files, int) and max_files > 0, "max_files_per_account must be a positive integer"
+        if not isinstance(max_files, int) or isinstance(max_files, bool) or max_files <= 0:
+            return Err(
+                ConfigError(
+                    "invalid_max_files",
+                    "max_files_per_account must be a positive integer.",
+                )
+            )
 
-        # Read accounts list
-        account_list = data.get("accounts")
-        assert isinstance(account_list, list), "YAML must contain an 'accounts' list"
+        accounts_raw = data.get("accounts")
+        if not isinstance(accounts_raw, list) or not accounts_raw:
+            return Err(
+                ConfigError(
+                    "missing_accounts", "The configuration must define a non-empty 'accounts' list."
+                )
+            )
 
-        accounts = []
-        for acc in account_list:
-            accounts.append(self._parse_account(acc))
+        accounts: list[AccountSpec] = []
+        seen_ids: set[str] = set()
+        seen_names: set[str] = set()
+        for index, item in enumerate(accounts_raw):
+            if not isinstance(item, dict):
+                return Err(ConfigError("invalid_account", f"Account #{index} must be a mapping."))
+            key_id = item.get("account_id")
+            key = item.get("account_key")
+            capacity_mb = item.get("capacity_in_mb")
+            missing = [
+                field
+                for field, value in (("account_id", key_id), ("account_key", key))
+                if not isinstance(value, str) or not value.strip()
+            ]
+            if missing:
+                return Err(
+                    ConfigError(
+                        "missing_account_fields",
+                        f"Account #{index} is missing or has an empty {', '.join(missing)}.",
+                    )
+                )
+            assert isinstance(key_id, str) and isinstance(key, str)
+            key_id = key_id.strip()
+            key = key.strip()
+            if key_id in seen_ids:
+                return Err(
+                    ConfigError(
+                        "duplicate_account",
+                        f"Account #{index} repeats account_id {key_id[:4]}…; account ids must be unique.",
+                    )
+                )
+            seen_ids.add(key_id)
 
-        return Config(max_files_per_account=max_files, accounts=accounts)
+            if capacity_mb is not None:
+                if (
+                    not isinstance(capacity_mb, int)
+                    or isinstance(capacity_mb, bool)
+                    or capacity_mb < 0
+                ):
+                    return Err(
+                        ConfigError(
+                            "invalid_capacity",
+                            f"Account #{index}: capacity_in_mb must be a non-negative integer.",
+                        )
+                    )
+                capacity_bytes = capacity_mb * 1024 * 1024
+            else:
+                capacity_bytes = None
 
-    def _parse_account(self, data: dict[str, Any]) -> AccountConfig:
-        """Parse a single account entry."""
-        account_id = data.get("account_id")
-        account_key = data.get("account_key")
-        capacity_mb = data.get("capacity_in_mb")
+            name = account_name(key_id)
+            if name in seen_names:
+                return Err(
+                    ConfigError(
+                        "duplicate_account_name",
+                        f"Account #{index} derives the same display name {name!r} as another account.",
+                    )
+                )
+            seen_names.add(name)
+            accounts.append(
+                AccountSpec(
+                    name=name,
+                    application_key_id=key_id,
+                    application_key=key,
+                    capacity_bytes=capacity_bytes,
+                )
+            )
 
-        assert all([account_id, account_key]), f"Account missing required fields: {', '.join(k for k, v in [('account_id', account_id), ('account_key', account_key)] if not v)}"
-
-        return AccountConfig(
-            account_id=str(account_id),
-            account_key=str(account_key),
-            capacity_in_mb=capacity_mb,
-        )
+        return Ok(Config(max_files_per_account=max_files, accounts=accounts))

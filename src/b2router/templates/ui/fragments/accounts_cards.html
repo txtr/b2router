@@ -1,0 +1,44 @@
+<div id="accounts-cards" class="row g-3"
+     hx-get="{{ url_for('ui.fragments_accounts') }}"
+     hx-trigger="every 5s"
+     hx-swap="outerHTML">
+  {% for account in accounts %}
+    {% set pct = (account.utilization * 100) %}
+    <div class="col-12 col-md-6 col-xxl-4">
+      <div class="glass h-100" style="padding: 1.05rem;">
+        <div class="d-flex align-items-start justify-content-between gap-2">
+          <div class="min-w-0">
+            <div class="d-inline-flex align-items-center gap-2">
+              <span class="file-icon" style="margin-right: 0"><i class="bi bi-person-badge"></i></span>
+              <span class="fw-semibold text-truncate mono" title="{{ account.name }}">{{ account.name }}</span>
+            </div>
+            <div class="text-secondary small mt-1">{{ account.file_count }} / {{ account.max_files }} file slots used</div>
+          </div>
+          <span class="chip {{ 'danger' if pct >= 95 else ('warn' if pct >= 85 else 'success') }}">{{ '%.1f'|format(pct) }}%</span>
+        </div>
+
+        <div class="d-flex justify-content-between align-items-end mt-3">
+          <div>
+            <div class="eyebrow">Accounted</div>
+            <div class="fs-5 fw-semibold">{{ account.used_bytes|human_size }}</div>
+          </div>
+          <div class="text-end">
+            <div class="eyebrow">Capacity</div>
+            <div class="small text-secondary">{{ account.capacity_bytes|human_size }}</div>
+          </div>
+        </div>
+        <div class="capacity-track progress mt-2 {{ 'danger' if pct >= 95 else ('warn' if pct >= 85 else '') }}" role="progressbar" aria-valuenow="{{ pct }}" aria-valuemin="0" aria-valuemax="100">
+          <div class="progress-bar" style="width: {{ [pct, 100]|min }}%"></div>
+        </div>
+        <div class="d-flex justify-content-between text-secondary small mt-2">
+          <span>{{ account.remaining_files }} slots free</span>
+          <span>{% if account.capacity_bytes %}{{ account.remaining_bytes|human_size }} free{% else %}Unlimited budget{% endif %}</span>
+        </div>
+      </div>
+    </div>
+  {% else %}
+    <div class="col-12">
+      <div class="empty-state glass"><i class="bi bi-person-x"></i><strong>No accounts loaded</strong></div>
+    </div>
+  {% endfor %}
+</div>

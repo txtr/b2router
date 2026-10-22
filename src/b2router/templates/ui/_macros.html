@@ -1,0 +1,74 @@
+{# Small, presentation-only helpers. Keep logic out of page templates. #}
+
+{% macro file_icon(name, content_type) -%}
+  {%- set ext = (name.rsplit('.', 1)[-1] if '.' in name else '')|lower -%}
+  {%- if content_type.startswith('image/') or ext in ['png','jpg','jpeg','gif','webp','svg','avif'] -%}
+    <i class="bi bi-file-earmark-image"></i>
+  {%- elif content_type.startswith('video/') or ext in ['mp4','mov','mkv','webm'] -%}
+    <i class="bi bi-file-earmark-play"></i>
+  {%- elif content_type.startswith('audio/') or ext in ['mp3','wav','flac','ogg'] -%}
+    <i class="bi bi-file-earmark-music"></i>
+  {%- elif content_type == 'application/pdf' or ext == 'pdf' -%}
+    <i class="bi bi-file-earmark-pdf"></i>
+  {%- elif ext in ['zip','gz','tar','7z','rar','xz'] -%}
+    <i class="bi bi-file-earmark-zip"></i>
+  {%- elif ext in ['py','js','ts','html','css','json','yaml','yml','toml','sh','rs','go'] -%}
+    <i class="bi bi-file-earmark-code"></i>
+  {%- elif content_type.startswith('text/') or ext in ['txt','md','csv','log'] -%}
+    <i class="bi bi-file-earmark-text"></i>
+  {%- else -%}
+    <i class="bi bi-file-earmark"></i>
+  {%- endif -%}
+{%- endmacro %}
+
+{% macro state_badge(state) -%}
+  {%- set labels = {
+    'queued': 'Queued',
+    'uploading': 'Uploading',
+    'replacing': 'Replacing',
+    'complete': 'Complete',
+    'partial': 'Partial',
+    'failed': 'Failed',
+    'cancelled': 'Cancelled'
+  } -%}
+  {%- set classes = {
+    'queued': 'violet',
+    'uploading': 'info',
+    'replacing': 'warn',
+    'complete': 'success',
+    'partial': 'warn',
+    'failed': 'danger',
+    'cancelled': 'muted'
+  } -%}
+  <span class="chip {{ classes.get(state, 'muted') }}">{{ labels.get(state, state) }}</span>
+{%- endmacro %}
+
+{% macro operation_badge(operation) -%}
+  {%- if operation == 'upsert' -%}
+    <span class="chip violet"><i class="bi bi-arrow-repeat"></i> Upsert</span>
+  {%- else -%}
+    <span class="chip accent"><i class="bi bi-cloud-arrow-up"></i> Upload</span>
+  {%- endif -%}
+{%- endmacro %}
+
+{% macro result_badge(result) -%}
+  <span class="chip {{ 'success' if result == 'success' else ('warn' if result == 'partial' else 'danger') }}">{{ result|capitalize }}</span>
+{%- endmacro %}
+
+{% macro pagination(view, endpoint) -%}
+  {% if view.pages > 1 %}
+    <nav class="d-flex flex-wrap align-items-center justify-content-between gap-2 mt-3" aria-label="Pagination">
+      <span class="text-secondary small">Page {{ view.page }} of {{ view.pages }} · {{ view.total }} file{{ '' if view.total == 1 else 's' }}</span>
+      <div class="btn-group btn-group-sm">
+        <a class="btn btn-ghost {{ 'disabled' if view.page <= 1 }}"
+           {% if view.page > 1 %}hx-get="{{ url_for(endpoint, q=view.q, account=view.account, sort=view.sort, order=view.order, limit=view.limit, page=view.page - 1) }}" hx-target="#files-panel" hx-swap="outerHTML"{% endif %}>
+          <i class="bi bi-chevron-left"></i>
+        </a>
+        <a class="btn btn-ghost {{ 'disabled' if view.page >= view.pages }}"
+           {% if view.page < view.pages %}hx-get="{{ url_for(endpoint, q=view.q, account=view.account, sort=view.sort, order=view.order, limit=view.limit, page=view.page + 1) }}" hx-target="#files-panel" hx-swap="outerHTML"{% endif %}>
+          <i class="bi bi-chevron-right"></i>
+        </a>
+      </div>
+    </nav>
+  {% endif %}
+{%- endmacro %}

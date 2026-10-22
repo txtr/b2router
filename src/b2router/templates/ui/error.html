@@ -1,0 +1,27 @@
+{% extends "ui/base.html" %}
+{% block title %}{{ problem.title }} · b2router{% endblock %}
+
+{% block content %}
+  <div class="glass mx-auto mt-4 fade-in" style="max-width: 720px;">
+    <div class="panel-body">
+      <div class="d-flex align-items-start gap-3">
+        <div class="file-icon" style="width: 48px; height: 48px; margin-right: 0; font-size: 1.3rem; color: var(--danger); background: rgba(251, 113, 133, 0.12);">
+          <i class="bi bi-exclamation-octagon"></i>
+        </div>
+        <div class="min-w-0">
+          <div class="eyebrow">HTTP {{ problem.status }}</div>
+          <h1 class="h4 mt-1 mb-2">{{ problem.title }}</h1>
+          {% if problem.detail %}<p class="text-secondary mb-3">{{ problem.detail }}</p>{% endif %}
+          <div class="d-flex flex-wrap gap-2">
+            <span class="chip danger mono">{{ problem.code }}</span>
+            {% if request_id %}<span class="chip muted mono">request {{ request_id }}</span>{% endif %}
+          </div>
+          <div class="mt-4 d-flex flex-wrap gap-2">
+            <a class="btn btn-accent btn-sm" href="{{ url_for('ui.dashboard') }}"><i class="bi bi-house"></i> Overview</a>
+            <button class="btn btn-ghost btn-sm" type="button" data-back><i class="bi bi-arrow-left"></i> Back</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+{% endblock %}

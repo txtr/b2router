@@ -1,22 +1,36 @@
 [project]
 name = "b2router"
 version = "0.1.0"
-description = "B2 Account pool management"
+description = "Hardened routing and observability gateway for a pool of Backblaze B2 accounts"
 readme = "README.md"
-license = {text = "MIT"}
+license = { text = "Apache-2.0" }
 requires-python = ">=3.11"
 dependencies = [
     "b2sdk>=2.0.0,<3.0.0",
-    "structlog>=24.1.0",
+    "flask>=3.0.0,<4.0.0",
+    "prometheus-client>=0.20.0",
     "pyyaml>=6.0.1",
-    "flask>=3.0.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "ruff>=0.5.0",
     "mypy>=1.10.0",
+    "pytest>=8.0.0",
+    "ruff>=0.6.0",
 ]
+
+[project.scripts]
+b2router = "b2router.server:main"
+b2router-create-file = "b2router.utils.create_file:main"
+b2router-delete-file = "b2router.utils.delete_file:main"
+b2router-reconcile = "b2router.utils.reconcile:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+exclude = ["b2router.tests", "b2router.tests.*"]
+
+[tool.setuptools.package-data]
+b2router = ["templates/**/*.html", "static/**/*"]
 
 [build-system]
 requires = ["setuptools>=69.0", "wheel"]
@@ -25,9 +39,12 @@ build-backend = "setuptools.build_meta"
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-select = ["E", "F", "I", "UP", "W"]
-ignore = ["E501"]
 src = ["src"]
+exclude = ["src/b2router/tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "W", "B", "C4", "SIM"]
+ignore = ["E501"]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -39,3 +56,10 @@ warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
 strict = true
+exclude = [
+    "src/b2router/tests",
+]
+
+[[tool.mypy.overrides]]
+module = "b2sdk.*"
+ignore_missing_imports = true

@@ -1,0 +1,48 @@
+{% set used_pct = stats.utilization_percent or 0 %}
+<div id="pool-stats" class="stat-grid fade-in"
+     hx-get="{{ url_for('ui.fragments_stats') }}"
+     hx-trigger="every 5s"
+     hx-swap="outerHTML">
+  <div class="glass stat-card">
+    <div class="d-flex align-items-start justify-content-between">
+      <div class="icon"><i class="bi bi-files"></i></div>
+      <span class="chip muted">{{ stats.revision }}</span>
+    </div>
+    <div class="value">{{ stats.files }}</div>
+    <div class="label">Files in the pool</div>
+    <div class="meta">{{ stats.size_human }} of object data</div>
+  </div>
+
+  <div class="glass stat-card violet">
+    <div class="d-flex align-items-start justify-content-between">
+      <div class="icon"><i class="bi bi-hdd-stack"></i></div>
+      <span class="chip {{ 'warn' if used_pct >= 85 else ('danger' if used_pct >= 95 else 'muted') }}">{{ '%.1f'|format(used_pct) }}%</span>
+    </div>
+    <div class="value">{{ stats.used_human }}</div>
+    <div class="label">Accounted bytes</div>
+    <div class="capacity-track progress mt-2 {{ 'danger' if used_pct >= 95 else ('warn' if used_pct >= 85 else '') }}" role="progressbar" aria-valuenow="{{ used_pct }}" aria-valuemin="0" aria-valuemax="100">
+      <div class="progress-bar" style="width: {{ [used_pct, 100]|min }}%"></div>
+    </div>
+    <div class="meta">{{ stats.free_human }} free{% if stats.capacity_bytes %} of {{ stats.capacity_human }}{% endif %}</div>
+  </div>
+
+  <div class="glass stat-card amber">
+    <div class="d-flex align-items-start justify-content-between">
+      <div class="icon"><i class="bi bi-lightning-charge"></i></div>
+      {% if queued_jobs %}<span class="chip warn">{{ queued_jobs }} queued</span>{% endif %}
+    </div>
+    <div class="value">{{ active_jobs }}</div>
+    <div class="label">Transfers in flight</div>
+    <div class="meta">{{ total_jobs }} job{{ '' if total_jobs == 1 else 's' }} in history</div>
+  </div>
+
+  <div class="glass stat-card blue">
+    <div class="d-flex align-items-start justify-content-between">
+      <div class="icon"><i class="bi bi-person-badge"></i></div>
+      <span class="chip accent">pool</span>
+    </div>
+    <div class="value">{{ stats.accounts }}</div>
+    <div class="label">B2 accounts</div>
+    <div class="meta">{{ stats.reserved_bytes|human_size }} held by reservations</div>
+  </div>
+</div>

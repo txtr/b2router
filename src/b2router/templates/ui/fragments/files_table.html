@@ -1,0 +1,80 @@
+{% from "ui/_macros.html" import file_icon, pagination %}
+{% if files %}
+  <div class="table-responsive">
+    <table class="table align-middle">
+      <thead>
+        <tr>
+          <th scope="col">Name</th>
+          <th scope="col">Size</th>
+          <th scope="col">Account</th>
+          <th scope="col">Uploaded</th>
+          {% if show_actions %}<th scope="col" class="text-end">Actions</th>{% endif %}
+        </tr>
+      </thead>
+      <tbody>
+        {% for file in files %}
+          <tr>
+            <td>
+              <span class="file-icon">{{ file_icon(file.file_name, file.content_type) }}</span>
+              <a class="file-name" href="{{ url_for('ui.download', file_name=file.file_name) }}" title="{{ file.file_name }}">
+                {{ file.file_name }}
+              </a>
+            </td>
+            <td class="text-secondary mono small">{{ file.size|human_size }}</td>
+            <td>
+              {% for account in file.accounts %}
+                <span class="chip accent">{{ account }}</span>
+              {% endfor %}
+            </td>
+            <td class="text-secondary small">{{ file.upload_timestamp|pretty_ts }}</td>
+            {% if show_actions %}
+              <td class="text-end">
+                <div class="d-inline-flex gap-1">
+                  <a class="btn btn-ghost btn-icon" href="{{ url_for('ui.download', file_name=file.file_name) }}" title="Download {{ file.file_name }}" aria-label="Download">
+                    <i class="bi bi-download"></i>
+                  </a>
+                  <a class="btn btn-ghost btn-icon" href="{{ url_for('ui.uploads', replace=file.file_name, replace_etag=file.etag) }}" title="Replace this file" aria-label="Replace">
+                    <i class="bi bi-arrow-repeat"></i>
+                  </a>
+                  <form method="post" action="{{ url_for('ui.delete_file') }}"
+                        hx-post="{{ url_for('ui.delete_file') }}"
+                        hx-target="#files-panel" hx-swap="outerHTML"
+                        hx-confirm="Delete {{ file.file_name }} from B2 and the cache?">
+                    <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+                    <input type="hidden" name="name" value="{{ file.file_name }}">
+                    <input type="hidden" name="etag" value="{{ file.etag }}">
+                    <input type="hidden" name="q" value="{{ view.q }}">
+                    <input type="hidden" name="account" value="{{ view.account }}">
+                    <input type="hidden" name="sort" value="{{ view.sort }}">
+                    <input type="hidden" name="order" value="{{ view.order }}">
+                    <input type="hidden" name="limit" value="{{ view.limit }}">
+                    <input type="hidden" name="page" value="{{ view.page }}">
+                    <button class="btn btn-ghost btn-icon text-danger" type="submit" title="Delete" aria-label="Delete">
+                      <i class="bi bi-trash3"></i>
+                    </button>
+                  </form>
+                </div>
+              </td>
+            {% endif %}
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if show_actions %}{{ pagination(view, 'ui.fragments_files') }}{% endif %}
+{% else %}
+  <div class="empty-state">
+    <i class="bi bi-inboxes"></i>
+    <strong>No files match this view</strong>
+    <span class="small">
+      {% if view and (view.q or view.account) %}
+        Try clearing the search or account filter.
+      {% else %}
+        Upload a file to see it here.
+      {% endif %}
+    </span>
+    {% if show_actions %}
+      <div class="mt-3"><a class="btn btn-accent btn-sm" href="{{ url_for('ui.uploads') }}"><i class="bi bi-cloud-arrow-up"></i> Upload a file</a></div>
+    {% endif %}
+  </div>
+{% endif %}

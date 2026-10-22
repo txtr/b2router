@@ -1,178 +1,272 @@
+"""Flask application factory and cross-cutting HTTP concerns.
+
+The API blueprint owns resources; this module owns identity (request/client
+ids), authentication, rate limiting, CORS, metrics, logging and problem
+responses. It is also the only place that knows about the runtime container.
+"""
+
 from __future__ import annotations
 
-from datetime import datetime
+import hmac
+import logging
+import math
+import re
+import secrets
+import time
+import uuid
 from typing import Any
 
-from flask import (
-    Flask,
-    Response,
-    abort,
-    make_response,
-    render_template,
-    request,
-    stream_with_context,
+from flask import Flask, Response, g, request
+
+from b2router import metrics
+from b2router.api.routes import bp
+from b2router.errors import Problem, register_error_handlers
+from b2router.logging_setup import (
+    client_label_var,
+    configure_logging,
+    job_id_var,
+    log_event,
+    request_id_var,
 )
+from b2router.ratelimit import RateLimiter
+from b2router.runtime import Runtime
+from b2router.services.audit import AuditLog
+from b2router.services.pool import AccountPool
+from b2router.services.uploads import UploadManager
+from b2router.settings import Settings
+from b2router.ui import ui_bp
+from b2router.utils.formatters import format_iso, format_timestamp, human_size
 
-from b2router.services import account_pool
+logger = logging.getLogger("b2router.web")
 
+REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+CLIENT_RE = re.compile(r"^[A-Za-z0-9._ @-]{1,64}$")
 
-def _format_files(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Map raw cache entries (from FileCacheEntry.to_dict) into template dicts."""
-    def _fmt_ts(ts):
-        """Format upload timestamp to human-readable string."""
-        if ts is None:
-            return "-"
-        try:
-            # ts is milliseconds since epoch (13-digit number)
-            dt = datetime.fromtimestamp(ts / 1000)
-            return dt.strftime("%Y-%m-%d %H:%M")
-        except (ValueError, OSError):
-            return str(ts)
-
-    formatted = []
-    for f in raw:
-        formatted.append({
-            "file_name": f["file_name"],
-            "file_id": f["file_id"],
-            "size": f["size"],
-            "size_mb": round(f["size"] / (1024 * 1024), 2),
-            "content_type": f["content_type"],
-            "upload_time": _fmt_ts(f["upload_timestamp"]),
-            "action": f["action"],
-            "accounts": f["accounts"],
-        })
-    return formatted
-def _format_stats(stats: dict[str, Any]) -> dict[str, Any]:
-    def _human_size(n_bytes: int) -> str:
-        """Format bytes into human-readable B/KB/MB/GB/TB."""
-        for unit in ("B", "KB", "MB", "GB", "TB"):
-            if n_bytes < 1024 or unit == "TB":
-                if unit == "B":
-                    return f"{n_bytes} {unit}"
-                return f"{round(n_bytes, 1)} {unit}"
-            n_bytes /= 1024
-
-    free_bytes = stats["total_free_bytes"]
-    used_bytes = stats["total_used_bytes"]
-    capacity_bytes = stats["total_capacity_bytes"]
-    return {
-        "total_free_space": "Unlimited" if capacity_bytes == 0 else _human_size(free_bytes),
-        "total_used_space": _human_size(used_bytes),
-        "number_of_files": stats["number_of_files"],
-        "number_of_accounts": stats["number_of_accounts"],
-    }
+_CORS_HEADERS = {
+    "Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers": (
+        "Authorization, Content-Type, If-Match, If-None-Match, "
+        "Idempotency-Key, X-Client-Name, X-Request-ID"
+    ),
+    "Access-Control-Expose-Headers": (
+        "ETag, Location, Retry-After, X-Request-ID, X-B2Router-Revision"
+    ),
+    "Access-Control-Max-Age": "600",
+}
 
 
-def create_app() -> Flask:
-    app = Flask(__name__)
-    app.secret_key = "dev-secret-change-in-production"
+def _client_address(settings: Settings) -> str:
+    if settings.trust_proxy:
+        forwarded = request.headers.get("X-Forwarded-For", "")
+        if forwarded:
+            return forwarded.split(",", 1)[0].strip() or "unknown"
+    return request.remote_addr or "unknown"
 
-    @app.route("/")
-    def index():
-        files = _format_files(account_pool.list_files())
-        stats = _format_stats(account_pool.file_cache_stats())
-        return render_template("index.html", files=files, stats=stats)
 
-    @app.route("/files")
-    def files_fragment():
-        """HTMX fragment: full file table (optionally filtered by ?q=)."""
-        q = request.args.get("q", "").strip()
-        files = _format_files(account_pool.list_files())
-        if q:
-            files = [f for f in files if q.lower() in f["file_name"].lower()]
-        return render_template("fragments/files_table.html", files=files, query=q)
+def _client_label(settings: Settings) -> str:
+    explicit = request.headers.get("X-Client-Name", "").strip()
+    if explicit and CLIENT_RE.match(explicit):
+        return explicit
+    if settings.api_token:
+        return "operator"
+    return _client_address(settings)
 
-    @app.route("/stats")
-    def stats_fragment():
-        """HTMX fragment: account-pool statistics."""
-        stats = _format_stats(account_pool.file_cache_stats())
-        return render_template("fragments/stats.html", stats=stats)
 
-    @app.route("/upload", methods=["POST"])
-    def upload():
-        """Handle HTMX file upload: flash messages + OOB refresh of table/stats."""
-        messages: list[dict[str, Any]] = []
-        for file in request.files.getlist("file"):
-            if not file.filename:
-                continue
-            content = file.read()
-            content_type = file.content_type or "application/octet-stream"
-            try:
-                account = account_pool.upload_file(
-                    file.filename, content, content_type
+def _allowed_origin(settings: Settings) -> str | None:
+    origin = request.headers.get("Origin")
+    if origin and origin in settings.cors_origins:
+        return origin
+    return None
+
+
+def create_app(
+    settings: Settings | None = None,
+    *,
+    pool: AccountPool | None = None,
+    manager: UploadManager | None = None,
+    audit: AuditLog | None = None,
+    configure_logs: bool = True,
+) -> Flask:
+    settings = settings or Settings.from_env()
+    if configure_logs:
+        configure_logging(settings.log_level, settings.log_format)
+
+    pool = pool or AccountPool()
+    audit = audit or AuditLog(maxlen=max(settings.job_history_max, 1000))
+    manager = manager or UploadManager(pool, audit, settings)
+    runtime = Runtime(settings=settings, pool=pool, manager=manager, audit=audit)
+
+    app = Flask(
+        __name__,
+        static_folder="static",
+        static_url_path="/static",
+        template_folder="templates",
+    )
+    app.extensions["b2router"] = runtime
+    app.config["MAX_CONTENT_LENGTH"] = (
+        settings.max_upload_bytes * settings.max_files_per_request + 1024 * 1024
+    )
+    app.config["SETTINGS"] = settings
+    app.secret_key = settings.secret_key or secrets.token_hex(32)
+    app.config.update(
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Strict",
+        SESSION_COOKIE_SECURE=settings.cookie_secure,
+    )
+    app.json.sort_keys = False  # type: ignore[attr-defined]
+
+    app.register_blueprint(bp)
+    app.register_blueprint(ui_bp)
+    app.jinja_env.filters["human_size"] = human_size
+    app.jinja_env.filters["pretty_ts"] = format_timestamp
+    app.jinja_env.filters["pretty_iso"] = format_iso
+    register_error_handlers(app)
+
+    limiter = RateLimiter(settings.mutation_rate_per_minute)
+    app.extensions["b2router_limiter"] = limiter
+    app.extensions["b2router_metrics_enabled"] = settings.metrics_enabled
+
+    @app.before_request
+    def _before() -> Response | None:
+        request_id = request.headers.get("X-Request-ID", "")
+        if not REQUEST_ID_RE.match(request_id):
+            request_id = f"req_{uuid.uuid4().hex[:16]}"
+        g.request_id = request_id
+        request_id_var.set(request_id)
+        job_id_var.set(None)
+
+        client = _client_label(settings)
+        g.client_label = client
+        client_label_var.set(client)
+        g.request_started = time.monotonic()
+
+        origin = _allowed_origin(settings)
+        if request.method == "OPTIONS" and origin:
+            response = Response(status=204)
+            response.headers.update(_CORS_HEADERS)
+            response.headers["Access-Control-Allow-Origin"] = origin
+            return response
+
+        mutating_api = request.method in {"POST", "PUT", "PATCH", "DELETE"} and (
+            request.path.startswith("/api/")
+        )
+        mutating_ui = (
+            request.method in {"POST", "PUT", "PATCH", "DELETE"}
+            and request.path.startswith("/ui/")
+            and not request.path.startswith("/ui/login")
+        )
+        if mutating_api or mutating_ui:
+            # Limit before authentication so failed bearer guesses cannot
+            # bypass the mutation budget. Key by network identity, never by the
+            # self-declared X-Client-Name header.
+            allowed, retry_after = limiter.allow(_client_address(settings))
+            if not allowed:
+                raise Problem(
+                    "too_many_requests",
+                    "Too many mutations; slow down and retry.",
+                    headers={"Retry-After": str(max(1, math.ceil(retry_after)))},
+                    extensions={"retry_after_seconds": round(retry_after, 3)},
                 )
-                messages.append({
-                    "type": "success",
-                    "text": f"Uploaded “{file.filename}” to {account.name} ({len(content):,} bytes)",
-                })
-            except AssertionError as e:
-                messages.append({"type": "error", "text": f"“{file.filename}”: {e}"})
-            except Exception as e:
-                messages.append({"type": "error", "text": f"“{file.filename}”: {e}"})
 
-        # Refresh the file table and stats out-of-band; re-render the form
-        # (with messages) into #upload-region.
-        table_html = render_template(
-            "fragments/files_table.html",
-            files=_format_files(account_pool.list_files()),
+        protected = request.path.startswith("/api/") or request.path == "/metrics"
+        if settings.api_token and protected and request.method != "OPTIONS":
+            supplied = request.headers.get("Authorization", "")
+            expected = f"Bearer {settings.api_token}"
+            if not hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8")):
+                raise Problem(
+                    "unauthorized",
+                    "A valid bearer token is required.",
+                    headers={"WWW-Authenticate": 'Bearer realm="b2router"'},
+                )
+
+        upload_request = request.method in {"POST", "PUT"} and (
+            request.path == "/api/files" or request.path.startswith("/api/files/")
         )
-        stats_html = render_template(
-            "fragments/stats.html",
-            stats=_format_stats(account_pool.file_cache_stats()),
+        if upload_request and manager.queued_count() >= settings.queue_max:
+            # Reject before Flask parses/spools the multipart body. This keeps a
+            # saturated queue from consuming the full aggregate body allowance.
+            raise Problem(
+                "queue_full",
+                "The upload queue is full; retry once active uploads finish.",
+                headers={"Retry-After": "5"},
+                extensions={"queue_max": settings.queue_max},
+            )
+        return None
+
+    @app.after_request
+    def _after(response: Response) -> Response:
+        response.headers["X-Request-ID"] = getattr(g, "request_id", "-")
+        response.headers["X-B2Router-Revision"] = str(runtime.pool.revision)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; base-uri 'none'; object-src 'none'; "
+            "frame-ancestors 'none'; form-action 'self'; img-src 'self' data:; "
+            "font-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "script-src 'self' 'unsafe-eval'; connect-src 'self'"
         )
-        form_html = render_template("fragments/upload_form.html", messages=messages)
+        if (
+            request.path.startswith("/api/")
+            or request.path.startswith("/ui/")
+            or request.path in {"/health", "/ready"}
+        ):
+            response.headers.setdefault("Cache-Control", "no-store")
+        origin = _allowed_origin(settings)
+        if origin:
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Vary"] = "Origin"
+            for key, value in _CORS_HEADERS.items():
+                response.headers.setdefault(key, value)
 
-        body = (
-            f'<div id="file-table" hx-swap-oob="true">{table_html}</div>'
-            f'<div id="stats-region" hx-swap-oob="true">{stats_html}</div>'
-            f"{form_html}"
+        started = getattr(g, "request_started", time.monotonic())
+        duration = time.monotonic() - started
+        route = request.url_rule.rule if request.url_rule is not None else "unmatched"
+        status = response.status_code
+        metrics.record_request(request.method, route, status, duration)
+        noisy = request.path in {"/health", "/ready", "/metrics"}
+        log_event(
+            "http.request",
+            level=logging.DEBUG if noisy else (logging.WARNING if status >= 500 else logging.INFO),
+            method=request.method,
+            path=request.path,
+            route=route,
+            status=status,
+            duration_ms=round(duration * 1000, 2),
+            bytes=response.content_length if response.content_length is not None else -1,
+            client=getattr(g, "client_label", None),
         )
-        resp = make_response(body)
-        resp.headers["Content-Type"] = "text/html; charset=utf-8"
-        return resp
+        return response
 
-    @app.route("/download/<path:file_name>")
-    def download_file(file_name: str):
-        """Stream file download from B2."""
-        accounts = account_pool.get_file_accounts(file_name)
-        if not accounts:
-            abort(404, description=f"File '{file_name}' not found in any account")
-        account_name = accounts[0]
-        account = account_pool[account_name]
-
-        downloaded = account.bucket.download_file_by_name(file_name)
-        file_info = account_pool.get_file(file_name)
-        content_type = file_info.content_type if file_info else "application/octet-stream"
-
-        def generate():
-            with downloaded.response as r:
-                r.raise_for_status()
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        yield chunk
-
-        return Response(
-            stream_with_context(generate()),
-            headers={
-                "Content-Type": content_type,
-                "Content-Disposition": f'attachment; filename="{file_name}"',
-            },
-        )
-
-    @app.route("/api/files")
-    def api_files():
-        """JSON: file cache + stats."""
-        return {"files": account_pool.list_files(), "stats": account_pool.file_cache_stats()}
-
-    @app.route("/api/accounts")
-    def api_accounts():
-        """JSON: active accounts + stats."""
-        return {"active": account_pool.names(), "stats": account_pool.stats()}
+    @app.teardown_request
+    def _teardown(_exc: BaseException | None) -> None:
+        request_id_var.set(None)
+        client_label_var.set(None)
+        job_id_var.set(None)
 
     return app
 
 
-def run_server(host: str = "0.0.0.0", port: int = 8000, debug: bool = False) -> None:
-    """Run the Flask development server."""
-    app = create_app()
-    app.run(host=host, port=port, debug=debug)
+def shutdown_app(app: Flask) -> None:
+    runtime: Any = app.extensions.get("b2router")
+    if runtime is not None:
+        runtime.shutdown()
+
+
+def run_server(
+    settings: Settings | None = None,
+    *,
+    pool: AccountPool | None = None,
+    manager: UploadManager | None = None,
+) -> None:
+    """Run the development server (threaded; single process by design)."""
+    settings = settings or Settings.from_env()
+    app = create_app(settings, pool=pool, manager=manager)
+    app.run(
+        host=settings.host,
+        port=settings.port,
+        threaded=True,
+        use_reloader=False,
+        debug=False,
+    )

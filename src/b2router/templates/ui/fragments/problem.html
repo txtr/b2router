@@ -1,0 +1,8 @@
+<div class="alert alert-danger d-flex gap-2 align-items-start" role="alert">
+  <i class="bi bi-exclamation-octagon mt-1"></i>
+  <div>
+    <div class="fw-semibold">{{ title|default(problem.title if problem else 'Something went wrong') }}</div>
+    {% if detail %}<div class="small">{{ detail }}</div>{% endif %}
+    {% if code %}<div class="small mono text-secondary mt-1">{{ code }}{% if request_id %} · {{ request_id }}{% endif %}</div>{% endif %}
+  </div>
+</div>

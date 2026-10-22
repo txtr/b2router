@@ -1,99 +1,128 @@
-#!/usr/bin/env python3
-"""Test script to validate ConfigReader parsing and output structured results."""
+"""accounts.yaml validation."""
 
-import json
-import sys
+from __future__ import annotations
+
 from pathlib import Path
 
 from b2router.core.config_reader import ConfigReader
+from b2router.services.pool import Err, Ok
 
 
-def test_config_reader(config_file: str = "accounts.yaml") -> dict:
-    """Test ConfigReader and return structured results for programmatic use."""
-    reader = ConfigReader(config_file)
-    config = reader.read()
-
-    results = {
-        "config_file": config_file,
-        "max_files_per_account": config.max_files_per_account,
-        "total_accounts": len(config.accounts),
-        "accounts": [],
-        "errors": [],
-        "warnings": [],
-    }
-
-    for acc in config.accounts:
-        if not acc.account_id:
-            results["errors"].append(f"{acc.name}: missing account_id")
-        if not acc.account_key:
-            results["errors"].append(f"{acc.name}: missing account_key")
-        if acc.capacity_in_mb is not None and acc.capacity_in_mb <= 0:
-            results["warnings"].append(f"{acc.name}: capacity_in_mb should be positive")
-
-        account_data = {
-            "name": acc.name,
-            "account_id": acc.account_id,
-            "account_key_masked": f"{acc.account_key[:8]}...{acc.account_key[-8:]}",
-            "capacity_in_mb": acc.capacity_in_mb,
-            "capacity_bytes": acc.capacity_bytes,
-        }
-        results["accounts"].append(account_data)
-
-    return results
+def _write(tmp_path: Path, text: str) -> Path:
+    path = tmp_path / "accounts.yaml"
+    path.write_text(text, encoding="utf-8")
+    return path
 
 
-def print_results(results: dict) -> None:
-    """Print formatted results to stdout."""
-    print(f"Config file: {results['config_file']}")
-    print(f"Max files per account: {results['max_files_per_account']}")
-    print(f"Total accounts: {results['total_accounts']}")
-    print("=" * 60)
-
-    for acc in results["accounts"]:
-        print(f"\n--- {acc['name']} ---")
-        print(f"  account_id: {acc['account_id']}")
-        print(f"  account_key: {acc['account_key_masked']}")
-        print(f"  capacity_in_mb: {acc['capacity_in_mb']}")
-        print(f"  capacity_bytes: {acc['capacity_bytes']}")
-
-    if results["warnings"]:
-        print("\n⚠️  Warnings:")
-        for w in results["warnings"]:
-            print(f"  - {w}")
-
-    if results["errors"]:
-        print("\n❌ Errors:")
-        for e in results["errors"]:
-            print(f"  - {e}")
-
-    print("\n" + "=" * 60)
-    status = "PASS" if not results["errors"] else "FAIL"
-    print(f"Validation: {status}")
+def test_valid_config(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path,
+        """
+max_files_per_account: 42
+accounts:
+  - account_id: aaaa1111bbbb
+    account_key: secret-one
+    capacity_in_mb: 10
+  - account_id: cccc2222dddd
+    account_key: secret-two
+""",
+    )
+    result = ConfigReader(path).read()
+    assert isinstance(result, Ok)
+    config = result.value
+    assert config.max_files_per_account == 42
+    assert [account.name for account in config.accounts] == [
+        "account-aaaa1111",
+        "account-cccc2222",
+    ]
+    assert config.accounts[0].capacity_bytes == 10 * 1024 * 1024
+    assert config.accounts[1].capacity_bytes is None
 
 
-def main(config_file: str = "accounts.yaml", output_json: bool = False) -> int:
-    """Run test and return exit code (0=success, 1=validation errors)."""
-    path = Path(config_file)
-    if not path.exists():
-        print(f"Error: Config file not found: {config_file}")
-        return 1
-
-    results = test_config_reader(config_file)
-
-    if output_json:
-        print(json.dumps(results, indent=2))
-    else:
-        print_results(results)
-
-    return 0 if not results["errors"] else 1
+def test_missing_file(tmp_path: Path) -> None:
+    result = ConfigReader(tmp_path / "nope.yaml").read()
+    assert isinstance(result, Err)
+    assert result.error.kind == "file_not_found"
 
 
-if __name__ == "__main__":
-    import argparse
+def test_empty_file(tmp_path: Path) -> None:
+    result = ConfigReader(_write(tmp_path, "")).read()
+    assert isinstance(result, Err)
+    assert result.error.kind == "empty_yaml"
 
-    parser = argparse.ArgumentParser(description="Test ConfigReader parsing")
-    parser.add_argument("config_file", nargs="?", default="accounts.yaml", help="Path to accounts.yaml")
-    parser.add_argument("--json", action="store_true", help="Output JSON for programmatic use")
-    args = parser.parse_args()
 
-    sys.exit(main(args.config_file, args.json))
+def test_root_must_be_mapping(tmp_path: Path) -> None:
+    result = ConfigReader(_write(tmp_path, "- one\n- two\n")).read()
+    assert isinstance(result, Err)
+    assert result.error.kind == "invalid_yaml"
+
+
+def test_missing_accounts(tmp_path: Path) -> None:
+    result = ConfigReader(_write(tmp_path, "max_files_per_account: 10\n")).read()
+    assert isinstance(result, Err)
+    assert result.error.kind == "missing_accounts"
+
+
+def test_duplicate_account_id(tmp_path: Path) -> None:
+    result = ConfigReader(
+        _write(
+            tmp_path,
+            """
+accounts:
+  - account_id: same-id
+    account_key: one
+  - account_id: same-id
+    account_key: two
+""",
+        )
+    ).read()
+    assert isinstance(result, Err)
+    assert result.error.kind == "duplicate_account"
+
+
+def test_missing_credentials_do_not_echo_secrets(tmp_path: Path) -> None:
+    result = ConfigReader(
+        _write(
+            tmp_path,
+            """
+accounts:
+  - account_id: aaaa1111
+    account_key: super-secret-value
+  - account_id: bbbb2222
+""",
+        )
+    ).read()
+    assert isinstance(result, Err)
+    assert "super-secret-value" not in result.error.message
+
+
+def test_invalid_capacity(tmp_path: Path) -> None:
+    result = ConfigReader(
+        _write(
+            tmp_path,
+            """
+accounts:
+  - account_id: aaaa1111
+    account_key: value
+    capacity_in_mb: -1
+""",
+        )
+    ).read()
+    assert isinstance(result, Err)
+    assert result.error.kind == "invalid_capacity"
+
+
+def test_invalid_max_files(tmp_path: Path) -> None:
+    result = ConfigReader(
+        _write(
+            tmp_path,
+            """
+max_files_per_account: 0
+accounts:
+  - account_id: aaaa1111
+    account_key: value
+""",
+        )
+    ).read()
+    assert isinstance(result, Err)
+    assert result.error.kind == "invalid_max_files"

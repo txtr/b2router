@@ -1,0 +1,71 @@
+<div id="audit-panel">
+  <div class="glass">
+    <div class="panel-head">
+      <div>
+        <h2 class="panel-title"><i class="bi bi-activity"></i> Mutation audit</h2>
+        <div class="text-secondary small mt-1">Bounded ring buffer · {{ audit_total }} entries · newest first</div>
+      </div>
+      <div class="d-flex gap-2">
+        <button class="btn btn-ghost btn-sm" type="button"
+                hx-get="{{ url_for('ui.fragments_audit', action=audit_action, result=audit_result, limit=audit_limit, page=audit_page) }}"
+                hx-target="#audit-panel" hx-swap="outerHTML" title="Refresh">
+          <i class="bi bi-arrow-clockwise"></i>
+        </button>
+        {% if not api_token_enabled %}
+          <a class="btn btn-ghost btn-sm" href="/api/audit" target="_blank" rel="noopener"><i class="bi bi-braces"></i></a>
+        {% endif %}
+      </div>
+    </div>
+    <div class="panel-body pb-2">
+      <form class="row g-2 align-items-center mb-3"
+            hx-get="{{ url_for('ui.fragments_audit') }}" hx-target="#audit-panel"
+            hx-swap="outerHTML" hx-trigger="submit" hx-indicator="#audit-spinner">
+        <div class="col-6 col-md-3">
+          <select class="form-select form-select-sm" name="action" aria-label="Action filter">
+            <option value="" {{ 'selected' if not audit_action }}>All actions</option>
+            {% for value in ['upload', 'upsert', 'delete'] %}
+              <option value="{{ value }}" {{ 'selected' if audit_action == value }}>{{ value|capitalize }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col-6 col-md-3">
+          <select class="form-select form-select-sm" name="result" aria-label="Result filter">
+            <option value="" {{ 'selected' if not audit_result }}>All results</option>
+            {% for value in ['success', 'partial', 'failed'] %}
+              <option value="{{ value }}" {{ 'selected' if audit_result == value }}>{{ value|capitalize }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col-6 col-md-2">
+          <select class="form-select form-select-sm" name="limit" aria-label="Page size">
+            {% for size in [25, 50, 100] %}
+              <option value="{{ size }}" {{ 'selected' if audit_limit == size }}>{{ size }} rows</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col-6 col-md-2">
+          <button class="btn btn-ghost btn-sm w-100" type="submit"><i class="bi bi-funnel"></i> Filter</button>
+        </div>
+        <div class="col-12 col-md-2 text-md-end">
+          <span id="audit-spinner" class="htmx-indicator chip accent"><i class="bi bi-arrow-repeat"></i> Loading</span>
+        </div>
+      </form>
+
+      {% include "ui/fragments/audit_table.html" %}
+
+      {% if audit_pages > 1 %}
+        <div class="d-flex justify-content-between align-items-center mt-3">
+          <span class="text-secondary small">Page {{ audit_page }} of {{ audit_pages }} · {{ audit_total }} entries</span>
+          <div class="btn-group btn-group-sm">
+            <button class="btn btn-ghost" {{ 'disabled' if audit_page <= 1 }}
+                    hx-get="{{ url_for('ui.fragments_audit', action=audit_action, result=audit_result, limit=audit_limit, page=audit_page - 1) }}"
+                    hx-target="#audit-panel" hx-swap="outerHTML"><i class="bi bi-chevron-left"></i></button>
+            <button class="btn btn-ghost" {{ 'disabled' if audit_page >= audit_pages }}
+                    hx-get="{{ url_for('ui.fragments_audit', action=audit_action, result=audit_result, limit=audit_limit, page=audit_page + 1) }}"
+                    hx-target="#audit-panel" hx-swap="outerHTML"><i class="bi bi-chevron-right"></i></button>
+          </div>
+        </div>
+      {% endif %}
+    </div>
+  </div>
+</div>
