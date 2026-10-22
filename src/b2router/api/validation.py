@@ -117,21 +117,8 @@ def choice_arg(request: Request, name: str, choices: set[str], *, default: str) 
     return value
 
 
-def parse_etag(header: str | None) -> str | None:
-    """Return the identifier from ``If-Match``/``If-None-Match``."""
-    if header is None:
-        return None
-    value = header.strip()
-    if value == "*":
-        return "*"
-    if value.startswith("W/"):
-        value = value[2:].strip()
-    if len(value) >= 2 and value[0] == value[-1] == '"':
-        value = value[1:-1]
-    return value
-
-
 def etag_matches(header: str | None, etag: str) -> bool:
+    """Weak comparison for ``If-None-Match`` (and ETag-based cache checks)."""
     if header is None:
         return False
     stripped = header.strip()
@@ -140,6 +127,27 @@ def etag_matches(header: str | None, etag: str) -> bool:
     candidates = [part.strip() for part in stripped.split(",")]
     normalised = {candidate.removeprefix("W/").strip('"') for candidate in candidates}
     return etag in normalised
+
+
+def if_match(header: str | None, etag: str) -> bool:
+    """Strong comparison for ``If-Match``.
+
+    HTTP requires strong comparison for If-Match: weak validators and malformed
+    list elements never satisfy it. A missing header imposes no precondition.
+    """
+    if header is None:
+        return True
+    stripped = header.strip()
+    if stripped == "*":
+        return True
+    for candidate in (part.strip() for part in stripped.split(",")):
+        if candidate.startswith("W/"):
+            continue
+        if candidate.startswith('"') and candidate.endswith('"'):
+            candidate = candidate[1:-1]
+        if candidate == etag:
+            return True
+    return False
 
 
 def make_etag(*parts: object) -> str:
@@ -210,6 +218,31 @@ class SpooledUpload:
     content_type: str
     path: str
     size: int
+
+
+def ensure_upload_space(temp_dir: str, content_length: int | None) -> None:
+    """Reject an upload whose parsed multipart body would exhaust staging space.
+
+    Flask/Werkzeug parses multipart bodies before route code runs. Checking the
+    declared length here avoids spooling gigabytes and only discovering the
+    disk is full in ``spool_upload`` afterwards.
+    """
+    if content_length is None:
+        return
+    try:
+        os.makedirs(temp_dir, mode=0o700, exist_ok=True)
+        free = shutil.disk_usage(temp_dir).free
+    except OSError as exc:
+        raise Problem(
+            "service_unavailable",
+            "The upload staging area is unavailable.",
+        ) from exc
+    if content_length + MIN_SPOOL_FREE_BYTES > free:
+        raise Problem(
+            "insufficient_storage",
+            "The upload staging area does not have enough free space for this request.",
+            status=507,
+        )
 
 
 def spool_upload(

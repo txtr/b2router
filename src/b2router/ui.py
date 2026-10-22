@@ -45,7 +45,7 @@ _login_limiter = RateLimiter(12, burst=12)
 FILE_SORTS = {"name", "size", "uploaded"}
 ORDERS = {"asc", "desc"}
 AUDIT_ACTIONS = {"upsert", "delete"}
-AUDIT_RESULTS = {"success", "partial", "failed"}
+AUDIT_RESULTS = {"success", "partial", "failed", "cancelled"}
 EMPTY_JOB_FRAGMENT = '<div class="job-missing"></div>'
 
 
@@ -249,7 +249,7 @@ def _guard() -> Any:
                 extensions={"queue_max": rt.settings.queue_max},
             )
 
-    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and not _csrf_valid():
+    if request.method in {"POST", "DELETE"} and not _csrf_valid():
         raise Problem("forbidden", "Invalid or missing CSRF token. Reload the page and retry.")
     return None
 
@@ -326,7 +326,10 @@ def login_submit() -> Any:
     if not settings.api_token:
         return redirect(url_for("ui.dashboard"))
 
-    allowed, retry_after = _login_limiter.allow(f"login:{request.remote_addr or 'unknown'}")
+    # Use the same trusted-proxy-aware address as the mutation limiter. A raw
+    # ``remote_addr`` keys everyone behind a reverse proxy to the proxy itself.
+    client_address = getattr(g, "client_address", None) or request.remote_addr or "unknown"
+    allowed, retry_after = _login_limiter.allow(f"login:{client_address}")
     if not allowed:
         time.sleep(min(retry_after, 1.0))
         return (
@@ -531,7 +534,7 @@ def delete_file() -> Any:
     delete_file_entry(
         rt,
         name,
-        expected_etag=request.form.get("etag") or None,
+        if_match_header=request.form.get("etag") or None,
         request_id=request_id_var.get(),
         client=getattr(g, "client_label", None),
     )

@@ -31,7 +31,7 @@
         <div class="col-6 col-md-3">
           <select class="form-select form-select-sm" name="result" aria-label="Result filter">
             <option value="" {{ 'selected' if not audit_result }}>All results</option>
-            {% for value in ['success', 'partial', 'failed'] %}
+            {% for value in ['success', 'partial', 'failed', 'cancelled'] %}
               <option value="{{ value }}" {{ 'selected' if audit_result == value }}>{{ value|capitalize }}</option>
             {% endfor %}
           </select>

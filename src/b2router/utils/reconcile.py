@@ -140,7 +140,9 @@ def main(argv: list[str] | None = None) -> int:
                     "stale": [version.to_dict() for version in stale],
                 }
             )
-            if not args.apply:
+            # Never delete when one account could not be listed: the missing
+            # versions may be the real keeper, or may still exist remotely.
+            if not args.apply or account_errors:
                 continue
             for stale_ref in stale:
                 client = clients[stale_ref.account]
@@ -164,15 +166,21 @@ def main(argv: list[str] | None = None) -> int:
                         }
                     )
 
+        apply_refused = bool(args.apply and account_errors)
         report = {
             "ok": not failed and not account_errors,
-            "applied": args.apply,
+            "applied": bool(args.apply and not account_errors),
+            "apply_refused": apply_refused,
             "duplicate_files": len(groups),
             "groups": groups,
             "deleted": deleted,
             "failed": failed,
             "account_errors": account_errors,
         }
+        if apply_refused:
+            report["message"] = (
+                "Refusing to delete anything because at least one account could not be listed."
+            )
         print(json.dumps(report, indent=2 if args.pretty else None))
         return 0 if report["ok"] else 1
     finally:

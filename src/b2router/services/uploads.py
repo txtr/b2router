@@ -12,6 +12,7 @@ accounting both prefer predictable throughput over unbounded parallelism.
 
 from __future__ import annotations
 
+import builtins
 import contextlib
 import logging
 import os
@@ -29,8 +30,8 @@ from typing import Any
 from b2sdk.v2 import AbstractProgressListener
 
 from b2router import metrics
-from b2router.logging_setup import job_id_var, log_event, request_id_var
-from b2router.services.account import StorageError
+from b2router.logging_setup import client_label_var, job_id_var, log_event, request_id_var
+from b2router.services.account import FileVersion, StorageBackend, StorageError
 from b2router.services.audit import AuditLog
 from b2router.services.pool import (
     AccountPool,
@@ -97,26 +98,27 @@ class UploadJob:
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def snapshot(self) -> dict[str, Any]:
-        return {
-            "id": self.id,
-            "operation": self.operation,
-            "file_name": self.file_name,
-            "file_size": self.file_size,
-            "content_type": self.content_type,
-            "account_name": self.account_name,
-            "state": self.state.value,
-            "progress": round(self.progress, 4),
-            "bytes_sent": self.bytes_sent,
-            "error": self.error,
-            "result": self.result,
-            "replaced": self.replaced,
-            "created_at": self.created_at,
-            "started_at": self.started_at,
-            "finished_at": self.finished_at,
-            "request_id": self.request_id,
-            "client": self.client,
-            "seq": self.seq,
-        }
+        with self._lock:
+            return {
+                "id": self.id,
+                "operation": self.operation,
+                "file_name": self.file_name,
+                "file_size": self.file_size,
+                "content_type": self.content_type,
+                "account_name": self.account_name,
+                "state": self.state.value,
+                "progress": round(self.progress, 4),
+                "bytes_sent": self.bytes_sent,
+                "error": self.error,
+                "result": self.result,
+                "replaced": self.replaced,
+                "created_at": self.created_at,
+                "started_at": self.started_at,
+                "finished_at": self.finished_at,
+                "request_id": self.request_id,
+                "client": self.client,
+                "seq": self.seq,
+            }
 
     # -- transitions ---------------------------------------------------
     def _touch(self) -> None:
@@ -139,8 +141,10 @@ class UploadJob:
 
     def update_progress(self, bytes_sent: int, total: int | None = None) -> None:
         with self._lock:
-            if total:
-                self.file_size = total
+            # ``file_size`` is the immutable spooled size captured at submit.
+            # The SDK's reported total must not overwrite the value used for
+            # capacity accounting and post-upload verification.
+            del total
             self.bytes_sent = bytes_sent
             self.progress = min(bytes_sent / (self.file_size or 1), 1.0)
             # Every observable byte count invalidates list/detail ETags, not
@@ -157,7 +161,10 @@ class UploadJob:
             self._touch()
 
     def partial(
-        self, result: dict[str, Any], error: dict[str, Any], replaced: dict[str, Any]
+        self,
+        result: dict[str, Any],
+        error: dict[str, Any],
+        replaced: dict[str, Any] | None = None,
     ) -> None:
         with self._lock:
             self.state = JobState.PARTIAL
@@ -247,6 +254,14 @@ class UploadManager:
         )
         self._owns_executor = executor is None
 
+    @property
+    def pool(self) -> AccountPool:
+        return self._pool
+
+    @property
+    def audit(self) -> AuditLog:
+        return self._audit
+
     def _blocking_name_locked(self, file_name: str) -> str | None:
         """Return the live job holding ``file_name``, pruning finished leftovers.
 
@@ -313,7 +328,16 @@ class UploadManager:
             )
             self._jobs[job.id] = job
             self._active_names[file_name] = job.id
-            self._futures[job.id] = self._executor.submit(self._run, job)
+            try:
+                self._futures[job.id] = self._executor.submit(self._run, job)
+            except Exception as exc:
+                self._jobs.pop(job.id, None)
+                self._active_names.pop(file_name, None)
+                self._cleanup_temp(job)
+                raise UploadRejected(
+                    "service_unavailable",
+                    "The upload worker pool is unavailable.",
+                ) from exc
         metrics.refresh_jobs(self)
         log_event(
             "upload.queued",
@@ -332,12 +356,13 @@ class UploadManager:
     # -- worker --------------------------------------------------------
     def _run(self, job: UploadJob) -> None:
         job_id_var.set(job.id)
-        if job.request_id:
-            request_id_var.set(job.request_id)
+        request_id_var.set(job.request_id)
+        client_label_var.set(job.client)
         started = time.monotonic()
         reservation: Reservation | None = None
-        client: Any = None
+        client: StorageBackend | None = None
         old_entry: FileEntry | None = None
+        remote_version: FileVersion | None = None
         committed = False
         if not job.begin():
             self._cleanup_temp(job)
@@ -345,77 +370,135 @@ class UploadManager:
             return
         metrics.refresh_jobs(self)
         old_entry = self._pool.get_file(job.file_name)
+        max_rate_limit_retries = len(self._pool._states)  # Try each account at most once
         try:
-            decision = self._route(job)
-            job.account_name = decision.account_name
-            reservation = self._pool.try_reserve(
-                decision.account_name,
-                job.file_name,
-                job.file_size,
-            )
-            client = self._pool.require(decision.account_name)
-            listener = _ProgressListener(job)
-            version = client.upload_local_file(
-                job.temp_path,
-                job.file_name,
-                job.content_type,
-                listener,
-                file_info={JOB_MARKER_KEY: job.id},
-            )
-            if version.size != job.file_size:
-                # The stored object does not match what we sent. Remove it and fail.
-                with contextlib.suppress(StorageError):
-                    client.delete_version(version.file_id, version.file_name)
-                raise PoolError(
-                    "upload_failed",
-                    "B2 stored a different number of bytes than were uploaded.",
-                    expected=job.file_size,
-                    actual=version.size,
-                )
-
-            committed = self._complete_upsert(job, reservation, old_entry, version, client, started)
-        except (PoolError, StorageError) as exc:
-            if (
-                not committed
-                and isinstance(exc, StorageError)
-                and exc.retryable
-                and client is not None
-                and reservation is not None
-            ):
-                committed = self._recover_after_transport_error(
-                    job, reservation, old_entry, client, started
-                )
-            if not committed:
-                self._fail(
-                    job,
-                    getattr(exc, "code", "upload_failed"),
-                    str(exc),
-                    started,
-                )
-        except BaseException as exc:  # noqa: BLE001 - worker must never die silently
-            log_event(
-                "upload.crashed",
-                level=40,
-                job_id=job.id,
-                file_name=job.file_name,
-                error=type(exc).__name__,
-            )
-            if not committed:
-                self._fail(job, "upload_failed", "The upload failed unexpectedly.", started)
+            for attempt in range(max_rate_limit_retries):
+                try:
+                    if reservation is not None:
+                        self._pool.release(reservation.id)
+                        reservation = None
+                    decision, reservation = self._pool.reserve(job.file_name, job.file_size)
+                    job.account_name = decision.account_name
+                    client = self._pool.require(decision.account_name)
+                    listener = _ProgressListener(job)
+                    remote_version = client.upload_local_file(
+                        job.temp_path,
+                        job.file_name,
+                        job.content_type,
+                        listener,
+                        file_info={JOB_MARKER_KEY: job.id},
+                    )
+                    if remote_version.size != job.file_size:
+                        committed = self._partial_size_mismatch(
+                            job,
+                            old_entry,
+                            remote_version,
+                            client,
+                            started,
+                        )
+                    else:
+                        committed = self._complete_upsert(
+                            job, reservation, old_entry, remote_version, client, started
+                        )
+                    break  # Success - exit retry loop
+                except StorageError as exc:
+                    if exc.code == "b2_rate_limited" and attempt < max_rate_limit_retries - 1:
+                        # Rate limited on this account - mark it and retry on another
+                        if reservation is not None:
+                            self._pool.mark_rate_limited(reservation.account_name)
+                            log_event(
+                                "upload.rate_limited_retry",
+                                job_id=job.id,
+                                file_name=job.file_name,
+                                account=reservation.account_name,
+                                attempt=attempt + 1,
+                            )
+                        continue  # Loop will retry with a new reservation
+                    # Not rate limited, or out of retries - handle as normal error
+                    if (
+                        not committed
+                        and exc.retryable
+                        and client is not None
+                        and reservation is not None
+                    ):
+                        committed = self._recover_after_transport_error(
+                            job, reservation, old_entry, client, started
+                        )
+                    if not committed and remote_version is not None:
+                        committed = self._partial_commit_failure(
+                            job,
+                            old_entry,
+                            remote_version,
+                            exc,
+                            started,
+                        )
+                    if not committed:
+                        self._fail(
+                            job,
+                            exc.code,
+                            str(exc),
+                            started,
+                            **getattr(exc, "details", {}),
+                        )
+                    break
+                except PoolError as exc:
+                    # Pool errors (no space, etc.) are not retryable on another account
+                    if not committed and remote_version is not None:
+                        committed = self._partial_commit_failure(
+                            job,
+                            old_entry,
+                            remote_version,
+                            exc,
+                            started,
+                        )
+                    if not committed:
+                        self._fail(
+                            job,
+                            exc.code,
+                            str(exc),
+                            started,
+                            **exc.details,
+                        )
+                    break
+                except BaseException as exc:  # noqa: BLE001 - worker must never die silently
+                    log_event(
+                        "upload.crashed",
+                        level=40,
+                        job_id=job.id,
+                        file_name=job.file_name,
+                        error=type(exc).__name__,
+                    )
+                    if not committed:
+                        if remote_version is not None:
+                            committed = self._partial_commit_failure(
+                                job,
+                                old_entry,
+                                remote_version,
+                                exc,
+                                started,
+                            )
+                        else:
+                            self._fail(
+                                job, "upload_failed", "The upload failed unexpectedly.", started
+                            )
+                    break
         finally:
             if reservation is not None:
                 self._pool.release(reservation.id)
             self._cleanup_temp(job)
             self._release_name(job)
             metrics.refresh_jobs(self)
+            job_id_var.set(None)
+            request_id_var.set(None)
+            client_label_var.set(None)
 
     def _complete_upsert(
         self,
         job: UploadJob,
         reservation: Reservation,
         old_entry: FileEntry | None,
-        version: Any,
-        client: Any,
+        version: FileVersion,
+        client: StorageBackend,
         started: float,
     ) -> bool:
         if old_entry is not None:
@@ -440,9 +523,12 @@ class UploadManager:
                         started,
                     )
                     return True
-            entry = self._pool.commit_replace(
-                reservation, old_entry, version, old_deleted=old_deleted
-            )
+            try:
+                entry = self._pool.commit_replace(
+                    reservation, old_entry, version, old_deleted=old_deleted
+                )
+            except (PoolError, StorageError) as exc:
+                return self._partial_commit_failure(job, old_entry, version, exc, started)
             if old_deleted:
                 job.replaced = old_entry.to_dict()
                 job.complete(entry.to_dict())
@@ -466,17 +552,113 @@ class UploadManager:
                     old_entry.to_dict(),
                 )
         else:
-            entry = self._pool.commit_upload(reservation, version)
+            try:
+                entry = self._pool.commit_upload(reservation, version)
+            except (PoolError, StorageError) as exc:
+                return self._partial_commit_failure(job, old_entry, version, exc, started)
             job.complete(entry.to_dict())
         self._record_success(job, started)
         return True
+
+    def _partial_size_mismatch(
+        self,
+        job: UploadJob,
+        old_entry: FileEntry | None,
+        version: FileVersion,
+        client: StorageBackend,
+        started: float,
+    ) -> bool:
+        cleanup_error: StorageError | None = None
+        try:
+            client.delete_version(version.file_id, version.file_name)
+        except StorageError as exc:
+            cleanup_error = exc
+            if exc.code == "b2_not_found":
+                cleanup_error = None
+        if cleanup_error is None:
+            self._fail(
+                job,
+                "upload_failed",
+                "B2 stored a different number of bytes than were uploaded.",
+                started,
+                expected=job.file_size,
+                actual=version.size,
+            )
+            return True
+
+        job.partial(
+            self._version_dict(version),
+            {
+                "code": "upload_cleanup_failed",
+                "message": (
+                    "B2 stored a different number of bytes and the invalid version could not "
+                    "be removed. Run b2router-reconcile --apply with the gateway stopped before "
+                    "retrying."
+                ),
+                "details": {
+                    "expected": job.file_size,
+                    "actual": version.size,
+                    "cleanup_error": cleanup_error.code,
+                    "file_id": version.file_id,
+                    "account": job.account_name,
+                },
+            },
+            old_entry.to_dict() if old_entry is not None else None,
+        )
+        self._record_success(job, started)
+        return True
+
+    def _partial_commit_failure(
+        self,
+        job: UploadJob,
+        old_entry: FileEntry | None,
+        version: FileVersion,
+        exc: BaseException,
+        started: float,
+    ) -> bool:
+        code = getattr(exc, "code", "commit_failed")
+        details = getattr(exc, "details", {})
+        if not isinstance(details, dict):
+            details = {}
+        job.partial(
+            self._version_dict(version),
+            {
+                "code": code,
+                "message": (
+                    "The upload reached B2, but the local cache commit failed. The cache may "
+                    "be stale; run b2router-reconcile --apply with the gateway stopped before "
+                    "retrying or restarting."
+                ),
+                "details": {
+                    **details,
+                    "job_id": job.id,
+                    "file_id": version.file_id,
+                    "account": job.account_name,
+                    "previous_file_id": old_entry.file_id if old_entry is not None else None,
+                },
+            },
+            old_entry.to_dict() if old_entry is not None else None,
+        )
+        self._record_success(job, started)
+        return True
+
+    @staticmethod
+    def _version_dict(version: FileVersion) -> dict[str, Any]:
+        return {
+            "file_name": version.file_name,
+            "file_id": version.file_id,
+            "size": version.size,
+            "content_type": version.content_type,
+            "upload_timestamp": version.upload_timestamp,
+            "action": version.action,
+        }
 
     def _recover_after_transport_error(
         self,
         job: UploadJob,
         reservation: Reservation,
         old_entry: FileEntry | None,
-        client: Any,
+        client: StorageBackend,
         started: float,
     ) -> bool:
         """Resolve an ambiguous transport error using the upload's fileInfo marker.
@@ -567,27 +749,30 @@ class UploadManager:
         )
         self._record_success(job, started)
 
+    def _append_audit(self, job: UploadJob, **fields: Any) -> None:
+        try:
+            self._audit.append("upsert", **fields)
+        except Exception:  # pragma: no cover - audit must never break a transfer
+            log_event("upload.audit_failed", level=40, job_id=job.id)
+
     def _record_success(self, job: UploadJob, started: float) -> None:
         duration = (time.monotonic() - started) * 1000
         result = "partial" if job.state == JobState.PARTIAL else "success"
         metrics.UPLOADS.labels(result=result).inc()
         if job.state == JobState.COMPLETE:
             metrics.UPLOAD_BYTES.inc(job.file_size)
-        try:
-            self._audit.append(
-                "upsert",
-                result=result,
-                file_name=job.file_name,
-                account_name=job.account_name,
-                file_size=job.file_size,
-                error_code=job.error["code"] if job.error else None,
-                request_id=job.request_id,
-                client=job.client,
-                duration_ms=duration,
-                details={"job_id": job.id, "replaced": job.replaced is not None},
-            )
-        except Exception:  # pragma: no cover - audit must never break a transfer
-            log_event("upload.audit_failed", level=40, job_id=job.id)
+        self._append_audit(
+            job,
+            result=result,
+            file_name=job.file_name,
+            account_name=job.account_name,
+            file_size=job.file_size,
+            error_code=job.error["code"] if job.error else None,
+            request_id=job.request_id,
+            client=job.client,
+            duration_ms=duration,
+            details={"job_id": job.id, "replaced": job.replaced is not None},
+        )
         log_event(
             "upload.finished",
             level=logging.WARNING if job.state == JobState.PARTIAL else logging.INFO,
@@ -599,14 +784,8 @@ class UploadManager:
             duration_ms=round(duration, 2),
         )
 
-    def _route(self, job: UploadJob) -> Any:
-        try:
-            return self._pool.route_one(job.file_name, job.file_size)
-        except PoolError as exc:
-            raise PoolError(exc.code, exc.message, file_name=job.file_name) from exc
-
     def _delete_old(self, entry: FileEntry) -> bool:
-        account_name = entry.accounts[0]
+        account_name = entry.account_name
         client = self._pool.get(account_name)
         if client is None:
             return False
@@ -640,7 +819,7 @@ class UploadManager:
         actually still there; otherwise the rollback would delete the only
         surviving copy.
         """
-        account_name = entry.accounts[0]
+        account_name = entry.account_name
         client = self._pool.get(account_name)
         if client is None:
             return None
@@ -658,7 +837,9 @@ class UploadManager:
             return None
         return any(version.file_id == entry.file_id for version in versions)
 
-    def _rollback_new_version(self, job: UploadJob, client: Any, version: Any) -> bool:
+    def _rollback_new_version(
+        self, job: UploadJob, client: StorageBackend, version: FileVersion
+    ) -> bool:
         """Delete a newly stored version after its predecessor could not be removed.
 
         Upserts upload first so a crash cannot lose the previous copy. Once the
@@ -697,12 +878,19 @@ class UploadManager:
         )
         return False
 
-    def _fail(self, job: UploadJob, code: str, message: str, started: float) -> None:
-        job.fail(code, message)
+    def _fail(
+        self,
+        job: UploadJob,
+        code: str,
+        message: str,
+        started: float,
+        **details: Any,
+    ) -> None:
+        job.fail(code, message, **details)
         metrics.UPLOADS.labels(result="failed").inc()
         duration = (time.monotonic() - started) * 1000
-        self._audit.append(
-            "upsert",
+        self._append_audit(
+            job,
             result="failed",
             file_name=job.file_name,
             account_name=job.account_name,
@@ -711,7 +899,7 @@ class UploadManager:
             request_id=job.request_id,
             client=job.client,
             duration_ms=duration,
-            details={"job_id": job.id},
+            details={"job_id": job.id, **details},
         )
         log_event(
             "upload.failed",
@@ -784,7 +972,7 @@ class UploadManager:
         limit: int = 100,
         offset: int = 0,
         newest_first: bool = False,
-    ) -> tuple[list[UploadJob], int]:
+    ) -> tuple[builtins.list[UploadJob], int]:
         with self._lock:
             self._prune()
             jobs = [
@@ -802,6 +990,31 @@ class UploadManager:
     def revision(self) -> int:
         with self._seq_lock:
             return self._last_seq
+
+    def jobs_snapshot(
+        self,
+        *,
+        states: set[JobState] | None = None,
+        file_name: str | None = None,
+        updated_since: int = 0,
+        limit: int = 100,
+        offset: int = 0,
+        newest_first: bool = False,
+    ) -> tuple[builtins.list[UploadJob], int, int]:
+        """Return jobs, total, and revision from a single consistent read."""
+        with self._lock:
+            self._prune()
+            jobs: list[UploadJob] = [
+                job
+                for job in self._jobs.values()
+                if (states is None or job.state in states)
+                and (file_name is None or job.file_name == file_name)
+                and job.seq > updated_since
+            ]
+            total = len(jobs)
+            rev = self._last_seq
+        jobs.sort(key=lambda job: job.seq, reverse=newest_first)
+        return jobs[offset : offset + limit], total, rev
 
     def queued_count(self) -> int:
         with self._lock:
@@ -829,12 +1042,12 @@ class UploadManager:
                     message = "The job has already finished; dismiss it instead."
                 raise UploadRejected("job_active", message, job_id=job_id)
             future = self._futures.get(job_id)
-            if future is not None:
-                future.cancel()
+            if future is not None and future.cancel():
+                self._futures.pop(job_id, None)
             self._active_names.pop(job.file_name, None)
         self._cleanup_temp(job)
-        self._audit.append(
-            "upsert",
+        self._append_audit(
+            job,
             result="cancelled",
             file_name=job.file_name,
             file_size=job.file_size,
@@ -875,9 +1088,9 @@ class UploadManager:
                 if job.try_cancel():
                     self._cleanup_temp(job)
                     future = self._futures.get(job.id)
-                    if future is not None:
-                        future.cancel()
-            futures = list(self._futures.values())
+                    if future is not None and future.cancel():
+                        self._futures.pop(job.id, None)
+            futures = [future for future in self._futures.values() if not future.cancelled()]
 
         # Do not hold _lock while waiting: workers and delete handlers need it
         # to finish their cleanup. New submissions and deletes are rejected by

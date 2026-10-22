@@ -8,6 +8,7 @@ start accepting HTTP traffic. A partially built pool never serves a request.
 from __future__ import annotations
 
 import argparse
+import signal
 import sys
 from dataclasses import replace
 
@@ -113,6 +114,14 @@ def main(argv: list[str] | None = None) -> int:
             port=settings.port,
             workers=settings.upload_workers,
         )
+
+        # Werkzeug does not translate SIGTERM into a controlled exit. Without
+        # this handler Docker/systemd would kill the process without draining
+        # accepted uploads or releasing the writer lock in our finally block.
+        def _on_sigterm(_signum: int, _frame: object) -> None:
+            raise KeyboardInterrupt
+
+        signal.signal(signal.SIGTERM, _on_sigterm)
         app.run(
             host=settings.host,
             port=settings.port,
@@ -126,9 +135,11 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         # Drain accepted uploads and deletes before releasing the writer lock.
         # A second process must never start while this one can still mutate B2.
-        if manager is not None:
-            manager.shutdown()
-        lock.release()
+        try:
+            if manager is not None:
+                manager.shutdown()
+        finally:
+            lock.release()
 
 
 if __name__ == "__main__":  # pragma: no cover

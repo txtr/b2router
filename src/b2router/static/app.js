@@ -100,6 +100,22 @@
     }
   });
 
+  const showError = (message) => {
+    const flash = document.getElementById("flash");
+    if (!flash) return;
+    const alert = document.createElement("div");
+    alert.className = "alert alert-danger d-flex gap-2 align-items-start";
+    alert.setAttribute("role", "alert");
+    const icon = document.createElement("i");
+    icon.className = "bi bi-exclamation-octagon mt-1";
+    const text = document.createElement("div");
+    // Never interpolate server-provided text into innerHTML: problem details
+    // can contain a filename, which is attacker-controlled.
+    text.textContent = message;
+    alert.append(icon, text);
+    flash.replaceChildren(alert);
+  };
+
   document.addEventListener("htmx:responseError", (event) => {
     const xhr = event.detail.xhr;
     let message = "The request failed.";
@@ -110,10 +126,7 @@
     } catch {
       /* not JSON */
     }
-    const flash = document.getElementById("flash");
-    if (flash) {
-      flash.innerHTML = `<div class="alert alert-danger d-flex gap-2 align-items-start" role="alert"><i class="bi bi-exclamation-octagon mt-1"></i><div>${message}</div></div>`;
-    }
+    showError(message);
   });
 
   onReady(() => {

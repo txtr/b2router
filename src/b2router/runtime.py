@@ -35,7 +35,9 @@ class Runtime:
 
     def shutdown(self) -> None:
         # Keep the writer lock until accepted uploads and deletes are drained.
-        self.manager.shutdown()
-        release = getattr(self.lock, "release", None)
-        if callable(release):
-            release()
+        try:
+            self.manager.shutdown()
+        finally:
+            release = getattr(self.lock, "release", None)
+            if callable(release):
+                release()

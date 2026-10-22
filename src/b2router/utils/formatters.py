@@ -2,19 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from datetime import UTC, datetime
-from typing import Any, Protocol
-
-
-class FileEntryLike(Protocol):
-    file_name: str
-    file_id: str
-    size: int
-    content_type: str
-    upload_timestamp: int
-    action: str
-    accounts: Sequence[str]
+from typing import Any
 
 
 def human_size(n_bytes: int | None) -> str:
@@ -51,24 +40,6 @@ def format_iso(value: str | None) -> str:
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=UTC)
     return moment.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S")
-
-
-def format_file_entry(entry: FileEntryLike) -> dict[str, Any]:
-    return {
-        "file_name": entry.file_name,
-        "file_id": entry.file_id,
-        "size": entry.size,
-        "size_human": human_size(entry.size),
-        "content_type": entry.content_type,
-        "uploaded_at": format_timestamp(entry.upload_timestamp),
-        "upload_timestamp": entry.upload_timestamp,
-        "action": entry.action,
-        "accounts": list(getattr(entry, "accounts", [])),
-    }
-
-
-def format_files(entries: Sequence[FileEntryLike]) -> list[dict[str, Any]]:
-    return [format_file_entry(entry) for entry in entries]
 
 
 def format_pool_stats(stats: dict[str, Any]) -> dict[str, Any]:
