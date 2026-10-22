@@ -12,8 +12,6 @@
 {% if jobs %}
   <div class="alert alert-success py-2" role="status">
     <i class="bi bi-check2-circle"></i> {{ jobs|length }} transfer{{ '' if jobs|length == 1 else 's' }} queued. Progress updates automatically.
+    <span class="visually-hidden" data-job-ids="{% for job in jobs %}{{ job.id }}{{ ',' if not loop.last }}{% endfor %}"></span>
   </div>
-  {% for job in jobs %}
-    {% include "ui/fragments/job_card.html" %}
-  {% endfor %}
 {% endif %}

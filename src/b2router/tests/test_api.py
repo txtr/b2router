@@ -7,8 +7,8 @@ from dataclasses import replace
 
 import pytest
 
+from b2router.services.account import StorageError
 from b2router.services.audit import AuditLog
-from b2router.settings import Settings
 from b2router.tests.conftest import wait_for_job
 from b2router.web import create_app
 
@@ -136,10 +136,40 @@ def test_upload_list_detail_and_content(client) -> None:
 
 def test_content_etag_and_not_modified(client) -> None:
     _upload_and_wait(client, "etag.txt", b"data")
+    detail = client.get("/api/files/etag.txt")
     content = client.get("/api/download/etag.txt")
     etag = content.headers["ETag"]
     assert etag.startswith('"')
+    assert detail.headers["ETag"] == etag
+    assert detail.get_json()["etag"] == etag.strip('"')
     assert client.get("/api/download/etag.txt", headers={"If-None-Match": etag}).status_code == 304
+    assert client.get("/api/files/etag.txt", headers={"If-None-Match": etag}).status_code == 304
+
+
+def test_streaming_failure_aborts_instead_of_truncating(client, accounts) -> None:
+    job = _upload_and_wait(client, "broken.txt", b"complete body")
+    accounts[job["account_name"]].stream_failure = True
+
+    response = client.get("/api/files/broken.txt/content")
+
+    with pytest.raises(StorageError, match="mid-stream"):
+        _ = response.data
+
+
+def test_queue_full_is_rejected_before_multipart_parsing(
+    client, manager, settings, monkeypatch
+) -> None:
+    monkeypatch.setattr(manager, "queued_count", lambda: settings.queue_max)
+
+    response = client.post(
+        "/api/files",
+        data=b"this is not valid multipart",
+        content_type="multipart/form-data; boundary=broken",
+    )
+
+    assert response.status_code == 429
+    assert response.headers["Retry-After"] == "5"
+    assert response.get_json()["code"] == "queue_full"
 
 
 def test_duplicate_upload_is_rejected(client) -> None:
@@ -156,7 +186,7 @@ def test_upsert_and_if_match(client) -> None:
     _upload_and_wait(client, "doc.txt", b"old")
 
     detail = client.get("/api/files/doc.txt").get_json()
-    old_id = detail["file_id"]
+    old_etag = detail["etag"]
 
     wrong = client.put(
         "/api/files/doc.txt",
@@ -171,12 +201,13 @@ def test_upsert_and_if_match(client) -> None:
         "/api/files/doc.txt",
         data={"file": (io.BytesIO(b"new content"), "ignored.txt")},
         content_type="multipart/form-data",
-        headers={"If-Match": f'"{old_id}"'},
+        headers={"If-Match": f'"{old_etag}"'},
     )
     assert response.status_code == 202
     job = wait_for_job(client, response.get_json()["id"])
     assert job["state"] == "complete"
-    assert job["replaced"]["file_id"] == old_id
+    assert job["replaced"]["etag"] == old_etag
+    assert client.get("/api/files/doc.txt").get_json()["etag"] != old_etag
     assert client.get("/api/download/doc.txt").data == b"new content"
 
     wildcard = client.put(
@@ -214,7 +245,7 @@ def test_delete_file_and_preconditions(client) -> None:
     assert wrong.status_code == 412
 
     deleted = client.delete(
-        "/api/files/remove.txt", headers={"If-Match": f'"{detail["file_id"]}"'}
+        "/api/files/remove.txt", headers={"If-Match": f'"{detail["etag"]}"'}
     )
     assert deleted.status_code == 204
     assert client.get("/api/files/remove.txt").status_code == 404

@@ -18,11 +18,16 @@ from b2router.web import create_app
 
 
 class FakeDownload:
-    def __init__(self, data: bytes) -> None:
+    def __init__(self, data: bytes, fail_after: int | None = None) -> None:
         self.data = data
+        self.fail_after = fail_after
         self.closed = False
 
     def iter_chunks(self, chunk_size: int = 65536) -> Iterator[bytes]:
+        if self.fail_after is not None:
+            if self.fail_after:
+                yield self.data[: self.fail_after]
+            raise StorageError("b2_unavailable", "Simulated mid-stream failure.", retryable=True)
         for offset in range(0, len(self.data), chunk_size):
             yield self.data[offset : offset + chunk_size]
 
@@ -35,9 +40,11 @@ class FakeStorage:
     name: str
     fail_upload: bool = False
     ambiguous_upload: bool = False
+    omit_upload_marker: bool = False
     fail_delete: bool = False
     delete_failures_remaining: int = 0
     upload_delay: float = 0.0
+    stream_failure: bool = False
     files: dict[str, FileVersion] = field(default_factory=dict)
     all_versions: list[FileVersion] = field(default_factory=list)
     data: dict[str, bytes] = field(default_factory=dict)
@@ -61,6 +68,7 @@ class FakeStorage:
         file_name: str,
         content_type: str,
         progress_listener: object | None = None,
+        file_info: dict[str, str] | None = None,
     ) -> FileVersion:
         if self.upload_delay:
             time.sleep(self.upload_delay)
@@ -75,6 +83,7 @@ class FakeStorage:
             content_type=content_type,
             upload_timestamp=int(time.time() * 1000),
             action="upload",
+            file_info={} if self.omit_upload_marker else dict(file_info or {}),
         )
         self.files[file_name] = version
         self.all_versions.append(version)
@@ -124,7 +133,7 @@ class FakeStorage:
         if range_ is not None:
             start, end = range_
             data = data[start : end + 1]
-        return FakeDownload(data)
+        return FakeDownload(data, fail_after=1 if self.stream_failure else None)
 
     def seed(self, file_name: str, data: bytes, content_type: str = "text/plain") -> FileVersion:
         file_id = self._new_id()

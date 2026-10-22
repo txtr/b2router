@@ -12,6 +12,7 @@ exercised in tests with fake accounts.
 
 from __future__ import annotations
 
+import hashlib
 import threading
 import uuid
 from collections.abc import Iterable, Mapping
@@ -66,6 +67,12 @@ def iso_timestamp(upload_timestamp_ms: int) -> str:
     )
 
 
+def make_file_etag(file_id: str, upload_timestamp: int) -> str:
+    """Return the opaque validator used by every file representation."""
+    digest = hashlib.sha256(f"file\x00{file_id}\x00{upload_timestamp}".encode()).hexdigest()[:20]
+    return digest
+
+
 @dataclass(frozen=True)
 class FileEntry:
     file_name: str
@@ -80,10 +87,15 @@ class FileEntry:
     def uploaded_at(self) -> str:
         return iso_timestamp(self.upload_timestamp)
 
+    @property
+    def etag(self) -> str:
+        return make_file_etag(self.file_id, self.upload_timestamp)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "file_name": self.file_name,
             "file_id": self.file_id,
+            "etag": self.etag,
             "size": self.size,
             "content_type": self.content_type,
             "upload_timestamp": self.upload_timestamp,
@@ -416,6 +428,11 @@ class AccountPool:
         with self._lock:
             return [self._file_cache[name] for name in sorted(self._file_cache)]
 
+    def files_snapshot(self) -> tuple[list[FileEntry], int]:
+        """Return files and the matching revision from one consistent read."""
+        with self._lock:
+            return [self._file_cache[name] for name in sorted(self._file_cache)], self._revision
+
     def list_files_for_account(self, account_name: str) -> list[FileEntry]:
         with self._lock:
             return [
@@ -431,6 +448,11 @@ class AccountPool:
     def account_states(self) -> list[AccountState]:
         with self._lock:
             return [self._states[name] for name in sorted(self._states)]
+
+    def accounts_snapshot(self) -> tuple[list[AccountState], int]:
+        """Return account states and the matching revision from one read."""
+        with self._lock:
+            return [self._states[name] for name in sorted(self._states)], self._revision
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
@@ -515,7 +537,8 @@ class AccountPool:
             best_name: str | None = None
             best_remaining: int | None = None
             replacement = file_name in file_cache and file_name in allow_existing
-            old_account = file_cache[file_name].accounts[0] if replacement else None
+            old_entry = file_cache[file_name] if replacement else None
+            old_account = old_entry.accounts[0] if old_entry is not None else None
             for name in sorted(states):
                 state = states[name]
                 remaining = state.remaining_bytes
@@ -523,8 +546,9 @@ class AccountPool:
                     state.remaining_files - reserved_files.get(name, 0) - batch_files.get(name, 0)
                 )
                 if replacement and name == old_account:
-                    # A same-account replacement frees the old slot when the new
-                    # version lands, so a full account can still be replaced.
+                    # A same-account replacement frees the old slot and its bytes
+                    # when the old version is deleted, so a full account can
+                    # still be replaced.
                     free_slots += 1
                 if free_slots <= 0:
                     continue
@@ -533,6 +557,8 @@ class AccountPool:
                     rem_after: int | None = 10**18
                 else:
                     effective = remaining - reserved_bytes.get(name, 0) - batch_bytes.get(name, 0)
+                    if replacement and name == old_account and old_entry is not None:
+                        effective += old_entry.size
                     if effective < file_size:
                         continue
                     rem_after = effective - file_size
@@ -563,6 +589,13 @@ class AccountPool:
                 if remaining is None
                 else remaining - reserved_bytes.get(best_name, 0) - batch_bytes.get(best_name, 0)
             )
+            if (
+                replacement
+                and best_name == old_account
+                and old_entry is not None
+                and effective is not None
+            ):
+                effective += old_entry.size
             final_remaining = None if effective is None else effective - file_size
             jobs.append(
                 RoutingJob(
@@ -577,7 +610,8 @@ class AccountPool:
                             remaining_files=state.remaining_files
                             - reserved_files.get(best_name, 0)
                             - batch_files.get(best_name, 0)
-                            - 1,
+                            - 1
+                            + (1 if replacement and best_name == old_account else 0),
                         )
                     ),
                 )
@@ -630,7 +664,14 @@ class AccountPool:
         return job.decision.value
 
     # -- reservations --------------------------------------------------
-    def try_reserve(self, account_name: str, file_name: str, file_size: int) -> Reservation:
+    def try_reserve(
+        self,
+        account_name: str,
+        file_name: str,
+        file_size: int,
+        *,
+        replace_entry: FileEntry | None = None,
+    ) -> Reservation:
         with self._lock:
             state = self._states.get(account_name)
             if state is None:
@@ -643,15 +684,23 @@ class AccountPool:
             reserved_files = sum(
                 r.file_slots for r in self._reservations.values() if r.account_name == account_name
             )
+            same_account_replacement = (
+                replace_entry is not None and replace_entry.accounts[0] == account_name
+            )
             remaining = state.remaining_bytes
             effective = None if remaining is None else remaining - reserved_bytes
+            if effective is not None and same_account_replacement and replace_entry is not None:
+                effective += replace_entry.size
             if effective is not None and effective < file_size:
                 raise PoolError(
                     "no_account_can_fit",
                     f"Account {account_name!r} no longer has room for this file.",
                     account=account_name,
                 )
-            if state.remaining_files - reserved_files <= 0:
+            free_slots = state.remaining_files - reserved_files
+            if same_account_replacement:
+                free_slots += 1
+            if free_slots <= 0:
                 raise PoolError(
                     "no_account_can_fit",
                     f"Account {account_name!r} has no file slots left.",
@@ -664,11 +713,13 @@ class AccountPool:
                 file_size=file_size,
             )
             self._reservations[reservation.id] = reservation
+            self._revision += 1
             return reservation
 
     def release(self, reservation_id: str) -> None:
         with self._lock:
-            self._reservations.pop(reservation_id, None)
+            if self._reservations.pop(reservation_id, None) is not None:
+                self._revision += 1
 
     def reservations(self) -> list[Reservation]:
         with self._lock:

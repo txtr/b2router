@@ -33,7 +33,7 @@
                   <a class="btn btn-ghost btn-icon" href="{{ url_for('ui.download', file_name=file.file_name) }}" title="Download {{ file.file_name }}" aria-label="Download">
                     <i class="bi bi-download"></i>
                   </a>
-                  <a class="btn btn-ghost btn-icon" href="{{ url_for('ui.uploads', replace=file.file_name, replace_id=file.file_id) }}" title="Replace this file" aria-label="Replace">
+                  <a class="btn btn-ghost btn-icon" href="{{ url_for('ui.uploads', replace=file.file_name, replace_etag=file.etag) }}" title="Replace this file" aria-label="Replace">
                     <i class="bi bi-arrow-repeat"></i>
                   </a>
                   <form method="post" action="{{ url_for('ui.delete_file') }}"
@@ -42,7 +42,7 @@
                         hx-confirm="Delete {{ file.file_name }} from B2 and the cache?">
                     <input type="hidden" name="_csrf" value="{{ csrf_token }}">
                     <input type="hidden" name="name" value="{{ file.file_name }}">
-                    <input type="hidden" name="file_id" value="{{ file.file_id }}">
+                    <input type="hidden" name="etag" value="{{ file.etag }}">
                     <input type="hidden" name="q" value="{{ view.q }}">
                     <input type="hidden" name="account" value="{{ view.account }}">
                     <input type="hidden" name="sort" value="{{ view.sort }}">

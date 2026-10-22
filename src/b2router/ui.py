@@ -27,7 +27,6 @@ from flask import (
     session,
     url_for,
 )
-from werkzeug.exceptions import HTTPException
 
 from b2router import metrics
 from b2router.api.validation import spool_upload, validate_file_name
@@ -37,7 +36,7 @@ from b2router.ratelimit import RateLimiter
 from b2router.runtime import Runtime
 from b2router.services.content import content_response
 from b2router.services.files import delete_file as delete_file_entry
-from b2router.services.uploads import ACTIVE_STATES, UploadRejected
+from b2router.services.uploads import ACTIVE_STATES, JobState, UploadRejected
 from b2router.utils.formatters import format_pool_stats
 
 ui_bp = Blueprint("ui", __name__, url_prefix="/ui")
@@ -68,8 +67,8 @@ def _csrf_token() -> str:
 
 
 def _csrf_valid() -> bool:
-    supplied = request.form.get("_csrf", "")
-    expected = session.get("_csrf", "")
+    supplied = request.form.get("_csrf", "").encode("utf-8")
+    expected = session.get("_csrf", "").encode("utf-8")
     return bool(expected) and hmac.compare_digest(supplied, expected)
 
 
@@ -77,7 +76,13 @@ def _safe_next(candidate: str | None) -> str:
     if not candidate:
         return url_for("ui.dashboard")
     parsed = urlparse(candidate)
-    if parsed.scheme or parsed.netloc or not (candidate == "/ui" or candidate.startswith("/ui/")):
+    if (
+        parsed.scheme
+        or parsed.netloc
+        or not (candidate == "/ui" or candidate.startswith("/ui/"))
+        or parsed.path in {"/ui/login", "/ui/logout"}
+        or parsed.path.startswith("/ui/fragments/")
+    ):
         return url_for("ui.dashboard")
     return candidate
 
@@ -136,16 +141,16 @@ def _file_view() -> dict[str, Any]:
 
 def _job_context() -> dict[str, Any]:
     rt = _runtime()
-    active = request.values.get("active", "") in {"1", "true", "yes"}
-    states = set(ACTIVE_STATES) if active else None
-    jobs, total = rt.manager.list(states=states, limit=100)
+    active_filter = request.values.get("active", "") in {"1", "true", "yes"}
+    states = set(ACTIVE_STATES) | {JobState.QUEUED} if active_filter else None
+    jobs, total = rt.manager.list(states=states, limit=100, newest_first=True)
     return {
         "jobs": [job.snapshot() for job in jobs],
         "total_jobs": total,
         "active_jobs": rt.manager.active_count(),
         "queued_jobs": rt.manager.queued_count(),
-        "active": active,
-        "jobs_url": url_for("ui.fragments_jobs", active=1 if active else 0),
+        "active_filter": active_filter,
+        "jobs_url": url_for("ui.fragments_jobs", active=1 if active_filter else 0),
     }
 
 
@@ -224,33 +229,21 @@ def _guard() -> Any:
             return Response(status=401, headers={"HX-Redirect": login_url})
         return redirect(login_url)
 
+    if request.method == "POST" and request.path == "/ui/upload":
+        rt = _runtime()
+        if rt.manager.queued_count() >= rt.settings.queue_max:
+            # Check before _csrf_valid() reads request.form, which would parse
+            # and spool the entire multipart body first.
+            raise Problem(
+                "queue_full",
+                "The upload queue is full; retry once active uploads finish.",
+                headers={"Retry-After": "5"},
+                extensions={"queue_max": rt.settings.queue_max},
+            )
+
     if request.method in {"POST", "PUT", "PATCH", "DELETE"} and not _csrf_valid():
         raise Problem("forbidden", "Invalid or missing CSRF token. Reload the page and retry.")
     return None
-
-
-@ui_bp.errorhandler(Problem)
-def _problem_handler(exc: Problem) -> Any:
-    if request.headers.get("HX-Request") == "true":
-        return render_template(
-            "ui/fragments/problem.html",
-            problem=exc,
-            title=exc.title,
-            detail=exc.detail,
-            code=exc.code,
-            request_id=request_id_var.get(),
-        )
-    return render_template("ui/error.html", problem=exc), exc.status
-
-
-@ui_bp.errorhandler(HTTPException)
-def _http_error(exc: HTTPException) -> Any:
-    problem = Problem(
-        "not_found" if exc.code == 404 else "bad_request",
-        exc.description,
-        status=exc.code or 500,
-    )
-    return render_template("ui/error.html", problem=problem), problem.status
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +253,7 @@ def _http_error(exc: HTTPException) -> Any:
 def dashboard() -> str:
     rt = _runtime()
     files = sorted(rt.pool.list_files(), key=lambda entry: entry.upload_timestamp, reverse=True)
-    recent_jobs, _ = rt.manager.list(limit=6)
+    recent_jobs, _ = rt.manager.list(limit=6, newest_first=True)
     recent_audit, _ = rt.audit.list(limit=6)
     view = {
         "q": "",
@@ -303,7 +296,7 @@ def uploads() -> str:
         "ui/uploads.html",
         **_job_context(),
         replace_name=request.args.get("replace", ""),
-        replace_id=request.args.get("replace_id", "")[:128],
+        replace_etag=request.args.get("replace_etag", "")[:128],
     )
 
 
@@ -444,7 +437,7 @@ def _queue_upload(
     *,
     file_name: str,
     operation: str,
-    expected_file_id: str | None = None,
+    expected_etag: str | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     spooled = None
     try:
@@ -462,7 +455,7 @@ def _queue_upload(
             operation=operation,
             request_id=request_id_var.get(),
             client=getattr(g, "client_label", None),
-            expected_file_id=expected_file_id,
+            expected_etag=expected_etag,
         )
         return job.snapshot(), None
     except UploadRejected as exc:
@@ -521,10 +514,20 @@ def upload() -> Any:
                     },
                 }
             )
+        elif not (parts[0].filename or "").strip():
+            rejected.append(
+                {
+                    "file_name": target,
+                    "error": {
+                        "code": "validation_error",
+                        "message": "Choose a replacement file with a non-empty filename.",
+                    },
+                }
+            )
         else:
-            expected = (request.form.get("file_id") or "").strip() or None
+            expected = (request.form.get("etag") or "").strip() or None
             current = rt.pool.get_file(target)
-            if expected is not None and (current is None or current.file_id != expected):
+            if expected is not None and (current is None or current.etag != expected):
                 rejected.append(
                     {
                         "file_name": target,
@@ -540,7 +543,7 @@ def upload() -> Any:
                     parts[0],
                     file_name=target,
                     operation="upsert",
-                    expected_file_id=current.file_id if expected is not None and current else None,
+                    expected_etag=current.etag if expected is not None and current else None,
                 )
                 if job is not None:
                     jobs.append(job)
@@ -608,26 +611,19 @@ def upload() -> Any:
 def delete_file() -> Any:
     rt = _runtime()
     name = request.form.get("name", "")
-    try:
-        validate_file_name(name, max_bytes=rt.settings.max_filename_bytes)
-        delete_file_entry(
-            rt,
-            name,
-            expected_file_id=request.form.get("file_id") or None,
-            request_id=request_id_var.get(),
-            client=getattr(g, "client_label", None),
-        )
-        alert = {
-            "level": "success",
-            "icon": "bi-check2-circle",
-            "message": f"Deleted {name}.",
-        }
-    except Problem as exc:
-        alert = {
-            "level": "danger",
-            "icon": "bi-exclamation-octagon",
-            "message": f"{exc.detail or exc.title} ({exc.code})",
-        }
+    validate_file_name(name, max_bytes=rt.settings.max_filename_bytes)
+    delete_file_entry(
+        rt,
+        name,
+        expected_etag=request.form.get("etag") or None,
+        request_id=request_id_var.get(),
+        client=getattr(g, "client_label", None),
+    )
+    alert = {
+        "level": "success",
+        "icon": "bi-check2-circle",
+        "message": f"Deleted {name}.",
+    }
 
     view = _file_view()
     response = Response(
@@ -641,24 +637,21 @@ def delete_file() -> Any:
         )
     )
     # The response already contains the refreshed panel. Emitting jobs-changed
-    # here would immediately replace it and erase the success/failure alert.
+    # here would immediately replace it and erase the success alert.
     return response
 
 
 @ui_bp.post("/jobs/<job_id>/cancel")
 def cancel_job(job_id: str) -> Any:
     rt = _runtime()
-    alert = None
     try:
         rt.manager.cancel(job_id)
     except UploadRejected as exc:
-        alert = {"level": "danger", "icon": "bi-exclamation-octagon", "message": exc.message}
+        raise Problem(exc.code, exc.message, extensions=exc.details) from exc
     job = rt.manager.get(job_id)
     if job is None:
         return Response(status=200, response=EMPTY_JOB_FRAGMENT)
-    response = Response(
-        render_template("ui/fragments/job_card.html", job=job.snapshot(), alert=alert)
-    )
+    response = Response(render_template("ui/fragments/job_card.html", job=job.snapshot()))
     response.headers["HX-Trigger"] = "jobs-changed"
     return response
 

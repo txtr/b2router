@@ -178,6 +178,19 @@ def create_app(
                     "A valid bearer token is required.",
                     headers={"WWW-Authenticate": 'Bearer realm="b2router"'},
                 )
+
+        upload_request = request.method in {"POST", "PUT"} and (
+            request.path == "/api/files" or request.path.startswith("/api/files/")
+        )
+        if upload_request and manager.queued_count() >= settings.queue_max:
+            # Reject before Flask parses/spools the multipart body. This keeps a
+            # saturated queue from consuming the full aggregate body allowance.
+            raise Problem(
+                "queue_full",
+                "The upload queue is full; retry once active uploads finish.",
+                headers={"Retry-After": "5"},
+                extensions={"queue_max": settings.queue_max},
+            )
         return None
 
     @app.after_request

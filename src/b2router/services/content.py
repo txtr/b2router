@@ -39,7 +39,7 @@ def content_headers(entry: FileEntry) -> dict[str, str]:
         "Content-Type": safe_content_type(entry.content_type),
         "Content-Disposition": content_disposition(entry.file_name),
         "Accept-Ranges": "bytes",
-        "ETag": _quoted(entry.file_id),
+        "ETag": _quoted(entry.etag),
         "Cache-Control": "private, max-age=0, must-revalidate",
     }
 
@@ -48,8 +48,8 @@ def content_response(rt: Runtime, file_name: str, request: Request) -> Response:
     entry = rt.pool.get_file(file_name)
     if entry is None:
         raise Problem("file_not_found", f"File {file_name!r} is not in the pool.", status=404)
-    if etag_matches(request.headers.get("If-None-Match"), entry.file_id):
-        return not_modified(entry.file_id)
+    if etag_matches(request.headers.get("If-None-Match"), entry.etag):
+        return not_modified(entry.etag)
 
     account = rt.pool.get(entry.accounts[0])
     if account is None:
@@ -82,13 +82,17 @@ def content_response(rt: Runtime, file_name: str, request: Request) -> Response:
     def generate() -> Any:
         try:
             yield from handle.iter_chunks()
-        except Exception as exc:  # pragma: no cover - connection may already be gone
+        except Exception as exc:
+            # Headers have already been sent, so a clean HTTP error is no longer
+            # possible. Propagating aborts the connection rather than making a
+            # truncated body look like a successful download.
             log_event(
                 "download.stream_failed",
                 level=30,
                 file_name=file_name,
                 error=type(exc).__name__,
             )
+            raise
         finally:
             handle.close()
 

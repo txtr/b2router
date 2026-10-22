@@ -36,7 +36,7 @@
       <div class="col-6 col-lg-2">
         <select class="form-select form-select-sm" name="account" aria-label="Account filter"
                 hx-get="{{ url_for('ui.fragments_files') }}" hx-target="#files-panel" hx-swap="outerHTML"
-                hx-swap="innerHTML" hx-trigger="change" hx-include="closest form">
+                hx-trigger="change" hx-include="closest form">
           <option value="">All accounts</option>
           {% for account in account_names %}
             <option value="{{ account }}" {{ 'selected' if view.account == account }}>{{ account }}</option>
@@ -46,7 +46,7 @@
       <div class="col-6 col-lg-2">
         <select class="form-select form-select-sm" name="sort" aria-label="Sort"
                 hx-get="{{ url_for('ui.fragments_files') }}" hx-target="#files-panel" hx-swap="outerHTML"
-                hx-swap="innerHTML" hx-trigger="change" hx-include="closest form">
+                hx-trigger="change" hx-include="closest form">
           <option value="name" {{ 'selected' if view.sort == 'name' }}>Name</option>
           <option value="size" {{ 'selected' if view.sort == 'size' }}>Size</option>
           <option value="uploaded" {{ 'selected' if view.sort == 'uploaded' }}>Uploaded</option>
@@ -55,7 +55,7 @@
       <div class="col-6 col-lg-1">
         <select class="form-select form-select-sm" name="order" aria-label="Order"
                 hx-get="{{ url_for('ui.fragments_files') }}" hx-target="#files-panel" hx-swap="outerHTML"
-                hx-swap="innerHTML" hx-trigger="change" hx-include="closest form">
+                hx-trigger="change" hx-include="closest form">
           <option value="asc" {{ 'selected' if view.order == 'asc' }}>Asc</option>
           <option value="desc" {{ 'selected' if view.order == 'desc' }}>Desc</option>
         </select>

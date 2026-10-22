@@ -55,6 +55,7 @@ TERMINAL_STATES = frozenset(
     {JobState.COMPLETE, JobState.PARTIAL, JobState.FAILED, JobState.CANCELLED}
 )
 ACTIVE_STATES = frozenset({JobState.UPLOADING, JobState.REPLACING})
+JOB_MARKER_KEY = "b2router_job_id"
 
 
 class UploadRejected(Exception):
@@ -81,7 +82,7 @@ class UploadJob:
     temp_path: str
     request_id: str | None
     client: str | None
-    expected_file_id: str | None = None
+    expected_etag: str | None = None
     account_name: str | None = None
     state: JobState = JobState.QUEUED
     progress: float = 0.0
@@ -95,7 +96,6 @@ class UploadJob:
     seq: int = 0
     seq_source: Callable[[], int] | None = field(default=None, repr=False, compare=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
-    _last_progress_bucket: int = field(default=0, repr=False)
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -144,10 +144,9 @@ class UploadJob:
                 self.file_size = total
             self.bytes_sent = bytes_sent
             self.progress = min(bytes_sent / (self.file_size or 1), 1.0)
-            bucket = int(self.progress * 100)
-            if bucket != self._last_progress_bucket:
-                self._last_progress_bucket = bucket
-                self._touch()
+            # Every observable byte count invalidates list/detail ETags, not
+            # only the transitions between integer percentages.
+            self._touch()
 
     def complete(self, result: dict[str, Any]) -> None:
         with self._lock:
@@ -165,6 +164,17 @@ class UploadJob:
             self.state = JobState.PARTIAL
             self.progress = 1.0
             self.result = result
+            self.error = error
+            self.replaced = replaced
+            self.finished_at = _now()
+            self._touch()
+
+    def partial_unresolved(
+        self, error: dict[str, Any], replaced: dict[str, Any] | None = None
+    ) -> None:
+        """Mark an operation whose remote outcome could not be confirmed."""
+        with self._lock:
+            self.state = JobState.PARTIAL
             self.error = error
             self.replaced = replaced
             self.finished_at = _now()
@@ -265,7 +275,7 @@ class UploadManager:
         operation: str,
         request_id: str | None,
         client: str | None,
-        expected_file_id: str | None = None,
+        expected_etag: str | None = None,
     ) -> UploadJob:
         if operation not in {"upload", "upsert"}:
             raise UploadRejected("bad_request", f"Unknown upload operation {operation!r}.")
@@ -309,7 +319,7 @@ class UploadManager:
                 temp_path=temp_path,
                 request_id=request_id,
                 client=client,
-                expected_file_id=expected_file_id,
+                expected_etag=expected_etag,
                 seq=self._next_seq(),
                 seq_source=self._next_seq,
             )
@@ -340,7 +350,6 @@ class UploadManager:
         reservation: Reservation | None = None
         client: Any = None
         old_entry: FileEntry | None = None
-        upload_started_ms: int | None = None
         committed = False
         if not job.begin():
             self._cleanup_temp(job)
@@ -349,8 +358,8 @@ class UploadManager:
         metrics.refresh_jobs(self)
         old_entry = self._pool.get_file(job.file_name)
         try:
-            if job.expected_file_id is not None and (
-                old_entry is None or old_entry.file_id != job.expected_file_id
+            if job.expected_etag is not None and (
+                old_entry is None or old_entry.etag != job.expected_etag
             ):
                 raise PoolError(
                     "precondition_failed",
@@ -359,13 +368,19 @@ class UploadManager:
             decision = self._route(job, allow_existing=job.operation == "upsert")
             job.account_name = decision.account_name
             reservation = self._pool.try_reserve(
-                decision.account_name, job.file_name, job.file_size
+                decision.account_name,
+                job.file_name,
+                job.file_size,
+                replace_entry=old_entry if job.operation == "upsert" else None,
             )
             client = self._pool.require(decision.account_name)
             listener = _ProgressListener(job)
-            upload_started_ms = int(time.time() * 1000)
             version = client.upload_local_file(
-                job.temp_path, job.file_name, job.content_type, listener
+                job.temp_path,
+                job.file_name,
+                job.content_type,
+                listener,
+                file_info={JOB_MARKER_KEY: job.id},
             )
             if version.size != job.file_size:
                 # The stored object does not match what we sent. Remove it and fail.
@@ -386,10 +401,9 @@ class UploadManager:
                 and exc.retryable
                 and client is not None
                 and reservation is not None
-                and upload_started_ms is not None
             ):
                 committed = self._recover_after_transport_error(
-                    job, reservation, old_entry, client, upload_started_ms, started
+                    job, reservation, old_entry, client, started
                 )
             if not committed:
                 self._fail(
@@ -483,25 +497,51 @@ class UploadManager:
         reservation: Reservation,
         old_entry: FileEntry | None,
         client: Any,
-        upload_started_ms: int,
         started: float,
     ) -> bool:
-        """Resolve an ambiguous transport error by asking B2 what it stored.
+        """Resolve an ambiguous transport error using the upload's fileInfo marker.
 
-        A timeout can happen after B2 accepted the bytes. Because uploads for a
-        given name are serialised, a matching version newer than the transfer
-        start can only be ours.
+        A timeout can happen after B2 accepted the bytes. Timestamps and sizes
+        are not unique enough to prove ownership, so the upload carries an opaque
+        job id in B2 ``fileInfo`` and recovery only commits an exact marker match.
+        If B2 cannot confirm the outcome after bounded retries, the job becomes
+        ``partial``/unknown instead of guessing.
         """
-        try:
-            latest = client.get_file_info(job.file_name)
-        except StorageError:
-            return False
-        if latest.size != job.file_size:
-            return False
-        if latest.upload_timestamp < upload_started_ms - 60_000:
-            return False
-        if old_entry is not None and latest.file_id == old_entry.file_id:
-            return False
+        latest = None
+        last_error: StorageError | None = None
+        for attempt in range(3):
+            try:
+                latest = client.get_file_info(job.file_name)
+                break
+            except StorageError as exc:
+                last_error = exc
+                if not exc.retryable:
+                    break
+                if attempt < 2:
+                    time.sleep(0.2 * (2**attempt))
+
+        if latest is None:
+            if last_error is not None and last_error.code == "b2_not_found":
+                # No version is visible under this name. Retrying the upload is
+                # safe and more useful than leaving a permanent unknown job.
+                return False
+            self._partial_unknown(
+                job,
+                old_entry,
+                started,
+                "B2 could not be queried after the upload failed.",
+            )
+            return True
+
+        marker = latest.file_info.get(JOB_MARKER_KEY)
+        if marker != job.id or latest.size != job.file_size:
+            self._partial_unknown(
+                job,
+                old_entry,
+                started,
+                "B2 did not return a matching job marker for the upload.",
+            )
+            return True
 
         cached = self._pool.get_file(job.file_name)
         try:
@@ -526,6 +566,26 @@ class UploadManager:
             return True
         except (PoolError, StorageError):
             return False
+
+    def _partial_unknown(
+        self,
+        job: UploadJob,
+        old_entry: FileEntry | None,
+        started: float,
+        message: str,
+    ) -> None:
+        job.partial_unresolved(
+            {
+                "code": "upload_outcome_unknown",
+                "message": (
+                    f"{message} The upload may or may not have landed. Run "
+                    "b2router-reconcile --apply with the gateway stopped before retrying."
+                ),
+                "details": {"job_id": job.id},
+            },
+            old_entry.to_dict() if old_entry is not None else None,
+        )
+        self._record_success(job, started)
 
     def _record_success(self, job: UploadJob, started: float) -> None:
         duration = (time.monotonic() - started) * 1000
@@ -743,6 +803,7 @@ class UploadManager:
         updated_since: int = 0,
         limit: int = 100,
         offset: int = 0,
+        newest_first: bool = False,
     ) -> tuple[list[UploadJob], int]:
         with self._lock:
             self._prune()
@@ -754,7 +815,7 @@ class UploadManager:
                 and job.seq > updated_since
             ]
         total = len(jobs)
-        jobs.sort(key=lambda job: job.seq)
+        jobs.sort(key=lambda job: job.seq, reverse=newest_first)
         return jobs[offset : offset + limit], total
 
     @property
@@ -816,6 +877,9 @@ class UploadManager:
                     job_id=job_id,
                 )
             del self._jobs[job_id]
+            # Dismissal changes the list representation even though no job
+            # remains to carry the new sequence number.
+            self._next_seq()
 
     def shutdown(self) -> None:
         """Stop accepting mutations and wait for accepted work to finish.
@@ -859,6 +923,7 @@ class UploadManager:
             age = now - _parse_iso(job.finished_at or job.created_at)
             if too_many or age > self._settings.job_ttl_seconds:
                 del self._jobs[job_id]
+                self._next_seq()
 
 
 def _parse_iso(value: str | None) -> float:

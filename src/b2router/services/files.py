@@ -21,7 +21,7 @@ def delete_file(
     rt: Runtime,
     file_name: str,
     *,
-    expected_file_id: str | None = None,
+    expected_etag: str | None = None,
     request_id: str | None = None,
     client: str | None = None,
 ) -> FileEntry:
@@ -41,18 +41,14 @@ def delete_file(
         if entry is None:
             raise Problem("file_not_found", f"File {file_name!r} is not in the pool.", status=404)
 
-        if (
-            expected_file_id is not None
-            and expected_file_id != "*"
-            and expected_file_id != entry.file_id
-        ):
+        if expected_etag is not None and expected_etag != "*" and expected_etag != entry.etag:
             raise Problem(
                 "precondition_failed",
                 "The file changed since it was read; refresh and retry.",
                 status=412,
                 extensions={
-                    "expected_file_id": expected_file_id,
-                    "actual_file_id": entry.file_id,
+                    "expected_etag": expected_etag,
+                    "actual_etag": entry.etag,
                 },
             )
 

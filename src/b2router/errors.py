@@ -177,8 +177,21 @@ def _ui_problem_response(exc: Problem) -> Response | None:
         "request_id": request_id_var.get(),
     }
     if request.headers.get("HX-Request") == "true":
-        return Response(render_template("ui/fragments/problem.html", **context), status=200)
-    return Response(render_template("ui/error.html", **context), status=exc.status)
+        headers = {
+            "HX-Retarget": "#flash",
+            "HX-Reswap": "innerHTML",
+            **exc.headers,
+        }
+        return Response(
+            render_template("ui/fragments/problem.html", **context),
+            status=exc.status,
+            headers=headers,
+        )
+    return Response(
+        render_template("ui/error.html", **context),
+        status=exc.status,
+        headers=exc.headers,
+    )
 
 
 def register_error_handlers(app: Flask) -> None:

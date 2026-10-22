@@ -110,6 +110,17 @@
     focusFlash();
   });
 
+  document.addEventListener("htmx:beforeSwap", (event) => {
+    const xhr = event.detail.xhr;
+    const contentType = xhr.getResponseHeader("Content-Type") || "";
+    if (xhr.status >= 400 && contentType.includes("text/html")) {
+      // Problem fragments from the UI carry HX-Retarget/HX-Reswap. Allow the
+      // real status to reach HTMX without replacing the mutation's target.
+      event.detail.shouldSwap = true;
+      event.detail.isError = false;
+    }
+  });
+
   document.addEventListener("htmx:responseError", (event) => {
     const xhr = event.detail.xhr;
     let message = "The request failed.";

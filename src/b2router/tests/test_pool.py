@@ -147,6 +147,34 @@ def test_same_account_upsert_can_use_its_own_full_slot() -> None:
     assert plan.jobs[0].decision.value.account_name == "a"
 
 
+def test_same_account_upsert_can_use_its_own_bytes() -> None:
+    fake = FakeStorage("a")
+    fake.seed("only", b"x" * 900)
+    pool = AccountPool()
+    pool.add_account(fake, capacity_bytes=1000)
+
+    assert isinstance(pool.plan([("other", 950)]).jobs[0].decision, Err)
+    plan = pool.plan([("only", 950)], allow_existing=["only"])
+    decision = plan.jobs[0].decision
+    assert isinstance(decision, Ok)
+    assert decision.value.remaining_bytes == 50
+
+
+def test_reservation_and_release_invalidate_revision() -> None:
+    pool = AccountPool()
+    pool.add_account(FakeStorage("a"), 100)
+    before = pool.revision
+
+    reservation = pool.try_reserve("a", "one.bin", 10)
+    reserved = pool.revision
+    assert reserved > before
+    assert pool.stats()["reserved_bytes"] == 10
+
+    pool.release(reservation.id)
+    assert pool.revision > reserved
+    assert pool.stats()["reserved_bytes"] == 0
+
+
 def test_cross_account_upsert_requires_a_free_slot() -> None:
     fake_a = FakeStorage("a")
     fake_a.seed("only", b"1")
@@ -178,7 +206,7 @@ def test_commit_upload_updates_cache_and_accounting() -> None:
 
 def test_commit_replace_same_account_adjusts_size() -> None:
     fake = FakeStorage("a")
-    old = fake.seed("file.txt", b"x" * 100)
+    fake.seed("file.txt", b"x" * 100)
     pool = AccountPool()
     pool.add_account(fake, 1000)
     old_entry = pool.get_file("file.txt")

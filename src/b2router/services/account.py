@@ -12,7 +12,7 @@ import contextlib
 import threading
 import time
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 import requests
@@ -53,6 +53,7 @@ class FileVersion:
     content_type: str
     upload_timestamp: int
     action: str
+    file_info: dict[str, Any] = field(default_factory=dict)
 
 
 class StorageError(Exception):
@@ -88,6 +89,7 @@ class StorageBackend(Protocol):
         file_name: str,
         content_type: str,
         progress_listener: AbstractProgressListener | None = None,
+        file_info: dict[str, str] | None = None,
     ) -> FileVersion: ...
 
     def delete_version(self, file_id: str, file_name: str) -> None: ...
@@ -331,6 +333,7 @@ class AccountClient:
             content_type=version.content_type,
             upload_timestamp=version.upload_timestamp,
             action=version.action,
+            file_info=dict(getattr(version, "file_info", None) or {}),
         )
 
     def get_file_info(self, file_name: str) -> FileVersion:
@@ -345,6 +348,7 @@ class AccountClient:
                 content_type=info.content_type,
                 upload_timestamp=info.upload_timestamp,
                 action=info.action or "upload",
+                file_info=dict(getattr(info, "file_info", None) or {}),
             )
         except BaseException as exc:
             error = _translate(exc)
@@ -357,6 +361,7 @@ class AccountClient:
         file_name: str,
         content_type: str,
         progress_listener: AbstractProgressListener | None = None,
+        file_info: dict[str, str] | None = None,
     ) -> FileVersion:
         started = time.monotonic()
         try:
@@ -364,6 +369,7 @@ class AccountClient:
                 local_path,
                 file_name,
                 content_type=content_type,
+                file_info=file_info,
                 progress_listener=progress_listener,
             )
             self._observe("upload", started, "ok")
@@ -374,6 +380,7 @@ class AccountClient:
                 content_type=version.content_type,
                 upload_timestamp=version.upload_timestamp,
                 action=version.action or "upload",
+                file_info=dict(getattr(version, "file_info", None) or {}),
             )
         except BaseException as exc:
             error = _translate(exc)

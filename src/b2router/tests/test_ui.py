@@ -12,7 +12,7 @@ from b2router.services.uploads import UploadManager
 from b2router.web import create_app
 
 CSRF_RE = re.compile(rb'name="_csrf" value="([^"]+)"')
-JOB_RE = re.compile(rb"job-(job_[a-f0-9]+)")
+JOB_RE = re.compile(rb'data-job-ids="(job_[a-f0-9]+)')
 
 
 def _csrf(client) -> str:
@@ -198,9 +198,12 @@ def test_token_login_and_csrf(settings, pool: AccountPool, manager: UploadManage
     assert response.status_code == 401
     assert b"not valid" in response.data
 
-    response = client.post("/ui/login", data={"_csrf": csrf, "token": "s3cret"})
+    response = client.post(
+        "/ui/login",
+        data={"_csrf": csrf, "token": "s3cret", "next": "/ui/fragments/files"},
+    )
     assert response.status_code == 302
-    assert response.headers["Location"].startswith("/ui")
+    assert response.headers["Location"] == "/ui/"
 
     response = client.get("/ui/")
     assert response.status_code == 200
@@ -225,12 +228,85 @@ def test_unknown_job_fragments(client) -> None:
     assert response.data == b'<div class="job-missing"></div>'
 
     response = client.post("/ui/jobs/job_missing/cancel", data={"_csrf": csrf})
-    assert response.status_code == 200
-    assert response.data == b'<div class="job-missing"></div>'
+    assert response.status_code == 404
+    assert b"job_not_found" in response.data
+    assert b"<img" not in response.data
 
     response = client.post("/ui/jobs/job_missing/dismiss", data={"_csrf": csrf})
     assert response.status_code == 200
     assert response.data == b'<div class="job-missing"></div>'
+
+
+def test_htmx_problem_keeps_status_and_targets_flash(client) -> None:
+    csrf = _csrf(client)
+
+    response = client.post(
+        "/ui/files/delete",
+        data={"_csrf": csrf, "name": "missing.txt"},
+        headers={"HX-Request": "true"},
+    )
+
+    assert response.status_code == 404
+    assert response.headers["HX-Retarget"] == "#flash"
+    assert response.headers["HX-Reswap"] == "innerHTML"
+    assert b"file_not_found" in response.data
+
+
+def test_ui_queue_full_is_checked_before_csrf_and_body_parsing(
+    client, manager, settings, monkeypatch
+) -> None:
+    monkeypatch.setattr(manager, "queued_count", lambda: settings.queue_max)
+
+    response = client.post(
+        "/ui/upload",
+        data=b"this is not valid multipart",
+        content_type="multipart/form-data; boundary=broken",
+    )
+
+    assert response.status_code == 429
+    assert response.headers["Retry-After"] == "5"
+    assert b"queue_full" in response.data
+
+
+def test_upload_result_does_not_duplicate_job_cards(client) -> None:
+    csrf = _csrf(client)
+    response = _upload(client, csrf, "once.txt", b"one")
+    job_id = _job_id(response)
+
+    assert b'id="job-' not in response.data
+    jobs = client.get("/ui/fragments/jobs")
+    assert jobs.data.count(f'id="job-{job_id}"'.encode()) == 1
+    _wait(client, job_id)
+
+
+def test_upsert_rejects_empty_filename_part(client) -> None:
+    csrf = _csrf(client)
+    _create(client, csrf, "keep.txt", b"old")
+
+    response = client.post(
+        "/ui/upload",
+        data={
+            "_csrf": csrf,
+            "operation": "upsert",
+            "target_name": "keep.txt",
+            "file": (io.BytesIO(b""), ""),
+        },
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 200
+    assert b"not queued" in response.data
+    assert client.get("/ui/download/keep.txt").data == b"old"
+
+
+def test_non_ascii_csrf_is_rejected_without_server_error(client) -> None:
+    response = client.post(
+        "/ui/files/delete",
+        data={"_csrf": "\u00e9", "name": "anything.txt"},
+    )
+
+    assert response.status_code == 403
+    assert response.content_type.startswith("text/html")
 
 
 def test_audit_filter_fragment(client) -> None:

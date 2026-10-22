@@ -66,7 +66,7 @@ def test_upload_job_succeeds(
     assert not Path(job.temp_path).exists()
 
 
-def test_upsert_expected_file_id_is_rechecked_by_the_worker(
+def test_upsert_expected_etag_is_rechecked_by_the_worker(
     settings: Settings, tmp_path: Path
 ) -> None:
     fake = FakeStorage("a")
@@ -84,7 +84,7 @@ def test_upsert_expected_file_id_is_rechecked_by_the_worker(
             operation="upsert",
             request_id=None,
             client=None,
-            expected_file_id="not-the-cached-id",
+            expected_etag="not-the-cached-etag",
         )
         finished = _wait_state(manager, job.id)
         assert finished.state is JobState.FAILED
@@ -204,6 +204,67 @@ def test_upsert_on_missing_file_creates_it(
     finished = _wait_state(manager, job.id)
     assert finished.state is JobState.COMPLETE
     assert pool.get_file("new.txt") is not None
+
+
+def test_upsert_reuses_full_account_slot_and_bytes(
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    fake = FakeStorage("a")
+    old = fake.seed("only.txt", b"old")
+    pool = AccountPool(max_files_per_account=1)
+    pool.add_account(fake, capacity_bytes=len(b"old"))
+    manager = UploadManager(pool, AuditLog(), settings)
+    try:
+        job = manager.submit(
+            file_name="only.txt",
+            temp_path=_spool(tmp_path, b"new"),
+            file_size=3,
+            content_type="text/plain",
+            operation="upsert",
+            request_id=None,
+            client=None,
+        )
+
+        finished = _wait_state(manager, job.id)
+
+        assert finished.state is JobState.COMPLETE
+        assert old.file_id in fake.deleted
+        entry = pool.get_file("only.txt")
+        assert entry is not None
+        assert entry.file_id != old.file_id
+        state = pool.get_account_state("a")
+        assert state is not None
+        assert state.file_count == 1
+        assert state.used_bytes == 3
+        assert pool.stats()["reserved_bytes"] == 0
+    finally:
+        manager.shutdown()
+
+
+def test_ambiguous_upload_without_matching_marker_is_partial(
+    manager: UploadManager, pool: AccountPool, accounts: dict[str, FakeStorage], tmp_path: Path
+) -> None:
+    accounts["a"].ambiguous_upload = True
+    accounts["a"].omit_upload_marker = True
+
+    job = manager.submit(
+        file_name="unknown.bin",
+        temp_path=_spool(tmp_path, b"landed"),
+        file_size=6,
+        content_type="text/plain",
+        operation="upload",
+        request_id=None,
+        client=None,
+    )
+
+    finished = _wait_state(manager, job.id)
+
+    assert finished.state is JobState.PARTIAL
+    assert finished.error is not None
+    assert finished.error["code"] == "upload_outcome_unknown"
+    assert pool.get_file("unknown.bin") is None
+    assert pool.stats()["used_bytes"] == 0
 
 
 def test_upsert_rolls_back_new_version_when_old_delete_fails(

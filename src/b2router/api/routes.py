@@ -146,12 +146,12 @@ def service_info() -> Response:
 def stats() -> Response:
     rt = runtime()
     body = rt.pool.stats()
-    revision = rt.pool.revision
+    revision = body["revision"]
     etag = make_etag("stats", revision)
     if etag_matches(request.headers.get("If-None-Match"), etag):
         return _not_modified(etag)
     metrics.refresh_pool(rt.pool)
-    response = jsonify({**body, "revision": revision})
+    response = jsonify(body)
     response.headers["ETag"] = _quoted(etag)
     return response
 
@@ -159,11 +159,11 @@ def stats() -> Response:
 @bp.get("/api/accounts")
 def accounts() -> Response:
     rt = runtime()
-    revision = rt.pool.revision
+    states, revision = rt.pool.accounts_snapshot()
     etag = make_etag("accounts", revision)
     if etag_matches(request.headers.get("If-None-Match"), etag):
         return _not_modified(etag)
-    items = [state.to_dict() for state in rt.pool.account_states()]
+    items = [state.to_dict() for state in states]
     response = jsonify({"items": items, "total": len(items), "revision": revision})
     response.headers["ETag"] = _quoted(etag)
     return response
@@ -180,8 +180,8 @@ def account_detail(name: str) -> Response:
 # ---------------------------------------------------------------------------
 # File cache
 # ---------------------------------------------------------------------------
-def _filtered_files(rt: Runtime) -> list[FileEntry]:
-    entries = rt.pool.list_files()
+def _filtered_files(rt: Runtime, entries: list[FileEntry] | None = None) -> list[FileEntry]:
+    entries = list(entries) if entries is not None else rt.pool.list_files()
     query = str_arg(request, "q", max_length=200).casefold()
     account = str_arg(request, "account", max_length=128)
     if query:
@@ -205,7 +205,8 @@ def _filtered_files(rt: Runtime) -> list[FileEntry]:
 @bp.get("/api/files")
 def list_files() -> Response:
     rt = runtime()
-    entries = _filtered_files(rt)
+    snapshot, revision = rt.pool.files_snapshot()
+    entries = _filtered_files(rt, snapshot)
     total = len(entries)
     limit = int_arg(request, "limit", default=100, minimum=1, maximum=1000)
     cursor = request.args.get("after")
@@ -221,7 +222,6 @@ def list_files() -> Response:
         )
     page = entries[start : start + limit]
     next_cursor = page[-1].file_name if page and start + limit < total else None
-    revision = rt.pool.revision
     etag = make_etag(
         "files",
         revision,
@@ -253,7 +253,7 @@ def file_detail(file_name: str) -> Response:
     entry = rt.pool.get_file(file_name)
     if entry is None:
         raise Problem("file_not_found", f"File {file_name!r} is not in the pool.", status=404)
-    etag = make_etag("file", entry.file_id, entry.upload_timestamp)
+    etag = entry.etag
     if etag_matches(request.headers.get("If-None-Match"), etag):
         return _not_modified(etag)
     response = jsonify(entry.to_dict())
@@ -276,7 +276,7 @@ def _spool_and_submit(
     *,
     file_name: str,
     operation: str,
-    expected_file_id: str | None = None,
+    expected_etag: str | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     spooled: SpooledUpload | None = None
     try:
@@ -294,7 +294,7 @@ def _spool_and_submit(
             operation=operation,
             request_id=request_id_var.get(),
             client=getattr(g, "client_label", None),
-            expected_file_id=expected_file_id,
+            expected_etag=expected_etag,
         )
         return job.snapshot(), None
     except UploadRejected as exc:
@@ -389,26 +389,26 @@ def upsert_file(file_name: str) -> Response:
         if expected == "*":
             if entry is None:
                 raise Problem("precondition_failed", "The file does not exist.", status=412)
-        elif entry is None or expected != entry.file_id:
+        elif entry is None or expected != entry.etag:
             raise Problem(
                 "precondition_failed",
                 "The file changed since it was read; refresh and retry.",
                 status=412,
                 extensions={
-                    "expected_file_id": expected,
-                    "actual_file_id": entry.file_id if entry else None,
+                    "expected_etag": expected,
+                    "actual_etag": entry.etag if entry else None,
                 },
             )
     parts = request.files.getlist("file")
     if len(parts) != 1:
         raise validation_problem("Attach exactly one file using the multipart field 'file'.")
-    expected_file_id = entry.file_id if expected is not None and entry is not None else None
+    expected_etag = entry.etag if expected is not None and entry is not None else None
     job, error = _spool_and_submit(
         rt,
         parts[0],
         file_name=file_name,
         operation="upsert",
-        expected_file_id=expected_file_id,
+        expected_etag=expected_etag,
     )
     if job is None:
         raise Problem(
@@ -430,7 +430,7 @@ def delete_file(file_name: str) -> Response:
     delete_file_entry(
         rt,
         file_name,
-        expected_file_id=parse_etag(request.headers.get("If-Match")),
+        expected_etag=parse_etag(request.headers.get("If-Match")),
         request_id=request_id_var.get(),
         client=getattr(g, "client_label", None),
     )
@@ -511,6 +511,7 @@ def list_jobs() -> Response:
     updated_since = int_arg(request, "updated_since", default=0, minimum=0)
     limit = int_arg(request, "limit", default=100, minimum=1, maximum=500)
     offset = int_arg(request, "offset", default=0, minimum=0)
+    revision = rt.manager.revision
     jobs, total = rt.manager.list(
         states=states,
         file_name=file_name,
@@ -518,7 +519,6 @@ def list_jobs() -> Response:
         limit=limit,
         offset=offset,
     )
-    revision = rt.manager.revision
     etag = make_etag(
         "jobs",
         revision,
