@@ -1,15 +1,11 @@
 {% extends "ui/base.html" %}
+{% from "ui/_macros.html" import page_head %}
 {% block title %}Audit · b2router{% endblock %}
 
 {% block content %}
-  <div class="page-head">
-    <div>
-      <div class="page-kicker">Observability</div>
-      <h1 class="page-title">Audit log</h1>
-      <p class="page-subtitle">Every upload, upsert, and delete, with account, size, client, request id, and duration.</p>
-    </div>
+  {% call page_head("Audit", "Recent upserts and deletes.") %}
     <span class="chip accent"><i class="bi bi-shield-check"></i> append-only in memory</span>
-  </div>
+  {% endcall %}
 
   {% include "ui/fragments/audit_panel.html" %}
 {% endblock %}

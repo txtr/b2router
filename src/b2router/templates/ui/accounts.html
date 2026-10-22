@@ -1,39 +1,27 @@
 {% extends "ui/base.html" %}
+{% from "ui/_macros.html" import page_head %}
 {% block title %}Accounts · b2router{% endblock %}
 
 {% block content %}
-  <div class="page-head">
-    <div>
-      <div class="page-kicker">Placement pool</div>
-      <h1 class="page-title">Accounts</h1>
-      <p class="page-subtitle">Budgets are local soft limits. The pool is built from <span class="mono">accounts.yaml</span> before the server starts and is never mutated at runtime.</p>
-    </div>
+  {% call page_head("Accounts", "Soft byte and slot budgets for each B2 account.") %}
     {% if not api_token_enabled %}
       <a class="btn btn-ghost" href="/api/accounts" target="_blank" rel="noopener"><i class="bi bi-braces"></i> JSON</a>
     {% endif %}
-  </div>
+  {% endcall %}
 
   {% include "ui/fragments/accounts_cards.html" %}
 
-  <div class="glass mt-4">
-    <div class="panel-head">
+  <details class="glass disclosure mt-4">
+    <summary class="panel-head">
       <h2 class="panel-title"><i class="bi bi-info-circle"></i> How placement works</h2>
-    </div>
+      <i class="bi bi-chevron-right"></i>
+    </summary>
     <div class="panel-body">
-      <div class="row g-4">
-        <div class="col-md-4">
-          <div class="eyebrow mb-2">Best fit</div>
-          <p class="text-secondary small mb-0">A new file goes to the account with the smallest remaining byte budget that still fits, with a stable account-name tiebreak. Same-account replacement can reuse its old file slot.</p>
-        </div>
-        <div class="col-md-4">
-          <div class="eyebrow mb-2">Reservations</div>
-          <p class="text-secondary small mb-0">In-flight jobs reserve bytes and slots before B2 is called, so concurrent clients cannot overbook an account. Reservations are released in a <span class="mono">finally</span> block.</p>
-        </div>
-        <div class="col-md-4">
-          <div class="eyebrow mb-2">Restart truth</div>
-          <p class="text-secondary small mb-0">At boot, every account's latest versions rebuild the cache and accounting. Duplicate names across accounts abort startup until <span class="mono">b2router-reconcile --apply</span> removes the stale copy.</p>
-        </div>
-      </div>
+      <ul class="mb-0 small text-secondary">
+        <li><strong>Best fit</strong> — the account with the smallest remaining budget that still fits, with a stable name tiebreak. A replacement excludes the account that currently holds the file and needs a free slot and enough bytes elsewhere.</li>
+        <li><strong>Reservations</strong> — in-flight jobs reserve bytes and slots before B2 is called, so concurrent clients cannot overbook an account.</li>
+        <li><strong>Restart truth</strong> — at boot, every account's latest versions rebuild the cache and accounting. Duplicate names across accounts abort startup until <span class="mono">b2router-reconcile --apply</span> resolves them; an interrupted upsert can leave that short-lived duplicate.</li>
+      </ul>
     </div>
-  </div>
+  </details>
 {% endblock %}

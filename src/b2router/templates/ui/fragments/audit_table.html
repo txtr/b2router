@@ -5,11 +5,9 @@
       <tr>
         <th scope="col">When</th>
         <th scope="col">Action</th>
-        <th scope="col">Result</th>
         <th scope="col">File</th>
-        <th scope="col">Account</th>
-        <th scope="col">Client</th>
-        <th scope="col" class="text-end">Duration</th>
+        <th scope="col">Result</th>
+        <th scope="col" class="text-end d-none d-md-table-cell">Duration</th>
       </tr>
     </thead>
     <tbody>
@@ -17,34 +15,37 @@
         <tr>
           <td class="text-secondary small text-nowrap">{{ entry.timestamp|pretty_iso }}</td>
           <td>
-            <span class="chip {{ 'accent' if entry.action == 'upload' else ('violet' if entry.action == 'upsert' else 'danger') }}">
-              <i class="bi {{ 'bi-cloud-arrow-up' if entry.action == 'upload' else ('bi-arrow-repeat' if entry.action == 'upsert' else 'bi-trash3') }}"></i>
+            <span class="chip {{ 'violet' if entry.action == 'upsert' else 'danger' }}">
+              <i class="bi {{ 'bi-arrow-repeat' if entry.action == 'upsert' else 'bi-trash3' }}"></i>
               {{ entry.action|capitalize }}
             </span>
           </td>
-          <td>{{ result_badge(entry.result) }}{% if entry.error_code %}<div class="small mono text-secondary mt-1">{{ entry.error_code }}</div>{% endif %}</td>
           <td class="small">
             {% if entry.file_name %}
-              <span class="mono text-truncate d-inline-block" style="max-width: 28ch" title="{{ entry.file_name }}">{{ entry.file_name }}</span>
-              <div class="text-secondary" style="font-size: 0.7rem">{{ entry.file_size|human_size }}</div>
+              <span class="mono text-truncate d-inline-block" style="max-width: 32ch" title="{{ entry.file_name }}">{{ entry.file_name }}</span>
+              <span class="text-secondary"> · {{ entry.file_size|human_size }}</span>
             {% else %}
               <span class="text-secondary">—</span>
             {% endif %}
+            <div class="text-secondary" style="font-size: 0.72rem;">
+              {{ entry.account_name or '—' }}
+              {% if entry.client %} · {{ entry.client }}{% endif %}
+              {% if entry.request_id %} · <span class="mono">{{ entry.request_id }}</span>{% endif %}
+            </div>
           </td>
-          <td class="small mono text-secondary">{{ entry.account_name or '—' }}</td>
-          <td class="small text-secondary">
-            <div>{{ entry.client or '—' }}</div>
-            {% if entry.request_id %}<div class="mono" style="font-size: 0.68rem">{{ entry.request_id }}</div>{% endif %}
+          <td>
+            {{ result_badge(entry.result) }}
+            {% if entry.error_code %}<div class="small mono text-secondary mt-1">{{ entry.error_code }}</div>{% endif %}
           </td>
-          <td class="text-end small mono text-secondary">{{ '%.0f ms'|format(entry.duration_ms) if entry.duration_ms is not none else '—' }}</td>
+          <td class="text-end small mono text-secondary d-none d-md-table-cell">{{ '%.0f ms'|format(entry.duration_ms) if entry.duration_ms is not none else '—' }}</td>
         </tr>
       {% else %}
         <tr>
-          <td colspan="7">
+          <td colspan="5">
             <div class="empty-state py-4">
               <i class="bi bi-activity"></i>
               <strong>No mutations recorded</strong>
-              <span class="small">Uploads, upserts, and deletes appear here.</span>
+              <span class="small">Upserts and deletes appear here.</span>
             </div>
           </td>
         </tr>

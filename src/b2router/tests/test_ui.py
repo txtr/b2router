@@ -23,24 +23,10 @@ def _csrf(client) -> str:
     return match.group(1).decode()
 
 
-def _upload(
-    client,
-    csrf: str,
-    name: str,
-    data: bytes,
-    *,
-    operation: str = "upload",
-):
-    payload = {
-        "_csrf": csrf,
-        "operation": operation,
-        "file": (io.BytesIO(data), name if operation == "upload" else "payload.bin"),
-    }
-    if operation == "upsert":
-        payload["target_name"] = name
+def _upload(client, csrf: str, name: str, data: bytes):
     response = client.post(
         "/ui/upload",
-        data=payload,
+        data={"_csrf": csrf, "file": (io.BytesIO(data), name)},
         content_type="multipart/form-data",
     )
     assert response.status_code == 200
@@ -93,6 +79,24 @@ def test_pages_and_vendored_assets(client) -> None:
     assert b"unpkg" not in page
 
 
+def test_dashboard_is_compact_and_filters_start_collapsed(client) -> None:
+    page = client.get("/ui/")
+    assert page.data.count(b'id="pool-stats"') == 1
+    assert b"Quick upload" not in page.data
+    assert b"Account pool" not in page.data
+    assert b"Recent activity" not in page.data
+
+    files_page = client.get("/ui/files")
+    assert b'class="filters"' in files_page.data
+    assert b'class="filters" open' not in files_page.data
+
+    filtered = client.get("/ui/files", query_string={"sort": "size"})
+    assert b'class="filters" open' in filtered.data
+
+    audit_page = client.get("/ui/audit")
+    assert b'name="limit"' not in audit_page.data
+
+
 def test_search_and_empty_fragment(client) -> None:
     csrf = _csrf(client)
     _create(client, csrf, "reports/q3.pdf", b"pdf")
@@ -118,7 +122,7 @@ def test_upload_fragment_delete_and_download_proxy(client) -> None:
     assert response.headers["Content-Disposition"].startswith("attachment;")
 
     response = _upload(client, csrf, "new.txt", b"new bytes")
-    assert b"transfer queued" in response.data
+    assert b"upsert queued" in response.data
     _wait(client, _job_id(response))
 
     response = client.get("/ui/download/new.txt")
@@ -134,35 +138,40 @@ def test_upload_fragment_delete_and_download_proxy(client) -> None:
     assert client.get("/ui/download/new.txt").status_code == 404
 
 
-def test_upsert_fragment_replaces_old_object(client, accounts) -> None:
+def test_upsert_fragment_replaces_old_object_in_another_account(client, accounts) -> None:
     csrf = _csrf(client)
     _create(client, csrf, "report.txt", b"v1")
 
-    response = _upload(client, csrf, "report.txt", b"v2", operation="upsert")
-    _wait(client, _job_id(response))
+    response = _upload(client, csrf, "report.txt", b"v2")
+    job_id = _job_id(response)
+    _wait(client, job_id)
 
     response = client.get("/ui/download/report.txt")
     assert response.status_code == 200
     assert response.data == b"v2"
-    assert len(accounts["a"].uploads) == 2
+    assert len(accounts["a"].uploads) == 1
     assert len(accounts["a"].deleted) == 1
+    assert len(accounts["b"].uploads) == 1
+    card = client.get(f"/ui/fragments/job/{job_id}")
+    assert b"Replaced" in card.data
 
 
-def test_duplicate_upload_is_reported_in_fragment(client) -> None:
+def test_multi_file_upsert_accepts_own_filenames(client) -> None:
     csrf = _csrf(client)
-    _create(client, csrf, "taken.txt", b"one")
     response = client.post(
         "/ui/upload",
         data={
             "_csrf": csrf,
-            "operation": "upload",
-            "file": (io.BytesIO(b"two"), "taken.txt"),
+            "file": [
+                (io.BytesIO(b"one"), "one.txt"),
+                (io.BytesIO(b"two"), "two.txt"),
+            ],
         },
         content_type="multipart/form-data",
     )
     assert response.status_code == 200
-    assert b"not queued" in response.data
-    assert b"duplicate_filename" in response.data
+    assert b"2 upserts queued" in response.data
+    assert b"target_name" not in client.get("/ui/uploads").data
 
 
 def test_ui_404_is_html(client) -> None:
@@ -211,7 +220,7 @@ def test_token_login_and_csrf(settings, pool: AccountPool, manager: UploadManage
 
     response = client.post(
         "/ui/upload",
-        data={"operation": "upload", "file": (io.BytesIO(b"x"), "x.txt")},
+        data={"file": (io.BytesIO(b"x"), "x.txt")},
         content_type="multipart/form-data",
     )
     assert response.status_code == 403
@@ -285,12 +294,7 @@ def test_upsert_rejects_empty_filename_part(client) -> None:
 
     response = client.post(
         "/ui/upload",
-        data={
-            "_csrf": csrf,
-            "operation": "upsert",
-            "target_name": "keep.txt",
-            "file": (io.BytesIO(b""), ""),
-        },
+        data={"_csrf": csrf, "file": (io.BytesIO(b""), "")},
         content_type="multipart/form-data",
     )
 

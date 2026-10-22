@@ -6,9 +6,9 @@ nothing here returns HTML.
 Route families:
   /health /ready /metrics        operational endpoints
   /api/stats /api/accounts       read-only pool state
-  /api/files[...]                cache + content, upload/upsert/delete
+  /api/files[...]                cache + content, upsert/delete
   /api/routing-plans             side-effect-free placement preview
-  /api/jobs[...]                 asynchronous upload lifecycle
+  /api/jobs[...]                 asynchronous upsert lifecycle
   /api/audit                     recent mutations
 """
 
@@ -275,8 +275,6 @@ def _spool_and_submit(
     storage: Any,
     *,
     file_name: str,
-    operation: str,
-    expected_etag: str | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     spooled: SpooledUpload | None = None
     try:
@@ -291,10 +289,8 @@ def _spool_and_submit(
             temp_path=spooled.path,
             file_size=spooled.size,
             content_type=spooled.content_type,
-            operation=operation,
             request_id=request_id_var.get(),
             client=getattr(g, "client_label", None),
-            expected_etag=expected_etag,
         )
         return job.snapshot(), None
     except UploadRejected as exc:
@@ -321,13 +317,13 @@ def _rejections_problem(rejected: list[dict[str, Any]]) -> Problem:
     code = codes.pop() if len(codes) == 1 else None
     return Problem(
         code or "bad_request",
-        "No files were accepted for upload.",
+        "No files were accepted for upsert.",
         extensions={"errors": rejected},
     )
 
 
 @bp.post("/api/files")
-def upload_files() -> Response:
+def upsert_files() -> Response:
     rt = runtime()
     parts = request.files.getlist("file")
     if not parts:
@@ -362,7 +358,7 @@ def upload_files() -> Response:
             )
             continue
         seen.add(name)
-        job, error = _spool_and_submit(rt, part, file_name=name, operation="upload")
+        job, error = _spool_and_submit(rt, part, file_name=name)
         if job is not None:
             jobs.append(job)
         if error is not None:
@@ -376,50 +372,6 @@ def upload_files() -> Response:
     response.status_code = 202
     if len(jobs) == 1:
         response.headers["Location"] = f"/api/jobs/{jobs[0]['id']}"
-    return response
-
-
-@bp.put("/api/files/<path:file_name>")
-def upsert_file(file_name: str) -> Response:
-    rt = runtime()
-    validate_file_name(file_name, max_bytes=rt.settings.max_filename_bytes)
-    entry = rt.pool.get_file(file_name)
-    expected = parse_etag(request.headers.get("If-Match"))
-    if expected is not None:
-        if expected == "*":
-            if entry is None:
-                raise Problem("precondition_failed", "The file does not exist.", status=412)
-        elif entry is None or expected != entry.etag:
-            raise Problem(
-                "precondition_failed",
-                "The file changed since it was read; refresh and retry.",
-                status=412,
-                extensions={
-                    "expected_etag": expected,
-                    "actual_etag": entry.etag if entry else None,
-                },
-            )
-    parts = request.files.getlist("file")
-    if len(parts) != 1:
-        raise validation_problem("Attach exactly one file using the multipart field 'file'.")
-    expected_etag = entry.etag if expected is not None and entry is not None else None
-    job, error = _spool_and_submit(
-        rt,
-        parts[0],
-        file_name=file_name,
-        operation="upsert",
-        expected_etag=expected_etag,
-    )
-    if job is None:
-        raise Problem(
-            error["code"] if error else "bad_request",
-            error["message"] if error else "The file could not be queued.",
-            extensions=error.get("details") if error else None,
-        )
-    metrics.refresh_pool(rt.pool)
-    response = jsonify(job)
-    response.status_code = 202
-    response.headers["Location"] = f"/api/jobs/{job['id']}"
     return response
 
 
@@ -449,10 +401,6 @@ def routing_plan() -> Response:
         raise validation_problem("'files' must be a list of {name, size} objects.")
     if len(files) > 100:
         raise validation_problem("At most 100 files may be planned per request.")
-    operation = body.get("operation", "upload")
-    if operation not in {"upload", "upsert"}:
-        raise validation_problem("'operation' must be 'upload' or 'upsert'.")
-
     descriptors: list[tuple[str, int]] = []
     errors: list[dict[str, Any]] = []
     for index, item in enumerate(files):
@@ -469,8 +417,7 @@ def routing_plan() -> Response:
     if errors:
         raise validation_problem("The routing request is invalid.", errors)
 
-    allow_existing = [name for name, _ in descriptors] if operation == "upsert" else []
-    plan = rt.pool.plan(descriptors, allow_existing=allow_existing)
+    plan = rt.pool.plan(descriptors)
     payload = plan.to_dict()
     payload["generated_at"] = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
     return jsonify(payload)

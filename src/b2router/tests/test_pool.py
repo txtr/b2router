@@ -86,19 +86,19 @@ def test_routing_prefers_best_fit() -> None:
     assert decision.value.account_name == "tight"
 
 
-def test_routing_rejects_duplicate_filename() -> None:
-    fake = FakeStorage("a")
-    fake.seed("exists.txt", b"1")
+def test_routing_replaces_from_another_account() -> None:
+    fake_a = FakeStorage("a")
+    fake_a.seed("exists.txt", b"1")
+    fake_b = FakeStorage("b")
     pool = AccountPool()
-    pool.add_account(fake, 1000)
+    pool.add_account(fake_a, 1000)
+    pool.add_account(fake_b, 1000)
 
     plan = pool.plan([("exists.txt", 10)])
-    failure = plan.jobs[0].decision
-    assert isinstance(failure, Err)
-    assert failure.error.reason is RoutingFailureReason.DUPLICATE_FILENAME
-
-    upsert_plan = pool.plan([("exists.txt", 10)], allow_existing=["exists.txt"])
-    assert isinstance(upsert_plan.jobs[0].decision, Ok)
+    decision = plan.jobs[0].decision
+    assert isinstance(decision, Ok)
+    assert decision.value.account_name == "b"
+    assert decision.value.source_account == "a"
 
 
 def test_routing_rejects_duplicate_in_batch() -> None:
@@ -135,29 +135,32 @@ def test_file_slot_limit_is_enforced() -> None:
     assert plan.jobs[0].decision.error.reason is RoutingFailureReason.NO_ACCOUNT_CAN_FIT
 
 
-def test_same_account_upsert_can_use_its_own_full_slot() -> None:
+def test_replacement_fails_when_source_is_the_only_account() -> None:
     fake = FakeStorage("a")
     fake.seed("only", b"1")
-    pool = AccountPool(max_files_per_account=1)
-    pool.add_account(fake, None)
-
-    assert isinstance(pool.plan([("other", 1)]).jobs[0].decision, Err)
-    plan = pool.plan([("only", 1)], allow_existing=["only"])
-    assert isinstance(plan.jobs[0].decision, Ok)
-    assert plan.jobs[0].decision.value.account_name == "a"
-
-
-def test_same_account_upsert_can_use_its_own_bytes() -> None:
-    fake = FakeStorage("a")
-    fake.seed("only", b"x" * 900)
     pool = AccountPool()
     pool.add_account(fake, capacity_bytes=1000)
 
-    assert isinstance(pool.plan([("other", 950)]).jobs[0].decision, Err)
-    plan = pool.plan([("only", 950)], allow_existing=["only"])
-    decision = plan.jobs[0].decision
-    assert isinstance(decision, Ok)
-    assert decision.value.remaining_bytes == 50
+    plan = pool.plan([("only", 1)])
+    failure = plan.jobs[0].decision
+    assert isinstance(failure, Err)
+    assert failure.error.reason is RoutingFailureReason.NO_REPLACEMENT_ACCOUNT
+    assert failure.error.source_account == "a"
+
+
+def test_replacement_does_not_reuse_source_bytes() -> None:
+    fake_a = FakeStorage("a")
+    fake_a.seed("only", b"x" * 900)
+    fake_b = FakeStorage("b")
+    fake_b.seed("other", b"y" * 900)
+    pool = AccountPool(max_files_per_account=2)
+    pool.add_account(fake_a, capacity_bytes=1000)
+    pool.add_account(fake_b, capacity_bytes=1000)
+
+    plan = pool.plan([("only", 950)])
+    failure = plan.jobs[0].decision
+    assert isinstance(failure, Err)
+    assert failure.error.reason is RoutingFailureReason.NO_REPLACEMENT_ACCOUNT
 
 
 def test_reservation_and_release_invalidate_revision() -> None:
@@ -175,7 +178,7 @@ def test_reservation_and_release_invalidate_revision() -> None:
     assert pool.stats()["reserved_bytes"] == 0
 
 
-def test_cross_account_upsert_requires_a_free_slot() -> None:
+def test_replacement_requires_a_free_slot_elsewhere() -> None:
     fake_a = FakeStorage("a")
     fake_a.seed("only", b"1")
     fake_b = FakeStorage("b")
@@ -184,11 +187,11 @@ def test_cross_account_upsert_requires_a_free_slot() -> None:
     pool.add_account(fake_a, 1000)
     pool.add_account(fake_b, 1000)
 
-    # Only account a can accept the replacement: b is full and a can reuse the
-    # slot its old version will free.
-    plan = pool.plan([("only", 1)], allow_existing=["only"])
-    assert isinstance(plan.jobs[0].decision, Ok)
-    assert plan.jobs[0].decision.value.account_name == "a"
+    # Account a is the source; b is full. The source slot cannot be reused.
+    plan = pool.plan([("only", 1)])
+    failure = plan.jobs[0].decision
+    assert isinstance(failure, Err)
+    assert failure.error.reason is RoutingFailureReason.NO_REPLACEMENT_ACCOUNT
 
 
 def test_commit_upload_updates_cache_and_accounting() -> None:
@@ -204,7 +207,7 @@ def test_commit_upload_updates_cache_and_accounting() -> None:
     assert pool.reservations() == []
 
 
-def test_commit_replace_same_account_adjusts_size() -> None:
+def test_commit_replace_rejects_same_account() -> None:
     fake = FakeStorage("a")
     fake.seed("file.txt", b"x" * 100)
     pool = AccountPool()
@@ -213,15 +216,14 @@ def test_commit_replace_same_account_adjusts_size() -> None:
     assert old_entry is not None
     reservation = pool.try_reserve("a", "file.txt", 40)
 
-    new_entry = pool.commit_replace(
-        reservation, old_entry, _version("file.txt", 40, "a", "2"), old_deleted=True
-    )
-
-    state = pool.get_account_state("a")
-    assert state.used_bytes == 40
-    assert state.file_count == 1
-    assert new_entry.file_id == "a-2"
-    assert pool.get_file("file.txt").file_id == "a-2"  # type: ignore[union-attr]
+    with pytest.raises(PoolError) as excinfo:
+        pool.commit_replace(
+            reservation, old_entry, _version("file.txt", 40, "a", "2"), old_deleted=True
+        )
+    assert excinfo.value.code == "state_changed"
+    assert pool.get_file("file.txt").file_id == old_entry.file_id  # type: ignore[union-attr]
+    assert pool.get_account_state("a").used_bytes == 100
+    assert pool.reservations() == [reservation]
 
 
 def test_commit_replace_cross_account_moves_accounting() -> None:

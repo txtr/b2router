@@ -1,7 +1,7 @@
 # b2router
 
 A single-process gateway that spreads files across a pool of Backblaze B2
-accounts and exposes one hardened HTTP surface for uploads, downloads, routing,
+accounts and exposes one hardened HTTP surface for upserts, downloads, routing,
 and observability.
 
 The process is deliberately opinionated:
@@ -9,9 +9,11 @@ The process is deliberately opinionated:
 - **One writer.** A `flock` prevents a second instance from sharing in-memory
   state. `accounts.yaml` is read once at startup; there is no runtime
   add/remove-account API.
-- **Jobs for mutation.** Uploads and upserts spool to a private temp file,
-  return `202`, and report progress through pollable jobs. Deletes stay
-  synchronous because they are cheap and must not leave a name in limbo.
+- **Jobs for mutation.** Upserts spool to a private temp file, return `202`, and
+  report progress through pollable jobs. A missing name is created normally; an
+  existing name is staged in a different account before the old version is
+  deleted. Deletes stay synchronous because they are cheap and must not leave a
+  name in limbo.
 - **JSON API, HTML UI.** `/api/*` never returns HTML. Failures are
   `application/problem+json` (RFC 9457). `/ui/*` is server-rendered with HTMX;
   its mutations call the same in-process services as the API, never a second
@@ -68,7 +70,7 @@ at startup.
 | `B2_CONNECT_TIMEOUT` | `30` | B2 connection timeout (seconds). |
 | `B2_READ_TIMEOUT` | `120` | B2 read timeout (seconds). |
 | `B2ROUTER_MAX_UPLOAD_BYTES` | `10737418240` | Per-file size limit (10 GiB). |
-| `B2ROUTER_MAX_FILES_PER_REQUEST` | `20` | Multipart upload batch limit. |
+| `B2ROUTER_MAX_FILES_PER_REQUEST` | `20` | Multipart upsert batch limit. |
 | `B2ROUTER_MAX_FILENAME_BYTES` | `1000` | UTF-8 filename limit. |
 | `B2ROUTER_UPLOAD_WORKERS` | `2` | Concurrent B2 transfers. |
 | `B2ROUTER_QUEUE_MAX` | `100` | Queued-job limit before `429 queue_full`. |
@@ -110,8 +112,7 @@ containing `/` are unambiguous; `/api/files/<name>/content` is an alias.
 | `GET` | `/api/files` | Cursor list; `q`, `account`, `limit`, `after`, `sort`, `order`. |
 | `GET` | `/api/files/{name}` | Cache metadata + `ETag`. |
 | `GET`/`HEAD` | `/api/download/{name}` | Object bytes; `Range`, `If-None-Match`. |
-| `POST` | `/api/files` | Multipart upload (one or more `file` parts) → `202` jobs. |
-| `PUT` | `/api/files/{name}` | Multipart upsert → `202` job; optional `If-Match`. |
+| `POST` | `/api/files` | Batch upsert (one or more `file` parts, each under its own filename) → `202` jobs. |
 | `DELETE` | `/api/files/{name}` | Synchronous delete → `204`; optional `If-Match`. |
 | `POST` | `/api/routing-plans` | Side-effect-free placement preview. |
 | `GET` | `/api/jobs` | List jobs; `state`, `updated_since`, `limit`. |
@@ -126,7 +127,7 @@ The full failure contract is in [`docs/problems.md`](docs/problems.md).
 `/ui` is a server-rendered operator console. It reads the same in-memory pool,
 job manager, and audit log as the API, and calls the same mutation services, so
 there is no second implementation to drift. Navigation is ordinary HTML;
-HTMX supplies live stats, file search/filtering, job polling, upload results,
+HTMX supplies live stats, file search/filtering, job polling, upsert results,
 and delete/refresh fragments. Downloads are proxied through
 `/ui/download/<name>` so a session cookie is enough (the raw API still expects a
 bearer token when configured).
@@ -135,29 +136,39 @@ Pages:
 
 | Path | Purpose |
 | --- | --- |
-| `/ui/` | Pool hero, live stats, quick upload, recent files/jobs/activity. |
-| `/ui/files` | Searchable/sortable file cache with download, replace, delete. |
-| `/ui/uploads` | New upload, upsert/replace, and live job history. |
+| `/ui/` | Pool hero, live stats, recent files/jobs/activity. |
+| `/ui/files` | Searchable/sortable file cache with download and delete. |
+| `/ui/uploads` | Multi-file upsert form and live job history. |
 | `/ui/accounts` | Per-account budget, utilization, slot usage. |
 | `/ui/audit` | Filterable mutation audit trail. |
 | `/ui/login` | Token sign-in when `B2ROUTER_API_TOKEN` is set. |
 
 Static assets are vendored under `src/b2router/static/vendor/` (HTMX 2.0.11,
 Bootstrap 5.3.8, Bootstrap Icons 1.13.2); the console makes no CDN requests.
-Uploads are queued as jobs and polled as fragments, so a slow B2 transfer never
+Upserts are queued as jobs and polled as fragments, so a slow B2 transfer never
 blocks the page. A completed job emits an HTMX `jobs-changed` event that
 refreshes the visible file table and stats.
 
-### Upload
+### Upsert
+
+Every create-or-replace is an upsert. `POST /api/files` accepts one or more
+`file` parts; each part keeps its own filename, so neither the API nor the
+console needs a separate target-name field:
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8000/api/files \
   -F 'file=@report.pdf;type=application/pdf' \
   -H 'X-Client-Name: nightly-export'
 # 202
-# {"jobs":[{"id":"job_…","operation":"upload","file_name":"report.pdf",
+# {"jobs":[{"id":"job_…","operation":"upsert","file_name":"report.pdf",
 #           "state":"queued","progress":0.0,...}]}
 ```
+
+A missing name is created in the best-fit account. An existing name is staged
+in a **different** account with a free file slot and enough free bytes; after
+that upload succeeds, the old version is deleted. The source account is never
+used for the replacement, even when it has room. A single-account pool can
+therefore create files but cannot replace them.
 
 Poll each id:
 
@@ -167,35 +178,24 @@ curl -sS http://127.0.0.1:8000/api/jobs/job_…
 
 Terminal states are `complete`, `partial`, `failed`, and `cancelled`. The
 result carries the winning `account_name`, `file_id`, and the new cache entry.
-For upserts, `complete` means the old version was removed. If the old version
-cannot be deleted, the router rolls the new version back and reports `failed`,
-so the same file name does not remain duplicated. `partial` means the router
-could not prove the final B2 state: either the old version could not be
-confirmed removed and rollback also failed, or an upload timed out after B2 may
-have accepted it. The latter reports `error.code = "upload_outcome_unknown"`.
-Uploads carry a `b2router_job_id` marker in B2 `fileInfo`; recovery only commits
-an exact marker and size match. After bounded retries without a match, the job
-stays `partial` rather than guessing. See [Reconciliation](#reconciliation).
+A replacement also sets `replaced` to the old entry. `complete` means the old
+version was removed. If the old version cannot be deleted, the router rolls the
+new version back and reports `failed` with `old_version_retained`, so the same
+file name does not remain duplicated. If no other account can stage the
+replacement, the job fails with `no_replacement_account` and the original is
+untouched.
 
-### Upsert
+`partial` means the router could not prove the final B2 state: either the old
+version could not be confirmed removed and rollback also failed, or an upload
+timed out after B2 may have accepted it. The latter reports
+`error.code = "upload_outcome_unknown"`. Upserts carry a `b2router_job_id`
+marker in B2 `fileInfo`; recovery only commits an exact marker and size match.
+After bounded retries without a match, the job stays `partial` rather than
+guessing. See [Reconciliation](#reconciliation).
 
-`PUT` routes the new bytes normally (best fit), uploads, then deletes the older
-version of the same name. It creates the file if it did not exist. If the old
-version cannot be deleted, the newly uploaded version is deleted again and the
-job fails, leaving the original file unchanged:
-
-```bash
-curl -sS -X PUT http://127.0.0.1:8000/api/files/report.pdf \
-  -H 'If-Match: "previous-etag"' \
-  -F 'file=@report-v2.pdf;type=application/pdf'
-```
-
-`If-Match` is optional but strongly recommended when a UI or script read the
-old metadata. Use the opaque `etag` from the detail response (or the `ETag`
-response header); it is not the B2 `file_id`. A mismatch is `412
-precondition_failed` before any upload is spooled, and the worker rechecks the
-same ETag before replacing. `If-Match: *` requires the file to exist (use it to
-avoid accidental creates).
+The filename in each multipart part is the target name. There is no separate
+named-upsert route; to replace `report.pdf`, upload a part whose filename is
+`report.pdf`.
 
 ### Download and ranges
 
@@ -206,8 +206,8 @@ curl -sS -D - http://127.0.0.1:8000/api/download/report.pdf \
 
 `200` includes `ETag: "<opaque-etag>"` and `Accept-Ranges: bytes`; `206` includes
 `Content-Range`; `304` is returned for a matching `If-None-Match`; `416` is a
-problem document. File detail and content return the same opaque ETag, and
-delete/upsert `If-Match` preconditions accept it, so clients never need to mix
+problem document. File detail and content return the same opaque ETag, and the
+delete `If-Match` precondition accepts it, so clients never need to mix
 `file_id` and metadata generations. Downloads stream from B2 in 64 KiB chunks
 and never buffer the whole object; if B2 fails mid-stream the connection is
 aborted rather than returning a silently truncated `200`.
@@ -219,14 +219,15 @@ Preview the pool's choice without reserving anything:
 ```bash
 curl -sS -X POST http://127.0.0.1:8000/api/routing-plans \
   -H 'Content-Type: application/json' \
-  -d '{"operation":"upload","files":[{"name":"a.bin","size":1048576}]}'
+  -d '{"files":[{"name":"a.bin","size":1048576}]}'
 ```
 
 The response separates `routable` from `unroutable` with stable reasons
-(`duplicate_filename`, `duplicate_in_batch`, `no_account_can_fit`) and includes
-the remaining bytes/slots the decision would leave. `"operation":"upsert"`
-allows replacing existing names. Routing is **best fit by remaining bytes**,
-with a stable account-name tiebreak; it accounts for in-flight reservations.
+(`duplicate_in_batch`, `no_account_can_fit`, `no_replacement_account`) and
+includes the remaining bytes/slots the decision would leave. Existing names
+report their `source_account` and `replaces: true`; the chosen account is always
+a different account. Routing is **best fit by remaining bytes**, with a stable
+account-name tiebreak; it accounts for in-flight reservations.
 
 ## Semantics worth knowing
 
@@ -234,10 +235,11 @@ with a stable account-name tiebreak; it accounts for in-flight reservations.
 
 | Situation | Response |
 | --- | --- |
-| `POST` a name that exists | `409 duplicate_filename` |
-| Any upload/upsert/delete while a job or delete owns that name | `409 job_active` |
+| `POST` a name that exists | `202`; the job stages a replacement in another account and deletes the old copy |
+| Existing name with no other account holding a free slot and enough bytes | `202`, then the job fails with `no_replacement_account`; the original is unchanged |
+| Any upsert/delete while a job or delete owns that name | `409 job_active` |
 | `DELETE` a missing name | `404 file_not_found` |
-| `If-Match` differs from the current file `etag` | `412 precondition_failed` |
+| `DELETE` with an `If-Match` that differs from the current file `etag` | `412 precondition_failed` |
 | Queue is full | `429 queue_full` with `Retry-After`, checked before the multipart body is parsed/spooled |
 | Same name twice in one batch | Per-file `409 duplicate_in_request`; `202` if another part was accepted, otherwise the batch problem |
 
@@ -246,13 +248,15 @@ in a `finally` block, so a crashed worker cannot permanently freeze a name.
 
 ### Caching and restarts
 
-The cache is rebuilt at boot from every account's latest version. Uploads,
-deletes, and upserts mutate it at runtime through the API or console; both use
-the same services. Account capacity is recomputed from B2 on restart. A job that was
+The cache is rebuilt at boot from every account's latest version. Upserts and
+deletes mutate it at runtime through the API or console; both use the same
+services. Account capacity is recomputed from B2 on restart. A job that was
 mid-transfer when the process died leaves a spool file (cleaned at next start)
 and no cache entry; B2 may or may not contain the object. If it does, the next
-boot adopts it. Startup rejects the whole pool if two accounts report the same
-name, because that would make downloads ambiguous:
+boot adopts it. An upsert that died after uploading the new version to another
+account but before deleting the old one can temporarily leave the same name in
+two accounts. Startup rejects that ambiguity, because downloads would otherwise
+have no single answer:
 
 ```
 $ b2router
@@ -263,15 +267,21 @@ Stop the gateway and run the reconciler with `--apply` to keep the newest copy.
 
 ### Reconciliation
 
-A single account should contain at most one visible upload version of a given
-file name. The router rolls back a new upsert version when the old-version
-delete fails. If both deletes fail, or the process dies between the upload and
-the old-version delete, B2 can still contain two versions. A latest-only
-listing cannot see the older copy, but its bytes still consume the account.
-Startup lists all visible versions and refuses to build the cache for that
-account if a name has more than one upload version, so run the reconciler.
-`b2router-reconcile` lists *all* upload versions, reports groups with more than
-one copy, and can delete everything except the newest:
+A file name should resolve to one visible upload version across the pool.
+The router rolls back a new version when the old-version delete fails, but two
+cases can still leave copies behind:
+
+* If both the old-version delete and the rollback fail, the old and new versions
+  remain in their respective accounts.
+* If the process dies after staging the new version in another account but
+  before deleting the old one, the same name exists in two accounts.
+
+A latest-only listing cannot see any older same-account copy, but its bytes still
+consume capacity. Startup lists all visible versions and refuses to run if a name
+has more than one upload version in an account or appears in multiple accounts.
+`b2router-reconcile` groups all upload versions by name **across accounts**,
+reports groups with more than one copy, and can delete everything except the
+newest:
 
 ```bash
 B2ROUTER_ACCOUNTS=/etc/b2router/accounts.yaml b2router-reconcile --pretty
@@ -298,7 +308,7 @@ the reconciler is read-only.
   `X-Client-Name` header.
 - Request ids are accepted from `X-Request-ID` and echoed; logs are JSON by
   default in containers for correlation.
-- Upload filenames are normalised, length-checked, and rejected if they contain
+- Upsert filenames are normalised, length-checked, and rejected if they contain
   NULs, backslashes, `.`/`..` segments, control characters, or a leading `/`.
   The spool directory is mode `0700`, and every spool file is `0600`. Spooling
   refuses to start with less than 1 MiB free and converts disk write failures
@@ -323,9 +333,9 @@ PYTHONPATH=src pytest -q
 ```
 
 Tests use a fake storage backend and never contact B2. The suite covers
-routing/reservations, conflict handling, async jobs, ambiguous-upload recovery,
+routing/reservations, conflict handling, async jobs, ambiguous-upsert recovery,
 RFC 9457 shapes, auth, rate limiting, CORS, ranges/ETags, config/settings
-validation, and the UI's sign-in, CSRF, fragments, uploads, deletes, and
+validation, and the UI's sign-in, CSRF, fragments, upserts, deletes, and
 download proxy.
 
 The process is intentionally the Flask development server for 0.0.1

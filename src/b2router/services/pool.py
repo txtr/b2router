@@ -179,8 +179,8 @@ class Reservation:
 # Routing (pure)
 # ---------------------------------------------------------------------------
 class RoutingFailureReason(StrEnum):
-    DUPLICATE_FILENAME = "duplicate_filename"
     NO_ACCOUNT_CAN_FIT = "no_account_can_fit"
+    NO_REPLACEMENT_ACCOUNT = "no_replacement_account"
     DUPLICATE_IN_BATCH = "duplicate_in_batch"
 
 
@@ -191,6 +191,7 @@ class RoutingDecision:
     account_name: str
     remaining_bytes: int | None
     remaining_files: int
+    source_account: str | None = None
 
 
 @dataclass(frozen=True)
@@ -198,6 +199,7 @@ class RoutingFailure:
     file_name: str
     reason: RoutingFailureReason
     message: str
+    source_account: str | None = None
 
 
 RoutingResult = Ok[RoutingDecision, RoutingFailure] | Err[RoutingDecision, RoutingFailure]
@@ -240,6 +242,8 @@ class RoutingPlan:
                         "account_name": decision.account_name,
                         "remaining_bytes": decision.remaining_bytes,
                         "remaining_files": decision.remaining_files,
+                        "source_account": decision.source_account,
+                        "replaces": decision.source_account is not None,
                     }
                 )
             else:
@@ -250,6 +254,7 @@ class RoutingPlan:
                         "file_size": job.file_size,
                         "reason": failure.reason.value,
                         "message": failure.message,
+                        "source_account": failure.source_account,
                     }
                 )
         return {
@@ -493,7 +498,6 @@ class AccountPool:
         file_cache: Mapping[str, FileEntry],
         reserved_bytes: Mapping[str, int],
         reserved_files: Mapping[str, int],
-        allow_existing: frozenset[str],
     ) -> list[RoutingJob]:
         batch_bytes: dict[str, int] = {}
         batch_files: dict[str, int] = {}
@@ -518,38 +522,22 @@ class AccountPool:
                 continue
             seen.add(file_name)
 
-            if file_name in file_cache and file_name not in allow_existing:
-                jobs.append(
-                    RoutingJob(
-                        file_name,
-                        file_size,
-                        Err(
-                            RoutingFailure(
-                                file_name,
-                                RoutingFailureReason.DUPLICATE_FILENAME,
-                                "A file with this name already exists in the pool.",
-                            )
-                        ),
-                    )
-                )
-                continue
-
+            old_entry = file_cache.get(file_name)
+            source_account = old_entry.accounts[0] if old_entry is not None else None
+            replacement = old_entry is not None
             best_name: str | None = None
             best_remaining: int | None = None
-            replacement = file_name in file_cache and file_name in allow_existing
-            old_entry = file_cache[file_name] if replacement else None
-            old_account = old_entry.accounts[0] if old_entry is not None else None
             for name in sorted(states):
+                if name == source_account:
+                    # A replacement is always staged in a different account. The
+                    # source account's old bytes and slot remain occupied until
+                    # the old version has been deleted.
+                    continue
                 state = states[name]
                 remaining = state.remaining_bytes
                 free_slots = (
                     state.remaining_files - reserved_files.get(name, 0) - batch_files.get(name, 0)
                 )
-                if replacement and name == old_account:
-                    # A same-account replacement frees the old slot and its bytes
-                    # when the old version is deleted, so a full account can
-                    # still be replaced.
-                    free_slots += 1
                 if free_slots <= 0:
                     continue
                 if remaining is None:
@@ -557,8 +545,6 @@ class AccountPool:
                     rem_after: int | None = 10**18
                 else:
                     effective = remaining - reserved_bytes.get(name, 0) - batch_bytes.get(name, 0)
-                    if replacement and name == old_account and old_entry is not None:
-                        effective += old_entry.size
                     if effective < file_size:
                         continue
                     rem_after = effective - file_size
@@ -567,6 +553,16 @@ class AccountPool:
                     best_name = name
 
             if best_name is None:
+                if replacement:
+                    reason = RoutingFailureReason.NO_REPLACEMENT_ACCOUNT
+                    message = (
+                        f"No account other than the current holder "
+                        f"({source_account!r}) has enough free bytes and file slots "
+                        "for the replacement."
+                    )
+                else:
+                    reason = RoutingFailureReason.NO_ACCOUNT_CAN_FIT
+                    message = "No account has enough free bytes and file slots."
                 jobs.append(
                     RoutingJob(
                         file_name,
@@ -574,8 +570,9 @@ class AccountPool:
                         Err(
                             RoutingFailure(
                                 file_name,
-                                RoutingFailureReason.NO_ACCOUNT_CAN_FIT,
-                                "No account has enough free bytes and file slots.",
+                                reason,
+                                message,
+                                source_account=source_account,
                             )
                         ),
                     )
@@ -589,13 +586,6 @@ class AccountPool:
                 if remaining is None
                 else remaining - reserved_bytes.get(best_name, 0) - batch_bytes.get(best_name, 0)
             )
-            if (
-                replacement
-                and best_name == old_account
-                and old_entry is not None
-                and effective is not None
-            ):
-                effective += old_entry.size
             final_remaining = None if effective is None else effective - file_size
             jobs.append(
                 RoutingJob(
@@ -610,8 +600,8 @@ class AccountPool:
                             remaining_files=state.remaining_files
                             - reserved_files.get(best_name, 0)
                             - batch_files.get(best_name, 0)
-                            - 1
-                            + (1 if replacement and best_name == old_account else 0),
+                            - 1,
+                            source_account=source_account,
                         )
                     ),
                 )
@@ -621,9 +611,7 @@ class AccountPool:
 
         return jobs
 
-    def plan(
-        self, file_descriptors: list[tuple[str, int]], *, allow_existing: Iterable[str] = ()
-    ) -> RoutingPlan:
+    def plan(self, file_descriptors: list[tuple[str, int]]) -> RoutingPlan:
         with self._lock:
             states = dict(self._states)
             cache = dict(self._file_cache)
@@ -644,18 +632,12 @@ class AccountPool:
                 cache,
                 reserved_bytes,
                 reserved_files,
-                frozenset(allow_existing),
             ),
             revision,
         )
 
-    def route_one(
-        self, file_name: str, file_size: int, *, allow_existing: bool = False
-    ) -> RoutingDecision:
-        plan = self.plan(
-            [(file_name, file_size)],
-            allow_existing=(file_name,) if allow_existing else (),
-        )
+    def route_one(self, file_name: str, file_size: int) -> RoutingDecision:
+        plan = self.plan([(file_name, file_size)])
         job = plan.jobs[0]
         if isinstance(job.decision, Err):
             raise PoolError(
@@ -669,8 +651,6 @@ class AccountPool:
         account_name: str,
         file_name: str,
         file_size: int,
-        *,
-        replace_entry: FileEntry | None = None,
     ) -> Reservation:
         with self._lock:
             state = self._states.get(account_name)
@@ -684,13 +664,8 @@ class AccountPool:
             reserved_files = sum(
                 r.file_slots for r in self._reservations.values() if r.account_name == account_name
             )
-            same_account_replacement = (
-                replace_entry is not None and replace_entry.accounts[0] == account_name
-            )
             remaining = state.remaining_bytes
             effective = None if remaining is None else remaining - reserved_bytes
-            if effective is not None and same_account_replacement and replace_entry is not None:
-                effective += replace_entry.size
             if effective is not None and effective < file_size:
                 raise PoolError(
                     "no_account_can_fit",
@@ -698,8 +673,6 @@ class AccountPool:
                     account=account_name,
                 )
             free_slots = state.remaining_files - reserved_files
-            if same_account_replacement:
-                free_slots += 1
             if free_slots <= 0:
                 raise PoolError(
                     "no_account_can_fit",
@@ -738,8 +711,8 @@ class AccountPool:
                 )
             if version.file_name in self._file_cache:
                 raise PoolError(
-                    "duplicate_filename",
-                    f"File {version.file_name!r} appeared in the cache during upload.",
+                    "file_changed",
+                    f"File {version.file_name!r} appeared in the cache during upload; retry the upsert.",
                     file_name=version.file_name,
                 )
             state = self._states[reservation.account_name]
@@ -801,13 +774,17 @@ class AccountPool:
 
             new_account = reservation.account_name
             old_account = old_entry.accounts[0]
+            if old_account == new_account:
+                raise PoolError(
+                    "state_changed",
+                    "A replacement must be staged in an account other than the current holder.",
+                    file_name=old_entry.file_name,
+                    account=old_account,
+                )
+
             new_state = self._states[new_account]
             projected_used = new_state.used_bytes + version.size
             projected_count = new_state.file_count + 1
-            if old_deleted and old_account == new_account:
-                projected_used -= old_entry.size
-                projected_count -= 1
-
             if old_deleted:
                 if (
                     new_state.capacity_bytes is not None
@@ -823,21 +800,14 @@ class AccountPool:
                         f"Account {new_account!r} has no file slots for the replacement.",
                     )
 
-            if old_account == new_account:
-                self._states[new_account] = replace(
-                    new_state,
-                    used_bytes=max(projected_used, 0),
-                    file_count=max(projected_count, 0),
+            self._states[new_account] = new_state.with_file(version.size)
+            if old_deleted:
+                old_state = self._states[old_account]
+                self._states[old_account] = replace(
+                    old_state,
+                    used_bytes=max(old_state.used_bytes - old_entry.size, 0),
+                    file_count=max(old_state.file_count - 1, 0),
                 )
-            else:
-                self._states[new_account] = new_state.with_file(version.size)
-                if old_deleted:
-                    old_state = self._states[old_account]
-                    self._states[old_account] = replace(
-                        old_state,
-                        used_bytes=max(old_state.used_bytes - old_entry.size, 0),
-                        file_count=max(old_state.file_count - 1, 0),
-                    )
 
             entry = FileEntry(
                 file_name=version.file_name,

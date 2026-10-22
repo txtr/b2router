@@ -1,10 +1,10 @@
-"""Job-based uploads and upserts.
+"""Job-based upserts.
 
-Uploads are asynchronous: the HTTP request spools bytes to a private temp file
+An upsert is asynchronous: the HTTP request spools bytes to a private temp file
 and returns 202 with a job. A small worker pool performs routing, reservation,
-the B2 transfer, and (for upserts) deletion of the old version. All state
-transitions are visible through ``UploadJob.to_dict`` and every mutation is
-audited.
+the B2 transfer, and, when the name already exists, deletion of the old version
+in a different account. All state transitions are visible through
+``UploadJob.to_dict`` and every mutation is audited.
 
 The worker pool is deliberately bounded: B2 transaction caps and the in-memory
 accounting both prefer predictable throughput over unbounded parallelism.
@@ -82,7 +82,6 @@ class UploadJob:
     temp_path: str
     request_id: str | None
     client: str | None
-    expected_etag: str | None = None
     account_name: str | None = None
     state: JobState = JobState.QUEUED
     progress: float = 0.0
@@ -272,13 +271,9 @@ class UploadManager:
         temp_path: str,
         file_size: int,
         content_type: str,
-        operation: str,
         request_id: str | None,
         client: str | None,
-        expected_etag: str | None = None,
     ) -> UploadJob:
-        if operation not in {"upload", "upsert"}:
-            raise UploadRejected("bad_request", f"Unknown upload operation {operation!r}.")
         with self._lock:
             if self._closed:
                 raise UploadRejected("service_unavailable", "The server is shutting down.")
@@ -297,12 +292,6 @@ class UploadManager:
                     f"A delete for {file_name!r} is in progress.",
                     file_name=file_name,
                 )
-            if operation == "upload" and self._pool.get_file(file_name) is not None:
-                raise UploadRejected(
-                    "duplicate_filename",
-                    f"A file named {file_name!r} already exists in the pool.",
-                    file_name=file_name,
-                )
             queued = sum(1 for job in self._jobs.values() if job.state == JobState.QUEUED)
             if queued >= self._settings.queue_max:
                 raise UploadRejected(
@@ -312,14 +301,13 @@ class UploadManager:
                 )
             job = UploadJob(
                 id=f"job_{uuid.uuid4().hex}",
-                operation=operation,
+                operation="upsert",
                 file_name=file_name,
                 file_size=file_size,
                 content_type=content_type,
                 temp_path=temp_path,
                 request_id=request_id,
                 client=client,
-                expected_etag=expected_etag,
                 seq=self._next_seq(),
                 seq_source=self._next_seq,
             )
@@ -332,7 +320,7 @@ class UploadManager:
             job_id=job.id,
             file_name=file_name,
             size=file_size,
-            operation=operation,
+            operation="upsert",
         )
         return job
 
@@ -358,20 +346,12 @@ class UploadManager:
         metrics.refresh_jobs(self)
         old_entry = self._pool.get_file(job.file_name)
         try:
-            if job.expected_etag is not None and (
-                old_entry is None or old_entry.etag != job.expected_etag
-            ):
-                raise PoolError(
-                    "precondition_failed",
-                    "The file changed after the request was accepted; refresh and retry.",
-                )
-            decision = self._route(job, allow_existing=job.operation == "upsert")
+            decision = self._route(job)
             job.account_name = decision.account_name
             reservation = self._pool.try_reserve(
                 decision.account_name,
                 job.file_name,
                 job.file_size,
-                replace_entry=old_entry if job.operation == "upsert" else None,
             )
             client = self._pool.require(decision.account_name)
             listener = _ProgressListener(job)
@@ -393,7 +373,7 @@ class UploadManager:
                     actual=version.size,
                 )
 
-            committed = self._complete_upload(job, reservation, old_entry, version, client, started)
+            committed = self._complete_upsert(job, reservation, old_entry, version, client, started)
         except (PoolError, StorageError) as exc:
             if (
                 not committed
@@ -429,7 +409,7 @@ class UploadManager:
             self._release_name(job)
             metrics.refresh_jobs(self)
 
-    def _complete_upload(
+    def _complete_upsert(
         self,
         job: UploadJob,
         reservation: Reservation,
@@ -438,7 +418,7 @@ class UploadManager:
         client: Any,
         started: float,
     ) -> bool:
-        if job.operation == "upsert" and old_entry is not None:
+        if old_entry is not None:
             job.set_state(JobState.REPLACING)
             old_deleted = self._delete_old(old_entry)
             old_exists: bool | None = None
@@ -554,7 +534,7 @@ class UploadManager:
                     self._record_success(job, started)
                 return True
 
-            self._complete_upload(job, reservation, old_entry, latest, client, started)
+            self._complete_upsert(job, reservation, old_entry, latest, client, started)
             if job.state is not JobState.FAILED:
                 log_event(
                     "upload.recovered",
@@ -595,7 +575,7 @@ class UploadManager:
             metrics.UPLOAD_BYTES.inc(job.file_size)
         try:
             self._audit.append(
-                "upsert" if job.operation == "upsert" else "upload",
+                "upsert",
                 result=result,
                 file_name=job.file_name,
                 account_name=job.account_name,
@@ -619,9 +599,9 @@ class UploadManager:
             duration_ms=round(duration, 2),
         )
 
-    def _route(self, job: UploadJob, *, allow_existing: bool) -> Any:
+    def _route(self, job: UploadJob) -> Any:
         try:
-            return self._pool.route_one(job.file_name, job.file_size, allow_existing=allow_existing)
+            return self._pool.route_one(job.file_name, job.file_size)
         except PoolError as exc:
             raise PoolError(exc.code, exc.message, file_name=job.file_name) from exc
 
@@ -722,7 +702,7 @@ class UploadManager:
         metrics.UPLOADS.labels(result="failed").inc()
         duration = (time.monotonic() - started) * 1000
         self._audit.append(
-            "upsert" if job.operation == "upsert" else "upload",
+            "upsert",
             result="failed",
             file_name=job.file_name,
             account_name=job.account_name,
@@ -854,7 +834,7 @@ class UploadManager:
             self._active_names.pop(job.file_name, None)
         self._cleanup_temp(job)
         self._audit.append(
-            "upload",
+            "upsert",
             result="cancelled",
             file_name=job.file_name,
             file_size=job.file_size,

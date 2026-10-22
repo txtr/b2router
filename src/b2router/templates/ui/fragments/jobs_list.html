@@ -1,6 +1,6 @@
 <div id="jobs-list"
      hx-get="{{ jobs_url|default(url_for('ui.fragments_jobs')) }}"
-     hx-trigger="every 4s, jobs-changed from:body"
+     hx-trigger="every 5s, jobs-changed from:body"
      hx-swap="outerHTML">
   {% if jobs %}
     {% for job in jobs %}
@@ -9,8 +9,8 @@
   {% else %}
     <div class="empty-state py-4">
       <i class="bi bi-lightning"></i>
-      <strong>{{ empty_message|default('No transfers yet') }}</strong>
-      <span class="small">Uploads and upserts appear here while they queue, transfer, and finish.</span>
+      <strong>{{ empty_message|default('No upserts yet') }}</strong>
+      <span class="small">Upserts appear here while they queue, transfer, and finish.</span>
     </div>
   {% endif %}
 </div>

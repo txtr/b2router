@@ -172,69 +172,29 @@ def test_queue_full_is_rejected_before_multipart_parsing(
     assert response.get_json()["code"] == "queue_full"
 
 
-def test_duplicate_upload_is_rejected(client) -> None:
-    _upload_and_wait(client, "dupe.txt", b"one")
+def test_existing_name_becomes_a_cross_account_upsert(client) -> None:
+    first = _upload_and_wait(client, "dupe.txt", b"one")
     response = _upload(client, "dupe.txt", b"two")
-    assert response.status_code == 409
-    assert response.content_type == "application/problem+json"
-    payload = response.get_json()
-    assert payload["code"] == "duplicate_filename"
-    assert payload["errors"][0]["error"]["code"] == "duplicate_filename"
+    assert response.status_code == 202
+    job = wait_for_job(client, response.get_json()["jobs"][0]["id"])
+
+    assert job["state"] == "complete"
+    assert job["operation"] == "upsert"
+    assert job["replaced"]["file_id"] == first["result"]["file_id"]
+    assert job["account_name"] != first["account_name"]
+    assert client.get("/api/download/dupe.txt").data == b"two"
 
 
-def test_upsert_and_if_match(client) -> None:
-    _upload_and_wait(client, "doc.txt", b"old")
-
-    detail = client.get("/api/files/doc.txt").get_json()
-    old_etag = detail["etag"]
-
-    wrong = client.put(
+def test_put_file_is_not_supported(client) -> None:
+    response = client.put(
         "/api/files/doc.txt",
         data={"file": (io.BytesIO(b"new"), "ignored.txt")},
         content_type="multipart/form-data",
-        headers={"If-Match": '"not-the-id"'},
     )
-    assert wrong.status_code == 412
-    assert wrong.get_json()["code"] == "precondition_failed"
 
-    response = client.put(
-        "/api/files/doc.txt",
-        data={"file": (io.BytesIO(b"new content"), "ignored.txt")},
-        content_type="multipart/form-data",
-        headers={"If-Match": f'"{old_etag}"'},
-    )
-    assert response.status_code == 202
-    job = wait_for_job(client, response.get_json()["id"])
-    assert job["state"] == "complete"
-    assert job["replaced"]["etag"] == old_etag
-    assert client.get("/api/files/doc.txt").get_json()["etag"] != old_etag
-    assert client.get("/api/download/doc.txt").data == b"new content"
-
-    wildcard = client.put(
-        "/api/files/doc.txt",
-        data={"file": (io.BytesIO(b"newest"), "ignored.txt")},
-        content_type="multipart/form-data",
-        headers={"If-Match": "*"},
-    )
-    assert wildcard.status_code == 202
-    assert wait_for_job(client, wildcard.get_json()["id"])["state"] == "complete"
-    assert client.get("/api/download/doc.txt").data == b"newest"
-
-    missing_wildcard = client.put(
-        "/api/files/not-there.txt",
-        data={"file": (io.BytesIO(b"x"), "x")},
-        content_type="multipart/form-data",
-        headers={"If-Match": "*"},
-    )
-    assert missing_wildcard.status_code == 412
-
-    created = client.put(
-        "/api/files/brand-new.txt",
-        data={"file": (io.BytesIO(b"created"), "x")},
-        content_type="multipart/form-data",
-    )
-    assert created.status_code == 202
-    assert wait_for_job(client, created.get_json()["id"])["state"] == "complete"
+    assert response.status_code == 405
+    assert response.content_type == "application/problem+json"
+    assert response.get_json()["code"] == "method_not_allowed"
 
 
 def test_delete_file_and_preconditions(client) -> None:
@@ -312,19 +272,16 @@ def test_routing_plans(client) -> None:
     assert payload["all_routable"] is True
     assert len(payload["routable"]) == 2
 
-    _upload_and_wait(client, "taken.bin", b"x")
-    duplicate = client.post(
+    created = _upload_and_wait(client, "taken.bin", b"x")
+    replacement = client.post(
         "/api/routing-plans",
         json={"files": [{"name": "taken.bin", "size": 10}]},
     )
-    assert duplicate.get_json()["all_routable"] is False
-    assert duplicate.get_json()["unroutable"][0]["reason"] == "duplicate_filename"
-
-    upsert = client.post(
-        "/api/routing-plans",
-        json={"operation": "upsert", "files": [{"name": "taken.bin", "size": 10}]},
-    )
-    assert upsert.get_json()["all_routable"] is True
+    assert replacement.get_json()["all_routable"] is True
+    routed = replacement.get_json()["routable"][0]
+    assert routed["source_account"] == created["account_name"]
+    assert routed["account_name"] != created["account_name"]
+    assert routed["replaces"] is True
 
     invalid = client.post(
         "/api/routing-plans",

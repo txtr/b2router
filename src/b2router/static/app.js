@@ -55,21 +55,7 @@
     });
   };
 
-  const initTooltips = (root = document) => {
-    if (!window.bootstrap) return;
-    root.querySelectorAll('[data-bs-toggle="tooltip"]').forEach((element) => {
-      if (element.dataset.tooltipReady === "1") return;
-      element.dataset.tooltipReady = "1";
-      new window.bootstrap.Tooltip(element);
-    });
-  };
-
   const initActionButtons = (root = document) => {
-    root.querySelectorAll("[data-reload]").forEach((button) => {
-      if (button.dataset.actionReady === "1") return;
-      button.dataset.actionReady = "1";
-      button.addEventListener("click", () => window.location.reload());
-    });
     root.querySelectorAll("[data-back]").forEach((button) => {
       if (button.dataset.actionReady === "1") return;
       button.dataset.actionReady = "1";
@@ -97,17 +83,10 @@
     });
   };
 
-  const focusFlash = () => {
-    const flash = document.querySelector("#flash .alert");
-    if (flash) flash.setAttribute("tabindex", "-1");
-  };
-
   document.addEventListener("htmx:afterSwap", (event) => {
     initDropzones(event.target);
-    initTooltips(event.target);
     initCopyButtons(event.target);
     initActionButtons(event.target);
-    focusFlash();
   });
 
   document.addEventListener("htmx:beforeSwap", (event) => {
@@ -139,10 +118,8 @@
 
   onReady(() => {
     initDropzones();
-    initTooltips();
     initCopyButtons();
     initActionButtons();
-    focusFlash();
 
     document.addEventListener("keydown", (event) => {
       if (event.key !== "/" || event.metaKey || event.ctrlKey || event.altKey) return;
@@ -152,6 +129,19 @@
       if (!search) return;
       event.preventDefault();
       search.focus();
+    });
+
+    document.addEventListener("click", (event) => {
+      document.querySelectorAll("details.filters[open]").forEach((details) => {
+        if (!details.contains(event.target)) details.open = false;
+      });
+    });
+
+    document.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape") return;
+      document.querySelectorAll("details.filters[open]").forEach((details) => {
+        details.open = false;
+      });
     });
   });
 })();

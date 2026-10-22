@@ -1,20 +1,14 @@
 {% extends "ui/base.html" %}
+{% from "ui/_macros.html" import page_head %}
 {% block title %}Files · b2router{% endblock %}
 
 {% block content %}
-  <div class="page-head">
-    <div>
-      <div class="page-kicker">Cache &amp; objects</div>
-      <h1 class="page-title">Files</h1>
-      <p class="page-subtitle">The in-memory view of every latest object across the pool. Downloads stream straight from B2.</p>
-    </div>
-    <div class="d-flex gap-2">
-      {% if not api_token_enabled %}
-        <a class="btn btn-ghost" href="/api/files" target="_blank" rel="noopener"><i class="bi bi-braces"></i> JSON</a>
-      {% endif %}
-      <a class="btn btn-accent" href="{{ url_for('ui.uploads') }}"><i class="bi bi-cloud-arrow-up"></i> Upload</a>
-    </div>
-  </div>
+  {% call page_head("Files", "Every latest object across the pool.") %}
+    {% if not api_token_enabled %}
+      <a class="btn btn-ghost" href="/api/files" target="_blank" rel="noopener"><i class="bi bi-braces"></i> JSON</a>
+    {% endif %}
+    <a class="btn btn-accent" href="{{ url_for('ui.uploads') }}"><i class="bi bi-arrow-repeat"></i> Upsert</a>
+  {% endcall %}
 
   {% include "ui/fragments/files_panel.html" %}
 {% endblock %}

@@ -3,7 +3,7 @@
 <div id="job-{{ job.id }}" class="job-card job-{{ job.state }} fade-in"
      {% if not terminal %}
        hx-get="{{ url_for('ui.fragment_job', job_id=job.id) }}"
-       hx-trigger="every 900ms"
+       hx-trigger="every 1500ms"
        hx-swap="outerHTML"
      {% endif %}>
   <div class="d-flex align-items-start justify-content-between gap-2">
@@ -11,13 +11,15 @@
       <div class="d-flex flex-wrap align-items-center gap-2 mb-1">
         {{ operation_badge(job.operation) }}
         {{ state_badge(job.state) }}
+        {% if job.replaced and job.state == 'complete' %}
+          <span class="chip success"><i class="bi bi-arrow-repeat"></i> Replaced</span>
+        {% endif %}
         {% if job.account_name %}<span class="chip muted"><i class="bi bi-person-badge"></i> {{ job.account_name }}</span>{% endif %}
       </div>
       <div class="job-title" title="{{ job.file_name }}">{{ job.file_name }}</div>
       <div class="job-meta mt-1">
         {{ job.file_size|human_size }}
         {% if job.created_at %} · {{ job.created_at|pretty_iso }}{% endif %}
-        {% if job.client %} · {{ job.client }}{% endif %}
       </div>
     </div>
     <div class="job-actions">
@@ -67,16 +69,20 @@
     </div>
   {% endif %}
 
-  <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mt-2 job-meta">
-    <span class="d-inline-flex align-items-center gap-1">
-      <span class="mono">{{ job.id }}</span>
-      <button class="btn btn-ghost btn-sm py-0 px-1" type="button" data-copy="{{ job.id }}" title="Copy job id"><i class="bi bi-clipboard"></i></button>
-    </span>
-    {% if job.request_id %}
+  <details class="job-details mt-2">
+    <summary>Details</summary>
+    <div class="d-flex flex-wrap align-items-center gap-3 mt-2 job-meta">
       <span class="d-inline-flex align-items-center gap-1">
-        <span class="mono">{{ job.request_id }}</span>
-        <button class="btn btn-ghost btn-sm py-0 px-1" type="button" data-copy="{{ job.request_id }}" title="Copy request id"><i class="bi bi-clipboard"></i></button>
+        <span class="mono">{{ job.id }}</span>
+        <button class="btn btn-ghost btn-sm py-0 px-1" type="button" data-copy="{{ job.id }}" title="Copy job id"><i class="bi bi-clipboard"></i></button>
       </span>
-    {% endif %}
-  </div>
+      {% if job.request_id %}
+        <span class="d-inline-flex align-items-center gap-1">
+          <span class="mono">{{ job.request_id }}</span>
+          <button class="btn btn-ghost btn-sm py-0 px-1" type="button" data-copy="{{ job.request_id }}" title="Copy request id"><i class="bi bi-clipboard"></i></button>
+        </span>
+      {% endif %}
+      {% if job.client %}<span>{{ job.client }}</span>{% endif %}
+    </div>
+  </details>
 </div>

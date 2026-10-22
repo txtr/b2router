@@ -1,5 +1,15 @@
 {# Small, presentation-only helpers. Keep logic out of page templates. #}
 
+{% macro page_head(title, subtitle=None) -%}
+  <div class="page-head">
+    <div>
+      <h1 class="page-title">{{ title }}</h1>
+      {% if subtitle %}<p class="page-subtitle">{{ subtitle }}</p>{% endif %}
+    </div>
+    {% if caller %}<div class="d-flex flex-wrap gap-2">{{ caller() }}</div>{% endif %}
+  </div>
+{%- endmacro %}
+
 {% macro file_icon(name, content_type) -%}
   {%- set ext = (name.rsplit('.', 1)[-1] if '.' in name else '')|lower -%}
   {%- if content_type.startswith('image/') or ext in ['png','jpg','jpeg','gif','webp','svg','avif'] -%}
@@ -44,11 +54,7 @@
 {%- endmacro %}
 
 {% macro operation_badge(operation) -%}
-  {%- if operation == 'upsert' -%}
-    <span class="chip violet"><i class="bi bi-arrow-repeat"></i> Upsert</span>
-  {%- else -%}
-    <span class="chip accent"><i class="bi bi-cloud-arrow-up"></i> Upload</span>
-  {%- endif -%}
+  <span class="chip violet"><i class="bi bi-arrow-repeat"></i> Upsert</span>
 {%- endmacro %}
 
 {% macro result_badge(result) -%}

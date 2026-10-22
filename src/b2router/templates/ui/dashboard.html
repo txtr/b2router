@@ -1,56 +1,12 @@
 {% extends "ui/base.html" %}
-{% from "ui/_macros.html" import file_icon %}
+{% from "ui/_macros.html" import page_head %}
 {% block title %}Overview · b2router{% endblock %}
 
 {% block content %}
-  <section class="hero fade-in mb-4">
-    <div class="row align-items-center g-4">
-      <div class="col-lg-7">
-        <div class="eyebrow">Backblaze B2 · pooled gateway</div>
-        <h1>One front door.<br>Every byte accounted for.</h1>
-        <p>
-          Files are placed by best fit across {{ stats.accounts }} account{{ '' if stats.accounts == 1 else 's' }},
-          transferred as pollable jobs, and served with strong cache semantics.
-          The cache is rebuilt from B2 at boot; this process is the only writer.
-        </p>
-        <div class="hero-actions">
-          <a class="btn btn-accent" href="{{ url_for('ui.uploads') }}"><i class="bi bi-cloud-arrow-up"></i> Upload files</a>
-          <a class="btn btn-ghost" href="{{ url_for('ui.files') }}"><i class="bi bi-folder2-open"></i> Browse cache</a>
-          {% if not api_token_enabled %}
-            <a class="btn btn-ghost" href="/api/stats" target="_blank" rel="noopener"><i class="bi bi-braces"></i> API</a>
-          {% endif %}
-        </div>
-      </div>
-      <div class="col-lg-5">
-        <div class="row g-3">
-          <div class="col-6">
-            <div class="hero-stat">
-              <div class="value">{{ stats.files }}</div>
-              <div class="label">Files</div>
-            </div>
-          </div>
-          <div class="col-6">
-            <div class="hero-stat">
-              <div class="value">{{ stats.used_human }}</div>
-              <div class="label">Accounted</div>
-            </div>
-          </div>
-          <div class="col-6">
-            <div class="hero-stat">
-              <div class="value">{{ active_jobs }}</div>
-              <div class="label">In flight</div>
-            </div>
-          </div>
-          <div class="col-6">
-            <div class="hero-stat">
-              <div class="value">{{ stats.free_human }}</div>
-              <div class="label">Free budget</div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </section>
+  {% call page_head("Overview", "Pool health, recent files, and live upserts.") %}
+    <a class="btn btn-accent" href="{{ url_for('ui.uploads') }}"><i class="bi bi-arrow-repeat"></i> Upsert</a>
+    <a class="btn btn-ghost" href="{{ url_for('ui.files') }}"><i class="bi bi-folder2-open"></i> Browse files</a>
+  {% endcall %}
 
   {% include "ui/fragments/stats.html" %}
 
@@ -59,8 +15,8 @@
       <div class="glass h-100">
         <div class="panel-head">
           <div>
-            <h2 class="panel-title"><i class="bi bi-clock-history"></i> Recently cached</h2>
-            <div class="text-secondary small mt-1">Newest files in the routing cache</div>
+            <h2 class="panel-title"><i class="bi bi-clock-history"></i> Recent files</h2>
+            <div class="text-secondary small mt-1">Newest objects in the cache</div>
           </div>
           <a class="btn btn-ghost btn-sm" href="{{ url_for('ui.files') }}">View all <i class="bi bi-arrow-right"></i></a>
         </div>
@@ -72,79 +28,15 @@
     </div>
 
     <div class="col-xl-5">
-      <div class="glass mb-4">
+      <div class="glass h-100">
         <div class="panel-head">
-          <div>
-            <h2 class="panel-title"><i class="bi bi-cloud-arrow-up"></i> Quick upload</h2>
-            <div class="text-secondary small mt-1">Spools locally, then returns a job</div>
-          </div>
-          <span class="chip accent">async</span>
-        </div>
-        <div class="panel-body">
-          <form hx-post="{{ url_for('ui.upload') }}" hx-target="#quick-upload-result" hx-swap="innerHTML"
-                hx-encoding="multipart/form-data" hx-indicator="#quick-spinner">
-            <input type="hidden" name="_csrf" value="{{ csrf_token }}">
-            <input type="hidden" name="operation" value="upload">
-            <div class="dropzone" data-dropzone>
-              <i class="bi bi-cloud-arrow-up d-block mb-1"></i>
-              <div class="fw-semibold">Drop files or click to browse</div>
-              <div class="hint">Up to {{ max_files_per_request }} files · {{ max_upload_bytes|human_size }} each</div>
-              <div class="file-list" data-file-list>No files selected yet</div>
-              <input type="file" name="file" multiple required>
-            </div>
-            <div class="d-flex justify-content-between align-items-center mt-3 gap-2">
-              <span id="quick-spinner" class="htmx-indicator chip accent"><i class="bi bi-arrow-repeat"></i> Queueing</span>
-              <button class="btn btn-accent" type="submit"><i class="bi bi-lightning-charge"></i> Queue upload</button>
-            </div>
-          </form>
-          <div id="quick-upload-result" class="mt-3"></div>
-          <p class="text-secondary small mt-3 mb-0">
-            Existing names are rejected. Use <a href="{{ url_for('ui.files') }}">Files → Replace</a> for an upsert.
-          </p>
-        </div>
-      </div>
-
-      <div class="glass">
-        <div class="panel-head">
-          <h2 class="panel-title"><i class="bi bi-lightning-charge"></i> Live transfers</h2>
+          <h2 class="panel-title"><i class="bi bi-lightning-charge"></i> Live upserts</h2>
           <a class="btn btn-ghost btn-sm" href="{{ url_for('ui.uploads') }}">All jobs <i class="bi bi-arrow-right"></i></a>
         </div>
         <div class="panel-body pt-3">
           {% set jobs = recent_jobs %}
-          {% set empty_message = "No transfers yet" %}
+          {% set empty_message = "No upserts yet" %}
           {% include "ui/fragments/jobs_list.html" %}
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div class="row g-4 mt-1">
-    <div class="col-xl-7">
-      <div class="glass h-100">
-        <div class="panel-head">
-          <div>
-            <h2 class="panel-title"><i class="bi bi-person-badge"></i> Account pool</h2>
-            <div class="text-secondary small mt-1">Soft budgets are enforced before B2 is touched</div>
-          </div>
-          <a class="btn btn-ghost btn-sm" href="{{ url_for('ui.accounts') }}">Details <i class="bi bi-arrow-right"></i></a>
-        </div>
-        <div class="panel-body">
-          {% include "ui/fragments/accounts_cards.html" %}
-        </div>
-      </div>
-    </div>
-    <div class="col-xl-5">
-      <div class="glass h-100">
-        <div class="panel-head">
-          <div>
-            <h2 class="panel-title"><i class="bi bi-activity"></i> Recent activity</h2>
-            <div class="text-secondary small mt-1">Every mutation is audited</div>
-          </div>
-          <a class="btn btn-ghost btn-sm" href="{{ url_for('ui.audit') }}">Full audit <i class="bi bi-arrow-right"></i></a>
-        </div>
-        <div class="panel-body pt-2">
-          {% set audit_entries = recent_audit %}
-          {% include "ui/fragments/audit_table.html" %}
         </div>
       </div>
     </div>

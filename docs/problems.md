@@ -7,18 +7,18 @@ not on prose.
 
 ```json
 {
-  "type": "https://github.com/txtr/b2router/blob/main/docs/problems.md#duplicate_filename",
-  "title": "Duplicate file name",
-  "status": 409,
-  "detail": "File 'reports/q3.pdf' already exists in the pool. Use PUT /api/files/reports/q3.pdf to replace it.",
-  "code": "duplicate_filename",
+  "type": "https://github.com/txtr/b2router/blob/main/docs/problems.md#validation_error",
+  "title": "Validation failed",
+  "status": 400,
+  "detail": "No files were accepted for upsert.",
+  "code": "validation_error",
   "request_id": "req_7b0b5c8f2b6d4a6aa8c8f9d5a3f0b1e2",
   "errors": [
     {
-      "file_name": "reports/q3.pdf",
+      "file_name": "../escape",
       "error": {
-        "code": "duplicate_filename",
-        "message": "File 'reports/q3.pdf' already exists in the pool."
+        "code": "validation_error",
+        "message": "File name must not contain '..' segments."
       }
     }
   ]
@@ -39,9 +39,9 @@ Common members:
 | `errors` | Optional per-item validation errors for batch requests. |
 
 `errors[]` entries have the shape `{ "file_name": <field or file name>,
-"error": { "code": ..., "message": ..., "details": {...} } }`. A batch upload
+"error": { "code": ..., "message": ..., "details": {...} } }`. A batch upsert
 that rejects every part reports the specific problem when all rejections share
-one code (for example `409 duplicate_filename` or `413 payload_too_large`);
+one code (for example `409 duplicate_in_request` or `413 payload_too_large`);
 mixed rejections fall back to `400 bad_request`.
 
 ## Catalogue
@@ -67,14 +67,14 @@ mixed rejections fall back to `400 bad_request`.
 | `code` | Status | Meaning | What to do |
 | --- | --- | --- | --- |
 | `file_not_found` | 404 | The named file is not in the cache, or its latest version disappeared from B2. | Refresh the file list. |
-| `duplicate_filename` | 409 | `POST /api/files` cannot create an existing name. | Use `PUT /api/files/{name}` to replace it. |
-| `duplicate_in_request` | 409 | The same name appears twice in one upload or routing request. | De-duplicate the request. |
-| `job_active` | 409 | Another upload, upsert, delete, or cancel is using that name. | Poll the active job or retry after it finishes. |
+| `duplicate_in_request` | 409 | The same name appears twice in one upsert or routing request. | De-duplicate the request. |
+| `job_active` | 409 | Another upsert, delete, or cancel is using that name. | Poll the active job or retry after it finishes. |
 | `file_changed` | 409 | The file's opaque `etag` changed between read and write. | Refresh, then retry with the new `If-Match`/`etag`. |
 | `state_changed` | 409 | A pool invariant changed while the operation was in flight. | Retry; the request is safe to repeat. |
 | `no_account_can_fit` | 409 | No account has enough bytes, file slots, or the right capacity. | Free space, raise capacity, or use a smaller file. |
+| `no_replacement_account` | 409 | The name exists and no other account has both a free file slot and enough bytes to stage the replacement. | Add another account, free capacity elsewhere, or keep the current version. |
 | `precondition_failed` | 412 | `If-Match` (the opaque file `etag`) or another precondition did not match. | Re-read the resource and retry with its current `etag`. |
-| `queue_full` | 429 | The bounded upload queue is saturated; checked before parsing/spooling the multipart body. | Retry later; inspect `/api/jobs?state=queued`. |
+| `queue_full` | 429 | The bounded upsert queue is saturated; checked before parsing/spooling the multipart body. | Retry later; inspect `/api/jobs?state=queued`. |
 
 ### Job problems
 
@@ -85,22 +85,27 @@ mixed rejections fall back to `400 bad_request`.
 
 An upsert whose old-version delete fails normally rolls the new version back
 and finishes with `failed` plus `error.code = "old_version_retained"`; the
-original file is unchanged. A job finishes in the `partial` state when the
-router cannot prove the final B2 state:
+original file is unchanged. A replacement is always staged in a different
+account. If no other account has a free file slot and enough bytes, the job
+fails with `no_replacement_account` before any B2 upload is attempted.
+
+A job finishes in the `partial` state when the router cannot prove the final B2
+state:
 
 * `error.code = "upload_outcome_unknown"` means an upload timed out after B2 may
-  have accepted the bytes. Uploads carry a `b2router_job_id` marker in B2
+  have accepted the bytes. Upserts carry a `b2router_job_id` marker in B2
   `fileInfo`; recovery commits only an exact marker and size match after bounded
   retries. If no match is visible, the job stays `partial` rather than guessing.
 * `error.code = "old_version_retained"` with rollback details means the old
-  version could not be confirmed removed and rollback also failed. Both versions
-  may remain stored, and the pool keeps both sets of bytes accounted for.
+  version could not be confirmed removed and rollback also failed. The old copy
+  in the source account and the new copy in the destination may both remain
+  stored, and the pool keeps both sets of bytes accounted for.
 
 These are job states, not HTTP problems: inspect `GET /api/jobs/{id}` and
 `error.details`. Run `b2router-reconcile --apply` with the gateway stopped
 before retrying or restarting. Startup lists all visible versions and refuses
-to build the cache when a file name has more than one upload version in the
-same account.
+to build the cache when a name has more than one upload version in an account
+or appears in multiple accounts.
 
 ### Storage backend problems
 
@@ -129,12 +134,10 @@ with `upload_outcome_unknown`; they are never reported as successful.
 
 ## Idempotency and retries
 
-* `POST /api/files` is **not** idempotent. A repeated request with the same name
-  returns `duplicate_filename`; retrying a `202` means polling its job instead.
-* `PUT /api/files/{name}` is idempotent for the same bytes. If the response is
-  lost, retry the PUT; the final object is the same and older versions are
-  removed. If using `If-Match`, re-read the file first because the successful
-  replacement changed its opaque `etag`.
+* `POST /api/files` is **not** idempotent. Repeating an existing name starts
+  another cross-account replacement, which moves the object and changes its
+  opaque `etag`. Retrying a `202` means polling its job instead. A single-account
+  pool can create a name but cannot replace it.
 * `DELETE /api/files/{name}` is idempotent from the client's point of view:
   deleting a missing name returns `file_not_found`, which can be treated as
   already deleted.

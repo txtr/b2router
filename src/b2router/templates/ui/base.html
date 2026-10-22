@@ -28,7 +28,7 @@
           {% set items = [
             ('ui.dashboard', 'dashboard', 'bi-grid-1x2', 'Overview'),
             ('ui.files', 'files', 'bi-folder2-open', 'Files'),
-            ('ui.uploads', 'uploads', 'bi-cloud-arrow-up', 'Transfers'),
+            ('ui.uploads', 'uploads', 'bi-arrow-repeat', 'Upserts'),
             ('ui.accounts', 'accounts', 'bi-person-badge', 'Accounts'),
             ('ui.audit', 'audit', 'bi-activity', 'Audit')
           ] %}
@@ -42,15 +42,9 @@
         </ul>
 
         <div class="d-flex align-items-center gap-2 flex-wrap">
-          <span class="chip muted" title="Cache and job revisions">
-            <i class="bi bi-arrow-repeat"></i> r{{ pool_revision }}
-          </span>
           <span class="chip {{ 'success' if ready else 'danger' }}">
             <span class="health-dot {{ '' if ready else 'warn' }}"></span> {{ 'Ready' if ready else 'Not ready' }}
           </span>
-          <button class="btn btn-ghost btn-icon" type="button" data-reload title="Refresh page" aria-label="Refresh page">
-            <i class="bi bi-arrow-clockwise"></i>
-          </button>
           {% if api_token_enabled and authenticated %}
             <form method="post" action="{{ url_for('ui.logout') }}">
               <input type="hidden" name="_csrf" value="{{ csrf_token }}">
@@ -72,8 +66,12 @@
 
   <footer class="footer">
     <div class="page-width d-flex flex-wrap justify-content-between gap-2">
-      <span><span class="dot">●</span> Single-writer gateway · cache, jobs, and reservations are in memory</span>
-      <span class="mono">v{{ version }} · <a class="text-secondary" href="{{ url_for('ui.audit') }}">audit</a> · <a class="text-secondary" href="/health">health</a></span>
+      <span class="mono">v{{ version }}</span>
+      <span>
+        <a class="text-secondary" href="/health">health</a> ·
+        <a class="text-secondary" href="{{ url_for('ui.audit') }}">audit</a>{% if not api_token_enabled %} ·
+        <a class="text-secondary" href="/api/stats">api</a>{% endif %}
+      </span>
     </div>
   </footer>
 </div>

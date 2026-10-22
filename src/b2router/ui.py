@@ -44,7 +44,7 @@ _login_limiter = RateLimiter(12, burst=12)
 
 FILE_SORTS = {"name", "size", "uploaded"}
 ORDERS = {"asc", "desc"}
-AUDIT_ACTIONS = {"upload", "upsert", "delete"}
+AUDIT_ACTIONS = {"upsert", "delete"}
 AUDIT_RESULTS = {"success", "partial", "failed"}
 EMPTY_JOB_FRAGMENT = '<div class="job-missing"></div>'
 
@@ -139,6 +139,17 @@ def _file_view() -> dict[str, Any]:
     }
 
 
+def _files_context() -> dict[str, Any]:
+    rt = _runtime()
+    view = _file_view()
+    return {
+        "view": view,
+        "files": view["files"],
+        "show_actions": True,
+        "account_names": [state.name for state in rt.pool.account_states()],
+    }
+
+
 def _job_context() -> dict[str, Any]:
     rt = _runtime()
     active_filter = request.values.get("active", "") in {"1", "true", "yes"}
@@ -158,7 +169,6 @@ def _audit_context() -> dict[str, Any]:
     rt = _runtime()
     action = _choice(request.values.get("action"), AUDIT_ACTIONS, "")
     result = _choice(request.values.get("result"), AUDIT_RESULTS, "")
-    limit = _choice(str(request.values.get("limit", "25")), {"25", "50", "100"}, "25")
     page = _clamp_int(request.values.get("page"), 1, minimum=1, maximum=10_000)
     entries, _ = rt.audit.list(limit=10**9)
     if action:
@@ -166,7 +176,7 @@ def _audit_context() -> dict[str, Any]:
     if result:
         entries = [entry for entry in entries if entry.result == result]
     total = len(entries)
-    size = int(limit)
+    size = 50
     pages = max(1, math.ceil(total / size)) if total else 1
     page = min(page, pages)
     start = (page - 1) * size
@@ -175,7 +185,6 @@ def _audit_context() -> dict[str, Any]:
         "audit_total": total,
         "audit_action": action,
         "audit_result": result,
-        "audit_limit": size,
         "audit_page": page,
         "audit_pages": pages,
     }
@@ -202,7 +211,6 @@ def _inject_shell() -> dict[str, Any]:
         active = ""
     return {
         "active": active,
-        "pool_revision": _runtime().pool.revision,
         "ready": len(_runtime().pool) > 0,
         "api_token_enabled": bool(settings.api_token),
         "authenticated": bool(session.get("authenticated")),
@@ -254,7 +262,6 @@ def dashboard() -> str:
     rt = _runtime()
     files = sorted(rt.pool.list_files(), key=lambda entry: entry.upload_timestamp, reverse=True)
     recent_jobs, _ = rt.manager.list(limit=6, newest_first=True)
-    recent_audit, _ = rt.audit.list(limit=6)
     view = {
         "q": "",
         "account": "",
@@ -271,40 +278,23 @@ def dashboard() -> str:
         files=files[:6],
         view=view,
         show_actions=False,
-        accounts=rt.pool.account_states(),
         recent_jobs=[job.snapshot() for job in recent_jobs],
-        recent_audit=[entry.to_dict() for entry in recent_audit],
     )
 
 
 @ui_bp.get("/files")
 def files() -> str:
-    rt = _runtime()
-    view = _file_view()
-    return render_template(
-        "ui/files.html",
-        view=view,
-        files=view["files"],
-        show_actions=True,
-        account_names=[state.name for state in rt.pool.account_states()],
-    )
+    return render_template("ui/files.html", **_files_context())
 
 
 @ui_bp.get("/uploads")
 def uploads() -> str:
-    return render_template(
-        "ui/uploads.html",
-        **_job_context(),
-        replace_name=request.args.get("replace", ""),
-        replace_etag=request.args.get("replace_etag", "")[:128],
-    )
+    return render_template("ui/uploads.html", **_job_context())
 
 
 @ui_bp.get("/accounts")
 def accounts() -> str:
-    return render_template(
-        "ui/accounts.html", **_stats_context(), accounts=_runtime().pool.account_states()
-    )
+    return render_template("ui/accounts.html", accounts=_runtime().pool.account_states())
 
 
 @ui_bp.get("/audit")
@@ -387,15 +377,7 @@ def fragments_stats() -> str:
 
 @ui_bp.get("/fragments/files")
 def fragments_files() -> str:
-    rt = _runtime()
-    view = _file_view()
-    return render_template(
-        "ui/fragments/files_panel.html",
-        view=view,
-        files=view["files"],
-        show_actions=True,
-        account_names=[state.name for state in rt.pool.account_states()],
-    )
+    return render_template("ui/fragments/files_panel.html", **_files_context())
 
 
 @ui_bp.get("/fragments/jobs")
@@ -436,8 +418,6 @@ def _queue_upload(
     storage: Any,
     *,
     file_name: str,
-    operation: str,
-    expected_etag: str | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     spooled = None
     try:
@@ -452,10 +432,8 @@ def _queue_upload(
             temp_path=spooled.path,
             file_size=spooled.size,
             content_type=spooled.content_type,
-            operation=operation,
             request_id=request_id_var.get(),
             client=getattr(g, "client_label", None),
-            expected_etag=expected_etag,
         )
         return job.snapshot(), None
     except UploadRejected as exc:
@@ -482,85 +460,31 @@ def _unlink(path: str) -> None:
 @ui_bp.post("/upload")
 def upload() -> Any:
     rt = _runtime()
-    operation = request.form.get("operation", "upload")
-    if operation not in {"upload", "upsert"}:
-        raise Problem("bad_request", "Unknown upload operation.")
-
     jobs: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
-
     parts = request.files.getlist("file")
-    if operation == "upsert":
-        target = (request.form.get("target_name") or "").strip()
-        try:
-            validate_file_name(target, max_bytes=rt.settings.max_filename_bytes)
-        except Problem as exc:
-            rejected.append(
-                {
-                    "file_name": target or "(missing name)",
-                    "error": {"code": exc.code, "message": str(exc)},
-                }
-            )
-            target = ""
-        if not target:
-            pass
-        elif len(parts) != 1:
-            rejected.append(
-                {
-                    "file_name": target,
-                    "error": {
-                        "code": "validation_error",
-                        "message": "Choose exactly one replacement file.",
-                    },
-                }
-            )
-        elif not (parts[0].filename or "").strip():
-            rejected.append(
-                {
-                    "file_name": target,
-                    "error": {
-                        "code": "validation_error",
-                        "message": "Choose a replacement file with a non-empty filename.",
-                    },
-                }
-            )
-        else:
-            expected = (request.form.get("etag") or "").strip() or None
-            current = rt.pool.get_file(target)
-            if expected is not None and (current is None or current.etag != expected):
-                rejected.append(
-                    {
-                        "file_name": target,
-                        "error": {
-                            "code": "precondition_failed",
-                            "message": "The file changed since this page was loaded; refresh and retry.",
-                        },
-                    }
-                )
-            else:
-                job, error = _queue_upload(
-                    rt,
-                    parts[0],
-                    file_name=target,
-                    operation="upsert",
-                    expected_etag=current.etag if expected is not None and current else None,
-                )
-                if job is not None:
-                    jobs.append(job)
-                if error is not None:
-                    rejected.append({"file_name": target, "error": error})
+
+    if not parts:
+        rejected.append(
+            {
+                "file_name": "(request)",
+                "error": {"code": "validation_error", "message": "Attach at least one file."},
+            }
+        )
+    elif len(parts) > rt.settings.max_files_per_request:
+        rejected.append(
+            {
+                "file_name": "(request)",
+                "error": {
+                    "code": "validation_error",
+                    "message": (
+                        f"At most {rt.settings.max_files_per_request} "
+                        "files may be upserted at once."
+                    ),
+                },
+            }
+        )
     else:
-        if len(parts) > rt.settings.max_files_per_request:
-            rejected.append(
-                {
-                    "file_name": "(request)",
-                    "error": {
-                        "code": "validation_error",
-                        "message": f"At most {rt.settings.max_files_per_request} files may be uploaded at once.",
-                    },
-                }
-            )
-            parts = []
         seen: set[str] = set()
         for part in parts:
             name = part.filename or ""
@@ -583,19 +507,11 @@ def upload() -> Any:
                 )
                 continue
             seen.add(name)
-            job, error = _queue_upload(rt, part, file_name=name, operation="upload")
+            job, error = _queue_upload(rt, part, file_name=name)
             if job is not None:
                 jobs.append(job)
             if error is not None:
                 rejected.append({"file_name": name, "error": error})
-
-    if parts == [] and not rejected and operation == "upload":
-        rejected.append(
-            {
-                "file_name": "(request)",
-                "error": {"code": "validation_error", "message": "Attach at least one file."},
-            }
-        )
 
     if jobs:
         metrics.refresh_pool(rt.pool)

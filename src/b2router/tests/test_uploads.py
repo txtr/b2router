@@ -51,7 +51,6 @@ def test_upload_job_succeeds(
         temp_path=_spool(tmp_path, b"hello"),
         file_size=5,
         content_type="text/plain",
-        operation="upload",
         request_id="req_1",
         client="test",
     )
@@ -66,64 +65,6 @@ def test_upload_job_succeeds(
     assert not Path(job.temp_path).exists()
 
 
-def test_upsert_expected_etag_is_rechecked_by_the_worker(
-    settings: Settings, tmp_path: Path
-) -> None:
-    fake = FakeStorage("a")
-    fake.seed("doc.txt", b"old")
-    pool = AccountPool()
-    pool.add_account(fake, None)
-    manager = UploadManager(pool, AuditLog(), settings)
-    path = _spool(tmp_path, b"replacement")
-    try:
-        job = manager.submit(
-            file_name="doc.txt",
-            temp_path=path,
-            file_size=11,
-            content_type="text/plain",
-            operation="upsert",
-            request_id=None,
-            client=None,
-            expected_etag="not-the-cached-etag",
-        )
-        finished = _wait_state(manager, job.id)
-        assert finished.state is JobState.FAILED
-        assert finished.error is not None
-        assert finished.error["code"] == "precondition_failed"
-        assert pool.get_file("doc.txt") is not None
-        assert fake.files["doc.txt"].file_id == pool.get_file("doc.txt").file_id
-        assert not Path(path).exists()
-    finally:
-        manager.shutdown()
-
-
-def test_upload_rejects_duplicate_filename(
-    settings: Settings, tmp_path: Path
-) -> None:
-    fake = FakeStorage("a")
-    fake.seed("taken.txt", b"old")
-    pool = AccountPool()
-    pool.add_account(fake, None)
-    manager = UploadManager(pool, AuditLog(), settings)
-    path = _spool(tmp_path, b"new")
-
-    try:
-        with pytest.raises(UploadRejected) as excinfo:
-            manager.submit(
-                file_name="taken.txt",
-                temp_path=path,
-                file_size=3,
-                content_type="text/plain",
-                operation="upload",
-                request_id=None,
-                client=None,
-            )
-        assert excinfo.value.code == "duplicate_filename"
-    finally:
-        Path(path).unlink(missing_ok=True)
-        manager.shutdown()
-
-
 def test_second_job_for_same_name_is_rejected(
     manager: UploadManager, accounts: dict[str, FakeStorage], tmp_path: Path
 ) -> None:
@@ -133,7 +74,6 @@ def test_second_job_for_same_name_is_rejected(
         temp_path=_spool(tmp_path, b"1"),
         file_size=1,
         content_type="text/plain",
-        operation="upload",
         request_id=None,
         client=None,
     )
@@ -147,7 +87,6 @@ def test_second_job_for_same_name_is_rejected(
             temp_path=_spool(tmp_path, b"2"),
             file_size=1,
             content_type="text/plain",
-            operation="upload",
             request_id=None,
             client=None,
         )
@@ -155,14 +94,16 @@ def test_second_job_for_same_name_is_rejected(
     assert _wait_state(manager, first.id).state is JobState.COMPLETE
 
 
-def test_upsert_replaces_old_version(
+def test_upsert_replaces_old_version_in_another_account(
     settings: Settings,
     tmp_path: Path,
 ) -> None:
-    fake = FakeStorage("a")
-    old = fake.seed("doc.txt", b"old")
+    fake_a = FakeStorage("a")
+    old = fake_a.seed("doc.txt", b"old")
+    fake_b = FakeStorage("b")
     pool = AccountPool()
-    pool.add_account(fake, None)
+    pool.add_account(fake_a, None)
+    pool.add_account(fake_b, None)
     manager = UploadManager(pool, AuditLog(), settings)
     try:
         job = manager.submit(
@@ -170,7 +111,6 @@ def test_upsert_replaces_old_version(
             temp_path=_spool(tmp_path, b"new content"),
             file_size=11,
             content_type="text/plain",
-            operation="upsert",
             request_id=None,
             client=None,
         )
@@ -180,11 +120,14 @@ def test_upsert_replaces_old_version(
         assert finished.state is JobState.COMPLETE
         assert finished.replaced is not None
         assert finished.replaced["file_id"] == old.file_id
-        assert old.file_id in fake.deleted
+        assert old.file_id in fake_a.deleted
         entry = pool.get_file("doc.txt")
         assert entry is not None
+        assert entry.accounts == ("b",)
         assert entry.file_id != old.file_id
-        assert fake.data[entry.file_id] == b"new content"
+        assert fake_b.data[entry.file_id] == b"new content"
+        assert pool.get_account_state("a").file_count == 0
+        assert pool.get_account_state("b").file_count == 1
     finally:
         manager.shutdown()
 
@@ -197,7 +140,6 @@ def test_upsert_on_missing_file_creates_it(
         temp_path=_spool(tmp_path, b"data"),
         file_size=4,
         content_type="text/plain",
-        operation="upsert",
         request_id=None,
         client=None,
     )
@@ -206,14 +148,14 @@ def test_upsert_on_missing_file_creates_it(
     assert pool.get_file("new.txt") is not None
 
 
-def test_upsert_reuses_full_account_slot_and_bytes(
+def test_upsert_fails_when_source_is_the_only_account(
     settings: Settings,
     tmp_path: Path,
 ) -> None:
     fake = FakeStorage("a")
     old = fake.seed("only.txt", b"old")
-    pool = AccountPool(max_files_per_account=1)
-    pool.add_account(fake, capacity_bytes=len(b"old"))
+    pool = AccountPool()
+    pool.add_account(fake, capacity_bytes=1000)
     manager = UploadManager(pool, AuditLog(), settings)
     try:
         job = manager.submit(
@@ -221,7 +163,40 @@ def test_upsert_reuses_full_account_slot_and_bytes(
             temp_path=_spool(tmp_path, b"new"),
             file_size=3,
             content_type="text/plain",
-            operation="upsert",
+            request_id=None,
+            client=None,
+        )
+
+        finished = _wait_state(manager, job.id)
+
+        assert finished.state is JobState.FAILED
+        assert finished.error is not None
+        assert finished.error["code"] == "no_replacement_account"
+        assert pool.get_file("only.txt").file_id == old.file_id  # type: ignore[union-attr]
+        assert fake.data == {old.file_id: b"old"}
+        assert pool.get_account_state("a").file_count == 1
+        assert pool.stats()["reserved_bytes"] == 0
+    finally:
+        manager.shutdown()
+
+
+def test_upsert_moves_to_another_account_and_frees_source(
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    fake_a = FakeStorage("a")
+    old = fake_a.seed("only.txt", b"old")
+    fake_b = FakeStorage("b")
+    pool = AccountPool(max_files_per_account=1)
+    pool.add_account(fake_a, capacity_bytes=1000)
+    pool.add_account(fake_b, capacity_bytes=1000)
+    manager = UploadManager(pool, AuditLog(), settings)
+    try:
+        job = manager.submit(
+            file_name="only.txt",
+            temp_path=_spool(tmp_path, b"new"),
+            file_size=3,
+            content_type="text/plain",
             request_id=None,
             client=None,
         )
@@ -229,14 +204,16 @@ def test_upsert_reuses_full_account_slot_and_bytes(
         finished = _wait_state(manager, job.id)
 
         assert finished.state is JobState.COMPLETE
-        assert old.file_id in fake.deleted
+        assert old.file_id in fake_a.deleted
         entry = pool.get_file("only.txt")
         assert entry is not None
+        assert entry.accounts == ("b",)
         assert entry.file_id != old.file_id
-        state = pool.get_account_state("a")
-        assert state is not None
-        assert state.file_count == 1
-        assert state.used_bytes == 3
+        assert fake_b.data[entry.file_id] == b"new"
+        assert pool.get_account_state("a").file_count == 0
+        assert pool.get_account_state("a").used_bytes == 0
+        assert pool.get_account_state("b").file_count == 1
+        assert pool.get_account_state("b").used_bytes == 3
         assert pool.stats()["reserved_bytes"] == 0
     finally:
         manager.shutdown()
@@ -253,7 +230,6 @@ def test_ambiguous_upload_without_matching_marker_is_partial(
         temp_path=_spool(tmp_path, b"landed"),
         file_size=6,
         content_type="text/plain",
-        operation="upload",
         request_id=None,
         client=None,
     )
@@ -271,12 +247,14 @@ def test_upsert_rolls_back_new_version_when_old_delete_fails(
     settings: Settings,
     tmp_path: Path,
 ) -> None:
-    fake = FakeStorage("a")
-    old = fake.seed("stuck.txt", b"old")
+    fake_a = FakeStorage("a")
+    old = fake_a.seed("stuck.txt", b"old")
     # The old-version delete exhausts all retries; the rollback then succeeds.
-    fake.delete_failures_remaining = 3
+    fake_a.delete_failures_remaining = 3
+    fake_b = FakeStorage("b")
     pool = AccountPool()
-    pool.add_account(fake, None)
+    pool.add_account(fake_a, None)
+    pool.add_account(fake_b, None)
     manager = UploadManager(pool, AuditLog(), settings)
     try:
         job = manager.submit(
@@ -284,7 +262,6 @@ def test_upsert_rolls_back_new_version_when_old_delete_fails(
             temp_path=_spool(tmp_path, b"much newer data"),
             file_size=15,
             content_type="text/plain",
-            operation="upsert",
             request_id=None,
             client=None,
         )
@@ -298,10 +275,14 @@ def test_upsert_rolls_back_new_version_when_old_delete_fails(
         entry = pool.get_file("stuck.txt")
         assert entry is not None
         assert entry.file_id == old.file_id
-        assert fake.files["stuck.txt"].file_id == old.file_id
-        assert fake.data == {old.file_id: b"old"}
-        assert [version.file_id for version in fake.all_versions] == [old.file_id]
+        assert fake_a.files["stuck.txt"].file_id == old.file_id
+        assert fake_a.data == {old.file_id: b"old"}
+        assert [version.file_id for version in fake_a.all_versions] == [old.file_id]
+        assert fake_b.data == {}
+        assert fake_b.all_versions == []
+        assert len(fake_b.deleted) == 1
         assert pool.get_account_state("a").file_count == 1
+        assert pool.get_account_state("b").file_count == 0
         assert pool.stats()["used_bytes"] == len(b"old")
     finally:
         manager.shutdown()
@@ -312,14 +293,16 @@ def test_upsert_accepts_ambiguous_old_delete_when_old_version_is_gone(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake = FakeStorage("a")
-    old = fake.seed("ambiguous.txt", b"old")
+    fake_a = FakeStorage("a")
+    old = fake_a.seed("ambiguous.txt", b"old")
+    fake_b = FakeStorage("b")
     pool = AccountPool()
-    pool.add_account(fake, None)
+    pool.add_account(fake_a, None)
+    pool.add_account(fake_b, None)
     manager = UploadManager(pool, AuditLog(), settings)
 
     def delete_old_but_report_failure(entry) -> bool:  # noqa: ANN001
-        fake.delete_version(entry.file_id, entry.file_name)
+        fake_a.delete_version(entry.file_id, entry.file_name)
         return False
 
     monkeypatch.setattr(manager, "_delete_old", delete_old_but_report_failure)
@@ -329,7 +312,6 @@ def test_upsert_accepts_ambiguous_old_delete_when_old_version_is_gone(
             temp_path=_spool(tmp_path, b"new"),
             file_size=3,
             content_type="text/plain",
-            operation="upsert",
             request_id=None,
             client=None,
         )
@@ -339,9 +321,11 @@ def test_upsert_accepts_ambiguous_old_delete_when_old_version_is_gone(
         assert finished.state is JobState.COMPLETE
         entry = pool.get_file("ambiguous.txt")
         assert entry is not None
+        assert entry.accounts == ("b",)
         assert entry.file_id != old.file_id
-        assert old.file_id not in fake.data
-        assert [version.file_id for version in fake.all_versions] == [entry.file_id]
+        assert old.file_id not in fake_a.data
+        assert fake_a.all_versions == []
+        assert [version.file_id for version in fake_b.all_versions] == [entry.file_id]
     finally:
         manager.shutdown()
 
@@ -350,11 +334,14 @@ def test_upsert_partial_when_old_delete_and_rollback_fail(
     settings: Settings,
     tmp_path: Path,
 ) -> None:
-    fake = FakeStorage("a")
-    fake.seed("stuck.txt", b"old")
-    fake.fail_delete = True
+    fake_a = FakeStorage("a")
+    old = fake_a.seed("stuck.txt", b"old")
+    fake_a.fail_delete = True
+    fake_b = FakeStorage("b")
+    fake_b.fail_delete = True
     pool = AccountPool()
-    pool.add_account(fake, None)
+    pool.add_account(fake_a, None)
+    pool.add_account(fake_b, None)
     manager = UploadManager(pool, AuditLog(), settings)
     try:
         job = manager.submit(
@@ -362,7 +349,6 @@ def test_upsert_partial_when_old_delete_and_rollback_fail(
             temp_path=_spool(tmp_path, b"much newer data"),
             file_size=15,
             content_type="text/plain",
-            operation="upsert",
             request_id=None,
             client=None,
         )
@@ -375,9 +361,15 @@ def test_upsert_partial_when_old_delete_and_rollback_fail(
         assert finished.error["details"]["rollback_failed"] is True
         entry = pool.get_file("stuck.txt")
         assert entry is not None
-        assert entry.file_id in fake.data
-        # Both copies still exist in B2, so both bytes and slots remain counted.
-        assert pool.get_account_state("a").file_count == 2
+        assert entry.accounts == ("b",)
+        assert entry.file_id != old.file_id
+        assert fake_b.data[entry.file_id] == b"much newer data"
+        assert fake_a.data[old.file_id] == b"old"
+        # Both copies still exist in B2, one in each account.
+        assert pool.get_account_state("a").file_count == 1
+        assert pool.get_account_state("a").used_bytes == len(b"old")
+        assert pool.get_account_state("b").file_count == 1
+        assert pool.get_account_state("b").used_bytes == 15
         assert pool.stats()["used_bytes"] == 15 + 3
     finally:
         manager.shutdown()
@@ -394,7 +386,6 @@ def test_upload_failure_releases_reservation(
         temp_path=path,
         file_size=4,
         content_type="text/plain",
-        operation="upload",
         request_id=None,
         client=None,
     )
@@ -416,7 +407,6 @@ def test_ambiguous_upload_is_recovered(
         temp_path=_spool(tmp_path, b"landed"),
         file_size=6,
         content_type="text/plain",
-        operation="upload",
         request_id=None,
         client=None,
     )
@@ -442,7 +432,6 @@ def test_delete_and_upload_cannot_race(
                 temp_path=path,
                 file_size=3,
                 content_type="text/plain",
-                operation="upsert",
                 request_id=None,
                 client=None,
             )
@@ -457,7 +446,6 @@ def test_delete_and_upload_cannot_race(
         temp_path=_spool(tmp_path, b"new"),
         file_size=3,
         content_type="text/plain",
-        operation="upsert",
         request_id=None,
         client=None,
     )
@@ -481,7 +469,6 @@ def test_queue_limit(
             temp_path=paths[0],
             file_size=1,
             content_type="text/plain",
-            operation="upload",
             request_id=None,
             client=None,
         )
@@ -493,7 +480,6 @@ def test_queue_limit(
             temp_path=paths[1],
             file_size=1,
             content_type="text/plain",
-            operation="upload",
             request_id=None,
             client=None,
         )
@@ -503,7 +489,6 @@ def test_queue_limit(
                 temp_path=paths[2],
                 file_size=1,
                 content_type="text/plain",
-                operation="upload",
                 request_id=None,
                 client=None,
             )
@@ -525,7 +510,6 @@ def test_running_job_cannot_be_cancelled(
         temp_path=_spool(tmp_path, b"1"),
         file_size=1,
         content_type="text/plain",
-        operation="upload",
         request_id=None,
         client=None,
     )
@@ -557,7 +541,6 @@ def test_cancel_queued_job(pool: AccountPool, settings: Settings, tmp_path: Path
         temp_path=path,
         file_size=4,
         content_type="text/plain",
-        operation="upload",
         request_id=None,
         client=None,
     )
@@ -583,7 +566,6 @@ def test_shutdown_waits_for_running_upload(
         temp_path=_spool(tmp_path, b"data"),
         file_size=4,
         content_type="text/plain",
-        operation="upload",
         request_id=None,
         client=None,
     )
@@ -660,7 +642,6 @@ def test_runtime_releases_lock_after_drain(
         temp_path=_spool(tmp_path, b"data"),
         file_size=4,
         content_type="text/plain",
-        operation="upload",
         request_id=None,
         client=None,
     )
@@ -688,7 +669,6 @@ def test_dismiss_only_terminal_jobs(
         temp_path=_spool(tmp_path, b"x"),
         file_size=1,
         content_type="text/plain",
-        operation="upload",
         request_id=None,
         client=None,
     )
