@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from concurrent.futures import Future
 from pathlib import Path
 
 import pytest
 
+from b2router.runtime import Runtime
 from b2router.services.audit import AuditLog
 from b2router.services.pool import AccountPool
 from b2router.services.uploads import (
@@ -506,6 +508,114 @@ def test_cancel_queued_job(pool: AccountPool, settings: Settings, tmp_path: Path
     assert manager.active_for_name("queued.bin") is None
     with pytest.raises(UploadRejected):
         manager.cancel(job.id)
+
+
+def test_shutdown_waits_for_running_upload(
+    manager: UploadManager,
+    accounts: dict[str, FakeStorage],
+    tmp_path: Path,
+) -> None:
+    accounts["a"].upload_delay = 0.5
+    accounts["b"].upload_delay = 0.5
+    job = manager.submit(
+        file_name="slow-shutdown.bin",
+        temp_path=_spool(tmp_path, b"data"),
+        file_size=4,
+        content_type="text/plain",
+        operation="upload",
+        request_id=None,
+        client=None,
+    )
+    deadline = time.monotonic() + 2
+    while manager.get(job.id).state is JobState.QUEUED and time.monotonic() < deadline:  # type: ignore[union-attr]
+        time.sleep(0.005)
+    assert manager.get(job.id).state is JobState.UPLOADING  # type: ignore[union-attr]
+
+    started = time.monotonic()
+    manager.shutdown()
+    elapsed = time.monotonic() - started
+
+    finished = manager.get(job.id)
+    assert finished is not None
+    assert finished.state is JobState.COMPLETE
+    assert elapsed >= 0.4
+
+
+def test_shutdown_waits_for_in_flight_delete(manager: UploadManager) -> None:
+    manager.begin_delete("blocked.bin")
+    finished = threading.Event()
+
+    def drain() -> None:
+        manager.shutdown()
+        finished.set()
+
+    thread = threading.Thread(target=drain)
+    thread.start()
+    deadline = time.monotonic() + 2
+    while not manager.closed and time.monotonic() < deadline:
+        time.sleep(0.005)
+
+    assert manager.closed
+    assert not finished.wait(0.1)
+
+    manager.end_delete("blocked.bin")
+    assert finished.wait(2.0)
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+
+
+def test_delete_rejected_after_shutdown(manager: UploadManager) -> None:
+    manager.shutdown()
+    with pytest.raises(UploadRejected) as excinfo:
+        manager.begin_delete("late.bin")
+    assert excinfo.value.code == "service_unavailable"
+
+
+def test_runtime_releases_lock_after_drain(
+    manager: UploadManager,
+    accounts: dict[str, FakeStorage],
+    pool: AccountPool,
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    accounts["a"].upload_delay = 0.5
+    accounts["b"].upload_delay = 0.5
+    runtime = Runtime(settings=settings, pool=pool, manager=manager, audit=AuditLog())
+
+    class RecordingLock:
+        released = False
+        active_at_release = -1
+        queued_at_release = -1
+
+        def release(self) -> None:
+            self.released = True
+            self.active_at_release = manager.active_count()
+            self.queued_at_release = manager.queued_count()
+
+    lock = RecordingLock()
+    runtime.lock = lock
+    job = manager.submit(
+        file_name="runtime-drain.bin",
+        temp_path=_spool(tmp_path, b"data"),
+        file_size=4,
+        content_type="text/plain",
+        operation="upload",
+        request_id=None,
+        client=None,
+    )
+    deadline = time.monotonic() + 2
+    while manager.get(job.id).state is JobState.QUEUED and time.monotonic() < deadline:  # type: ignore[union-attr]
+        time.sleep(0.005)
+    assert manager.get(job.id).state is JobState.UPLOADING  # type: ignore[union-attr]
+
+    runtime.shutdown()
+
+    assert lock.released
+    assert lock.active_at_release == 0
+    assert lock.queued_at_release == 0
+    finished = manager.get(job.id)
+    assert finished is not None
+    assert finished.state is JobState.COMPLETE
 
 
 def test_dismiss_only_terminal_jobs(

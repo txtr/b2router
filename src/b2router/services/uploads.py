@@ -20,7 +20,7 @@ import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -228,6 +228,7 @@ class UploadManager:
         self._deleting: set[str] = set()
         self._futures: dict[str, Future[None]] = {}
         self._lock = threading.RLock()
+        self._delete_done = threading.Condition(self._lock)
         self._seq_lock = threading.Lock()
         self._last_seq = 0
         self._closed = False
@@ -711,6 +712,8 @@ class UploadManager:
         operations must claim the same per-name slot before touching B2.
         """
         with self._lock:
+            if self._closed:
+                raise UploadRejected("service_unavailable", "The server is shutting down.")
             existing = self._blocking_name_locked(file_name)
             if existing is not None:
                 raise UploadRejected(
@@ -728,8 +731,9 @@ class UploadManager:
             self._deleting.add(file_name)
 
     def end_delete(self, file_name: str) -> None:
-        with self._lock:
+        with self._delete_done:
             self._deleting.discard(file_name)
+            self._delete_done.notify_all()
 
     def list(
         self,
@@ -765,6 +769,11 @@ class UploadManager:
     def active_count(self) -> int:
         with self._lock:
             return sum(1 for job in self._jobs.values() if job.state in ACTIVE_STATES)
+
+    @property
+    def closed(self) -> bool:
+        with self._lock:
+            return self._closed
 
     # -- lifecycle -----------------------------------------------------
     def cancel(self, job_id: str) -> UploadJob:
@@ -809,16 +818,35 @@ class UploadManager:
             del self._jobs[job_id]
 
     def shutdown(self) -> None:
+        """Stop accepting mutations and wait for accepted work to finish.
+
+        The process-level writer lock must not be released until this method
+        returns. Running uploads may still be touching B2, and synchronous
+        deletes are not part of the executor, so both must be drained separately.
+        """
         with self._lock:
             self._closed = True
             queued = [job for job in self._jobs.values() if job.state == JobState.QUEUED]
             for job in queued:
                 if job.try_cancel():
                     self._cleanup_temp(job)
-            self._active_names.clear()
-            self._deleting.clear()
+                    future = self._futures.get(job.id)
+                    if future is not None:
+                        future.cancel()
+            futures = list(self._futures.values())
+
+        # Do not hold _lock while waiting: workers and delete handlers need it
+        # to finish their cleanup. New submissions and deletes are rejected by
+        # the _closed check above.
         if self._owns_executor:
-            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._executor.shutdown(wait=True, cancel_futures=True)
+        else:
+            wait(futures)
+
+        with self._delete_done:
+            self._delete_done.wait_for(lambda: not self._deleting)
+            self._active_names.clear()
+            self._futures.clear()
 
     def _prune(self) -> None:
         """Drop old terminal jobs; never removes queued/running work."""

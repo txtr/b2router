@@ -42,6 +42,17 @@ def test_health_ready_and_service_info(client) -> None:
     assert info.get_json()["service"] == "b2router"
 
 
+def test_ready_reports_draining(client, manager) -> None:
+    manager.shutdown()
+
+    response = client.get("/ready")
+
+    assert response.status_code == 503
+    payload = response.get_json()
+    assert payload["code"] == "not_ready"
+    assert payload["checks"]["accepting_mutations"] is False
+
+
 def test_metrics_endpoint(client) -> None:
     response = client.get("/metrics")
     assert response.status_code == 200

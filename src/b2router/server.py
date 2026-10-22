@@ -124,6 +124,8 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:  # pragma: no cover
         return 0
     finally:
+        # Drain accepted uploads and deletes before releasing the writer lock.
+        # A second process must never start while this one can still mutate B2.
         if manager is not None:
             manager.shutdown()
         lock.release()

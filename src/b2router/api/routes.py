@@ -90,6 +90,7 @@ def ready() -> Response:
         "pool_loaded": len(rt.pool) > 0,
         "pool_has_files_or_empty": True,
         "upload_workers": rt.settings.upload_workers > 0,
+        "accepting_mutations": not rt.manager.closed,
         "metrics_enabled": rt.settings.metrics_enabled,
     }
     if not all(checks.values()):
