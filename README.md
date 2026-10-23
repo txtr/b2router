@@ -123,7 +123,258 @@ containing `/` are unambiguous; `/api/files/<name>/content` is an alias.
 
 The full failure contract is in [`docs/problems.md`](docs/problems.md).
 
+## Type system & implementation details
+
+### Shared result type
+
+`src/b2router/utils/result.py` defines a generic `Result[T, E] = Ok[T, E] | Err[T, E]` used by
+`ConfigReader.read()` and `AccountPool._plan()`. Removes duplicate `Ok/Err` definitions.
+
+### Semantic ID types (`NewType`)
+
+`src/b2router/types.py` provides zero-cost `NewType` aliases:
+`FileId`, `JobId`, `AccountName`, `FileName`, `RequestId`, `ReservationId`.
+Catch `file_id = job_id` bugs at type-check time; erased at runtime.
+
+### TypedDict API contracts
+
+`src/b2router/api/types.py` documents every JSON response shape with `TypedDict`
+(`FileEntryDict`, `JobSnapshotDict`, `RoutingPlanDict`, etc.). Enables precise
+type checking in route handlers and tests.
+
+### `ProgressListener` protocol
+
+`src/b2router/services/account.py` defines a `ProgressListener` protocol
+instead of depending on `b2sdk.v2.AbstractProgressListener`. The worker's
+`_ProgressListener` implements this protocol, decoupling the gateway from the SDK.
+
+### `Literal` for fixed strings
+
+`FileVersion.action: Literal["upload", "hide"]`, `UploadJob.operation: Literal["upsert"]`.
+Exhaustiveness-checked by mypy.
+
+## Hidden-version accounting
+
+`AccountPool.add_account()` counts **every** upload version (`action == "upload"`) from
+`list_versions()`, not just the latest visible version from `list_files()`. This
+means hidden/superseded versions consume capacity and file slots in the local
+budget, matching what B2 actually stores. Hide markers (`action == "hide"`) are
+not counted.
+
+## Immutable `file_size` in upload jobs
+
+`UploadJob.update_progress()` ignores the SDK's reported `total` and uses the
+spooled size captured at submit time. This prevents the SDK from overwriting
+the value used for capacity accounting and post-upload verification.
+
+## Executor-submit cleanup
+
+If `ThreadPoolExecutor.submit()` raises (pool exhausted), the temp file is
+deleted and the per-name lock is released **before** `UploadRejected` is raised.
+No leaked temp files or stuck names.
+
+## Log context isolation
+
+Context variables (`job_id_var`, `request_id_var`, `client_label_var`) are set
+at worker start and cleared in a `finally` block. No cross-contamination
+between concurrent jobs.
+
+## Cancelled-future removal in shutdown
+
+`UploadManager.shutdown()` filters cancelled futures from `self._futures` before
+calling `wait()`. Without this, Python 3.14 `concurrent.futures.wait()` would
+block indefinitely on cancelled futures.
+
+## Strong `If-Match` comparison
+
+`validation.if_match()` implements **strong** ETag comparison per RFC 9110:
+weak validators (`W/"..."`) are rejected; only exact opaque ETag matches
+succeed. `validation.etag_matches()` (weak) is used only for `If-None-Match`.
+
+## XSS-safe flash alerts
+
+`static/app.js` builds DOM with `textContent` and `replaceChildren()`, never
+`innerHTML`. Server-provided error details (which can contain attacker-controlled
+filenames) are safely rendered.
+
+## SIGTERM handler & guaranteed lock release
+
+`server.py` installs a `SIGTERM → KeyboardInterrupt` handler so Docker/systemd
+signals trigger the normal shutdown path. The writer lock is released in
+**nested `finally` blocks** (`server.py:138-142`, `runtime.py:36-43`), ensuring
+it is released even if `manager.shutdown()` raises.
+
+## Docker stop grace period
+
+`docker-compose.yml` sets `stop_grace_period: 1h` so Docker waits for accepted
+uploads (up to 10 GiB) to drain before sending `SIGKILL`.
+
+## `FileEntry.account_name` as single source of truth
+
+`FileEntry` stores `account_name: str`. The legacy `.accounts` property returns
+`(account_name,)` for API compatibility. `to_dict()` serializes
+`"accounts": [account_name]`.
+
+## Dead code removed
+
+Removed: `set_max_files_per_account`, `accounts()`, `get_file_accounts`,
+`list_files_for_account`, `file_cache_stats`, `can_fit`, `with_max_files`,
+`with_file`, `shutdown_app`, `run_server`, `current_request_id`, `parse_etag`,
+`FileEntryLike`, `format_file_entry`, `format_files`.
+
+## Manager consistency guard
+
+`create_app()` validates `manager.pool is pool` and `manager.audit is audit`,
+exposing `UploadManager.pool` and `.audit` as read-only properties. Prevents
+accidental mismatch between injected dependencies.
+
+## Reconcile `--apply` guard
+
+`b2router-reconcile --apply` refuses to delete anything when `account_errors`
+is non-empty (an account could not be listed). The report includes
+`apply_refused: true` and a message. This prevents deleting the real keeper
+from an unreadable account.
+
+## Centralized error mapping
+
+`storage_error_status(code)` in `errors.py` maps B2 error codes to HTTP status:
+`b2_unauthorized→502`, `b2_rate_limited→503`, `b2_unavailable→503`,
+`b2_timeout→504`, `range_not_satisfiable→416`.
+
+## Multipart staging security
+
+`ensure_upload_space()` rejects `507 insufficient_storage` **before** Flask
+parses the multipart body when the declared `Content-Length` would exhaust the
+staging volume. `TMPDIR=/data/tmp` in Docker ensures Werkzeug's internal spool
+uses the persistent volume, not the container layer. Spool directory is `0700`,
+files `0600`.
+
+## CLI tools (all take the writer lock)
+
+| Tool | Purpose |
+|------|---------|
+| `b2router-reconcile [--apply] [--pretty]` | Cross-account duplicate detection; `--apply` deletes all but newest per name; refuses if any account unreadable; exits 3 if gateway holds lock |
+| `b2router-create-file <account> <name> (--file <path> \| --size-mb <N>)` | Upload test object directly to one account; visible after gateway restart; exits 3 if gateway holds lock |
+| `b2router-delete-file <account> <name>` | Delete object directly from one account; exits 3 if gateway holds lock |
+
+## Lockfile (`InstanceLock`)
+
+Advisory `fcntl.flock()` on a small file (`B2ROUTER_LOCK_FILE`). Writes owning
+PID for debugging. Non-blocking (`LOCK_NB`); fails fast with `LockError` if
+another writer exists. Context manager support.
+
+## Audit log
+
+Thread-safe ring buffer (`deque` with `maxlen=max(job_history_max, 1000)`).
+Each entry: `id`, `timestamp`, `action` (upsert/delete), `result`
+(success/partial/failed/cancelled), `file_name`, `account_name`, `file_size`,
+`error_code`, `request_id`, `client`, `duration_ms`, `details`. `GET /api/audit`
+supports pagination.
+
+## Metrics (Prometheus)
+
+Exposed at `/metrics` (enabled by `B2ROUTER_METRICS=1`). Bounded label
+cardinality: route rules, stable error codes, operation names. Key metrics:
+
+| Metric | Type | Labels |
+|--------|------|--------|
+| `b2router_requests` | Counter | method, route, status |
+| `b2router_request_duration_seconds` | Histogram | method, route |
+| `b2router_files` / `b2router_used_bytes` / `b2router_capacity_bytes` | Gauge | — |
+| `b2router_jobs_queued` / `b2router_jobs_active` | Gauge | — |
+| `b2router_uploads` | Counter | result (success/partial/failed) |
+| `b2router_b2_request_duration_seconds` | Histogram | operation |
+| `b2router_b2_errors` | Counter | operation, code |
+
+`/metrics` returns 404 if `B2ROUTER_METRICS=0`.
+
+## Health & Ready endpoints
+
+| Endpoint | Purpose | Checks |
+|----------|---------|--------|
+| `GET /health` | Liveness | Version, uptime, pool/jobs revision |
+| `GET /ready` | Readiness | `len(pool) > 0`, workers > 0, `not manager.closed` |
+
+`/ready` returns 503 with `checks` extension if any check fails.
+
+## Docker multipart spool
+
+Both `B2ROUTER_TEMP_DIR` and `TMPDIR` are set to `/data/tmp` in `docker-compose.yml`
+and `Dockerfile`. This routes **both** the gateway's spool and Werkzeug's internal
+multipart parser to the persistent volume.
+
+## Login limiter proxy-aware
+
+`_client_address(settings)` reads `X-Forwarded-For` when `B2ROUTER_TRUST_PROXY=1`
+for both the mutation limiter and the login limiter. Prevents bypass via
+spoofed `X-Client-Name`.
+
+## `jobs_snapshot()` atomic ETag
+
+`UploadManager.jobs_snapshot()` returns `(jobs, total, revision)` from a single
+consistent read under the job lock. `GET /api/jobs` uses this for `ETag` and
+`X-B2Router-Revision` headers.
+
+## Rate-limit retry across accounts
+
+`AccountState.rate_limited_until` + `mark_rate_limited(duration=60)`. Routing
+skips rate-limited accounts. Worker retries on next available account (up to
+*N* attempts where *N* = pool size). Avoids hammering a throttled account.
+
 ## Web console
+
+`/ui` is now a **separate repository** (`b2router-ui`) communicating via the
+gateway's JSON API. It shares no code with the gateway; templates and static
+assets were moved. The gateway's `/ui` routes were removed. See
+<https://github.com/txtr/b2router-ui>.
+
+## Security (additional)
+
+- **Constant-time token comparison**: `hmac.compare_digest()` for bearer and UI sign-in.
+- **Network-identity rate limiting**: Mutation budget keyed by client IP (`X-Forwarded-For` if `trust_proxy`), never `X-Client-Name`.
+- **Request ID correlation**: Accepted from `X-Request-ID`, echoed in response header and logs.
+- **Content-Security-Policy**: Self-hosted scripts/styles only, `img-src data:` for favicon, `frame-ancestors 'none'`.
+- **Referrer-Policy: no-referrer**, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, minimal `Permissions-Policy`.
+- **Cookie security**: `HttpOnly`, `SameSite=Strict`, `Secure` when `B2ROUTER_COOKIE_SECURE=1`.
+- **CSRF**: Per-session token in UI forms, validated on every mutation.
+- **Bound everything**: Body size, batch size, queue length, worker count, job history, audit history, filename length, request rate.
+
+## Development
+
+```bash
+pip install -e '.[dev]'
+ruff check src/b2router
+ruff format --check src/b2router
+mypy src/b2router
+PYTHONPATH=src pytest -q
+```
+
+Tests use a fake storage backend and never contact B2. The suite covers
+routing/reservations, conflict handling, async jobs, ambiguous-upsert recovery,
+RFC 9457 shapes, auth, rate limiting, CORS, ranges/ETags, config/settings
+validation, and the UI's sign-in, CSRF, fragments, upserts, deletes, and
+download proxy.
+
+The process is intentionally the Flask development server for 0.0.1
+(`threaded=True`, no reloader). The in-memory cache, reservations, jobs, and
+`flock` depend on a **single process**; do not run it behind a preforking
+application server.
+
+## Docker
+
+```bash
+docker compose up --build
+# http://127.0.0.1:8000/ui/
+```
+
+The image runs as a non-root user, exposes `8000`, installs the package with its
+templates/static assets, and keeps spool/lock state in the `b2router-data`
+volume. Mount `accounts.yaml` read-only at `/config/accounts.yaml`; keep the
+host file mode at `0600`. Compose allows up to an hour for graceful shutdown so
+accepted uploads can drain before Docker sends `SIGKILL`.
+Compose publishes `127.0.0.1:8000:8000` by default. Exposing the port on a
+remote interface requires an explicit `B2ROUTER_API_TOKEN` and a deliberate
+port/network change; without the token the console and API are unauthenticated.
 
 `/ui` is a server-rendered operator console. It reads the same in-memory pool,
 job manager, and audit log as the API, and calls the same mutation services, so
