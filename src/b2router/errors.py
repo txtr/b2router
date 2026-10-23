@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from flask import Flask, Response, render_template, request
+from flask import Flask, Response
 from werkzeug.exceptions import HTTPException
 
 from b2router.logging_setup import request_id_var
@@ -164,40 +164,6 @@ def _http_problem(exc: HTTPException) -> Problem:
     return Problem(code, detail, status=status, headers=headers)
 
 
-def _ui_problem_response(exc: Problem) -> Response | None:
-    """Render HTML instead of JSON for browser-facing failures.
-
-    HTMX requests receive a small alert fragment so a failed form submission
-    does not replace the page with a full document. Normal navigations receive
-    the shared error page.
-    """
-    if not request.path.startswith("/ui"):
-        return None
-    context = {
-        "problem": exc,
-        "title": exc.title,
-        "detail": exc.detail,
-        "code": exc.code,
-        "request_id": request_id_var.get(),
-    }
-    if request.headers.get("HX-Request") == "true":
-        headers = {
-            "HX-Retarget": "#flash",
-            "HX-Reswap": "innerHTML",
-            **exc.headers,
-        }
-        return Response(
-            render_template("ui/fragments/problem.html", **context),
-            status=exc.status,
-            headers=headers,
-        )
-    return Response(
-        render_template("ui/error.html", **context),
-        status=exc.status,
-        headers=exc.headers,
-    )
-
-
 def register_error_handlers(app: Flask) -> None:
     @app.errorhandler(Problem)
     def _handle_problem(exc: Problem) -> Response:
@@ -206,14 +172,12 @@ def register_error_handlers(app: Flask) -> None:
                 "request.failed",
                 extra={"data": {"code": exc.code, "status": exc.status, "detail": exc.detail}},
             )
-        rendered = _ui_problem_response(exc)
-        return rendered if rendered is not None else problem_response(exc)
+        return problem_response(exc)
 
     @app.errorhandler(HTTPException)
     def _handle_http(exc: HTTPException) -> Response:
         problem = _http_problem(exc)
-        rendered = _ui_problem_response(problem)
-        return rendered if rendered is not None else problem_response(problem)
+        return problem_response(problem)
 
     @app.errorhandler(Exception)
     def _handle_unexpected(exc: Exception) -> Response:
@@ -227,8 +191,7 @@ def register_error_handlers(app: Flask) -> None:
             problem = Problem(
                 "internal_error", "An unexpected error occurred. Check the server logs."
             )
-        rendered = _ui_problem_response(problem)
-        return rendered if rendered is not None else problem_response(problem)
+        return problem_response(problem)
 
 
 def validation_problem(detail: str, errors: list[dict[str, Any]] | None = None) -> Problem:

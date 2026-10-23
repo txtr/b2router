@@ -34,8 +34,6 @@ from b2router.services.audit import AuditLog
 from b2router.services.pool import AccountPool
 from b2router.services.uploads import UploadManager
 from b2router.settings import Settings
-from b2router.ui import ui_bp
-from b2router.utils.formatters import format_iso, format_timestamp, human_size
 
 logger = logging.getLogger("b2router.web")
 
@@ -107,12 +105,7 @@ def create_app(
         )
     runtime = Runtime(settings=settings, pool=pool, manager=manager, audit=audit)
 
-    app = Flask(
-        __name__,
-        static_folder="static",
-        static_url_path="/static",
-        template_folder="templates",
-    )
+    app = Flask(__name__)
     app.extensions["b2router"] = runtime
     app.config["MAX_CONTENT_LENGTH"] = (
         settings.max_upload_bytes * settings.max_files_per_request + 1024 * 1024
@@ -127,10 +120,6 @@ def create_app(
     app.json.sort_keys = False  # type: ignore[attr-defined]
 
     app.register_blueprint(bp)
-    app.register_blueprint(ui_bp)
-    app.jinja_env.filters["human_size"] = human_size
-    app.jinja_env.filters["pretty_ts"] = format_timestamp
-    app.jinja_env.filters["pretty_iso"] = format_iso
     register_error_handlers(app)
 
     limiter = RateLimiter(settings.mutation_rate_per_minute)
@@ -160,12 +149,7 @@ def create_app(
             return response
 
         mutating_api = request.method in {"POST", "DELETE"} and request.path.startswith("/api/")
-        mutating_ui = (
-            request.method in {"POST", "DELETE"}
-            and request.path.startswith("/ui/")
-            and not request.path.startswith("/ui/login")
-        )
-        if mutating_api or mutating_ui:
+        if mutating_api:
             # Limit before authentication so failed bearer guesses cannot
             # bypass the mutation budget. Key by network identity, never by the
             # self-declared X-Client-Name header.
@@ -217,11 +201,7 @@ def create_app(
             "font-src 'self'; style-src 'self' 'unsafe-inline'; "
             "script-src 'self' 'unsafe-eval'; connect-src 'self'"
         )
-        if (
-            request.path.startswith("/api/")
-            or request.path.startswith("/ui/")
-            or request.path in {"/health", "/ready"}
-        ):
+        if request.path.startswith("/api/") or request.path in {"/health", "/ready"}:
             response.headers.setdefault("Cache-Control", "no-store")
         origin = _allowed_origin(settings)
         if origin:
