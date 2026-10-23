@@ -6,6 +6,34 @@ and observability.
 
 The process is deliberately opinionated:
 
+## Table of Contents
+
+| Section | Description |
+|---------|-------------|
+| [Quick start](#quick-start) | Get running in 3 commands |
+| [Environment](#environment) | All configuration variables |
+| [API at a glance](#api-at-a-glance) | Complete endpoint table |
+| [Router logic](#router-logic-account-selection-for-upserts) | Account selection algorithm |
+| [Web console](#web-console) | UI (now separate repo) |
+| [Semantics worth knowing](#semantics-worth-knowing) | Conflict matrix, caching, reconciliation |
+| [Security](#security) | Threat model & mitigations |
+| [Development](#development) | Local dev workflow |
+| [Docker](#docker) | Container deployment |
+
+**Deep dive docs** (in [`docs/`](docs/)):
+
+| Document | Audience |
+|----------|----------|
+| [`docs/architecture.md`](docs/architecture.md) | System design, data flow, concurrency |
+| [`docs/failure-modes.md`](docs/failure-modes.md) | Every failure mode + handling |
+| [`docs/scaling.md`](docs/scaling.md) | Limits, benchmarks, non-goals |
+| [`docs/glossary.md`](docs/glossary.md) | Terminology, error codes, metrics |
+| [`docs/migration.md`](docs/migration.md) | Upgrade, config changes, rollback |
+| [`docs/contributing.md`](docs/contributing.md) | PR process, code standards |
+| [`docs/problems.md`](docs/problems.md) | RFC 9457 error catalogue |
+
+The process is deliberately opinionated:
+
 - **One writer.** A `flock` prevents a second instance from sharing in-memory
   state. `accounts.yaml` is read once at startup; there is no runtime
   add/remove-account API.
