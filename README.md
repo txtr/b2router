@@ -230,6 +230,96 @@ report their `source_account` and `replaces: true`; the chosen account is always
 a different account. Routing is **best fit by remaining bytes**, with a stable
 account-name tiebreak; it accounts for in-flight reservations.
 
+## Router logic (account selection for upserts)
+
+The router decides **which account receives a new or replacement file** at
+`POST /api/files` time (and for preview via `POST /api/routing-plans`). The
+algorithm is pure — no B2 calls — and runs under the pool lock so in-flight
+reservations are visible to subsequent decisions in the same batch.
+
+### 1. Inputs per file
+
+| Input | Source |
+|-------|--------|
+| `file_name` | Multipart part filename (or `routing-plans` request body) |
+| `file_size` | Declared `Content-Length` / spool size |
+| `source_account` | Current cache holder of `file_name`, or `null` for new files |
+
+### 2. Eligibility filter (per account, in deterministic name order)
+
+An account is **eligible** for a file iff all hold:
+
+- **Not the source account** (for replacements). A replacement is *always* staged
+  in a different account; the source account's old bytes and slot stay occupied
+  until the old version is deleted.
+- **Not rate limited**. Accounts returning `429`/`b2_rate_limited` are marked
+  for 60 s and skipped during routing. The worker will retry on another account.
+- **Has a free file slot**. `remaining_files = max_files - file_count - reserved_files - batch_files > 0`.
+- **Has enough free bytes** (if capacity is configured). `effective_remaining = capacity - used - reserved_bytes - batch_bytes ≥ file_size`. Unlimited accounts (`capacity_bytes = null`) always pass this check.
+
+If no account passes, the file is **unroutable**:
+- `no_replacement_account` — file exists but no *other* account can fit it
+- `no_account_can_fit` — new file, no account has space/slots
+
+### 3. Best-fit selection
+
+Among eligible accounts, pick the one with the **smallest `remaining_after`**
+(i.e. least free space left after placing this file):
+
+```
+remaining_after = effective_remaining - file_size
+```
+
+- Unlimited accounts get a synthetic `remaining_after = 10^18` (sorted last).
+- Tiebreaker: account name (lexicographic), so the result is deterministic.
+
+This "best fit" packs files tightly, leaving larger contiguous gaps for future
+large uploads — analogous to bin packing.
+
+### 4. Batch-aware accounting
+
+When a request contains multiple files (`max_files_per_request`, default 20),
+the router processes them **sequentially in request order** and updates
+`batch_bytes` / `batch_files` after each decision. This means:
+
+- File *N* sees the reservations of files *1..N-1* in the same batch.
+- A large file early in the batch can "reserve" space that a later file would
+  have used, causing the later file to route elsewhere or fail.
+
+### 5. Reservations vs. commits
+
+- **Routing (`plan`)** is read-only — no state changes.
+- **`reserve(file_name, file_size)`** atomically routes *and* creates a
+  `Reservation` (bytes + slot held) under the pool lock. The reservation is
+  released in a `finally` block when the worker finishes (success, failure, or
+  cancellation).
+- **`commit_upload` / `commit_replace`** convert the reservation into a cache
+  entry and update account `used_bytes` / `file_count`.
+
+### 6. Rate-limit retry (worker side)
+
+If the B2 upload returns `b2_rate_limited`:
+1. The account is marked rate-limited for 60 s (`mark_rate_limited`).
+2. The reservation is released.
+3. The worker loops and calls `reserve()` again, which now skips that account.
+4. Retries continue up to *N* attempts (where *N* = number of accounts in pool).
+
+This avoids hammering a throttled account and gracefully fails over.
+
+### 7. Preview endpoint
+
+`POST /api/routing-plans` runs the exact same `_plan` logic **without** creating
+reservations. Use it to dry-run a batch:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8000/api/routing-plans \
+  -H 'Content-Type: application/json' \
+  -d '{"files":[{"name":"a.bin","size":1048576},{"name":"b.bin","size":2097152}]}'
+```
+
+The response includes `routable` (with `account_name`, `remaining_bytes`,
+`remaining_files`, `replaces`) and `unroutable` (with `reason`, `message`).
+
 ## Semantics worth knowing
 
 ### Conflict matrix
